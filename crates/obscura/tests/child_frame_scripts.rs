@@ -113,6 +113,70 @@ fn spawn_server(parent_html: &'static str) -> String {
     format!("http://{addr}")
 }
 
+#[cfg(feature = "render")]
+fn spawn_detached_image_frame_server() -> String {
+    const PARENT: &[u8] = br#"<!doctype html><html><body>
+<iframe src="/image-child.html"></iframe>
+</body></html>"#;
+    const CHILD: &[u8] = br#"<!doctype html><html><body><script>
+  window.__detachedImageState = ["pending", false, 0, 0];
+  window.__detachedImage = new Image();
+  window.__detachedImage.onload = function () {
+    window.__detachedImageState = [
+      "load",
+      window.__detachedImage.complete,
+      window.__detachedImage.naturalWidth,
+      window.__detachedImage.naturalHeight
+    ];
+  };
+  window.__detachedImage.onerror = function () {
+    window.__detachedImageState = [
+      "error",
+      window.__detachedImage.complete,
+      window.__detachedImage.naturalWidth,
+      window.__detachedImage.naturalHeight
+    ];
+  };
+  window.__detachedImage.src = "/pixel.png";
+</script></body></html>"#;
+    const PIXEL_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+        0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+        0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78,
+        0xda, 0x63, 0xfc, 0xcf, 0xc0, 0x50, 0x0f, 0x00, 0x05, 0x83, 0x02, 0x7f, 0x94, 0xff,
+        0x2f, 0x59, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let mut stream = match incoming {
+                Ok(stream) => stream,
+                Err(_) => continue,
+            };
+            let mut buf = [0u8; 2048];
+            let read = stream.read(&mut buf).unwrap_or(0);
+            let (content_type, body): (&str, &[u8]) =
+                if buf[..read].starts_with(b"GET /image-child.html ") {
+                    ("text/html", CHILD)
+                } else if buf[..read].starts_with(b"GET /pixel.png ") {
+                    ("image/png", PIXEL_PNG)
+                } else {
+                    ("text/html", PARENT)
+                };
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(headers.as_bytes());
+            let _ = stream.write_all(body);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    });
+    format!("http://{addr}")
+}
+
 #[tokio::test]
 async fn a_child_frame_runs_its_own_script() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
@@ -287,6 +351,56 @@ async fn a_static_child_frame_runs_its_own_script() {
     assert_eq!(
         page.evaluate_in_frame(0, "window.__ran").unwrap(),
         serde_json::json!("YES"),
+    );
+}
+
+#[cfg(feature = "render")]
+#[tokio::test]
+async fn a_detached_new_image_in_a_child_frame_loads_once() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let base = spawn_detached_image_frame_server();
+
+    let browser = Browser::new().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+    let image_requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_requests = image_requests.clone();
+    page.on_request(std::sync::Arc::new(move |request| {
+        if request.url.path() == "/pixel.png" {
+            observed_requests
+                .lock()
+                .unwrap()
+                .push(request.resource_type);
+        }
+    }));
+
+    page.goto(&base).await.unwrap();
+    for _ in 0..20 {
+        page.settle(250).await;
+        if page.frame_urls().len() == 1
+            && page
+                .evaluate_in_frame(0, "window.__detachedImageState[0] === 'load'")
+                .ok()
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+        {
+            break;
+        }
+    }
+
+    assert_eq!(
+        page.evaluate_in_frame(0, "window.__detachedImageState")
+            .unwrap(),
+        serde_json::json!(["load", true, 1, 1]),
+        "the child frame's detached Image did not complete with decoded dimensions",
+    );
+    assert_eq!(
+        *image_requests.lock().unwrap(),
+        vec![obscura::ResourceType::Image],
+        "the child image must issue exactly one observable Image request",
+    );
+    assert!(
+        page.fetched_urls().contains(&format!("{base}/pixel.png")),
+        "page assets did not aggregate the child frame's image request",
     );
 }
 

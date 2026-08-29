@@ -205,6 +205,16 @@ impl FrameRealm {
         &self.origin
     }
 
+    /// Absolute URLs fetched from this frame's realm. Frame documents keep
+    /// their DOM and request bookkeeping separate from the page realm, so a
+    /// page-level asset dump has to aggregate these explicitly.
+    pub fn fetched_urls(&self) -> Vec<String> {
+        let state = self.realms.borrow().by_frame_id(self.frame_id);
+        state
+            .map(|state| state.borrow().fetched_urls.clone())
+            .unwrap_or_default()
+    }
+
     /// Whether script from `other_origin` may reach into this frame's DOM. Two
     /// opaque origins are never same-origin, which is why `"null"` never
     /// matches.

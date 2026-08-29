@@ -15,6 +15,13 @@ The first build compiles V8 from source, so it is slow and needs the same build 
 obscura = { git = "https://github.com/h4ckf0r0day/obscura", tag = "v0.1.7" }
 ```
 
+Enable the `render` feature when the application must download resources loaded
+through `new Image()` or `<img>` (including images created inside child frames):
+
+```toml
+obscura = { git = "https://github.com/h4ckf0r0day/obscura", features = ["render"] }
+```
+
 ## Quickstart
 
 ```rust
@@ -51,6 +58,9 @@ async fn main() -> anyhow::Result<()> {
 - `goto(url).await` navigate and wait for load
 - `content()` rendered HTML
 - `url()` current URL
+- `frame_urls()` child-frame URLs in creation order
+- `evaluate_in_frame(index, js)` run JavaScript in a child frame realm
+- `fetched_urls()` resource URLs fetched by the page and its child frames
 - `evaluate(js)` run JavaScript, returns a `serde_json::Value`
 - `query_selector(css)` first match as an `Element`, or `None`
 - `wait_for_selector(css, Duration).await` poll until present

@@ -484,7 +484,7 @@ impl RealmStates {
         self.entries.retain(|(known, _, _)| known != context);
     }
 
-    fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
+    pub(crate) fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
         self.entries
             .iter()
             .find(|(_, id, _)| *id == frame_id)
@@ -4939,8 +4939,13 @@ fn cached_image_metadata_for_node(gs: &ObscuraState, node_id: NodeId) -> String 
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_image_metadata(
+    state: &OpState,
+    frame_id: u32,
+    nid: u32,
+    _cached_only: bool,
+) -> String {
+    let shared = frame_state(state, frame_id);
     let gs = shared.borrow();
     let node_id = NodeId::new(nid);
     let is_image = gs.dom.as_ref().is_some_and(|dom| {
@@ -5030,10 +5035,14 @@ fn finish_async_image_metadata(
 #[cfg(feature = "render")]
 #[op2(async)]
 #[string]
-async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String {
+async fn op_load_image_metadata(
+    state: Rc<RefCell<OpState>>,
+    frame_id: u32,
+    nid: u32,
+) -> String {
     let shared = {
         let state = state.borrow();
-        state.borrow::<SharedState>().clone()
+        frame_state(&state, frame_id)
     };
     let node_id = NodeId::new(nid);
     let (
@@ -5106,6 +5115,12 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
     if !has_page_transport {
         return load_image_metadata_without_page_transport(&mut shared.borrow_mut(), node_id);
     }
+
+    // Image requests use the retained render-resource transport rather than
+    // fetch(), but they are still observable page assets. Record the selected
+    // URL in the realm that initiated the request so Page::fetched_urls can
+    // aggregate page and child-frame resources for `--dump assets`.
+    shared.borrow_mut().fetched_urls.push(selected_url.clone());
 
     // Different CORS/credential profiles do not share an in-flight response.
     let request_key = (document_generation, selected_url.clone(), request_profile);

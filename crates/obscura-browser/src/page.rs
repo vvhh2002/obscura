@@ -2656,14 +2656,28 @@ impl Page {
         if duration_ms == 0 {
             return;
         }
-        if let Some(js) = &mut self.js {
-            Self::settle_runtime_for_duration(js, duration_ms).await;
+        // A fixed wait must retain its full wall clock, but it still has to
+        // alternate runtime work with frame attachment and message delivery.
+        // Attaching frames only after the entire delay strands their timers,
+        // fetches and multi-turn postMessage handshakes until a second settle.
+        // Challenge widgets are a common example: the child reports ready,
+        // the parent sends configuration, then the child starts image loads.
+        const FRAME_PUMP_SLICE_MS: u64 = 50;
+        let started = std::time::Instant::now();
+        loop {
+            let remaining = duration_ms
+                .saturating_sub(started.elapsed().as_millis() as u64);
+            if remaining == 0 {
+                break;
+            }
+            let slice = remaining.min(FRAME_PUMP_SLICE_MS);
+            if let Some(js) = &mut self.js {
+                Self::settle_runtime_for_duration(js, slice).await;
+            } else {
+                tokio::time::sleep(tokio::time::Duration::from_millis(slice)).await;
+            }
+            self.advance_frames().await;
         }
-        // A fixed wait must retain its full wall clock, so frames get their
-        // realms once at the end instead of being interleaved as in `settle`.
-        // Their document scripts still run; only their own deferred work is
-        // left for a later settle.
-        self.advance_frames().await;
     }
 
     /// Advance one wake-driven browser task for a continuously owned page.
@@ -3531,13 +3545,17 @@ impl Page {
             .unwrap_or((0.0, 0.0))
     }
 
-    /// Absolute URLs the page pulled in via fetch()/XHR (issue #301). Empty
-    /// when the page has no live JS runtime.
+    /// Absolute URLs pulled in through fetch/XHR or Image by the page and its
+    /// child frames (issue #301). Empty when no live realm fetched a resource.
     pub fn fetched_urls(&self) -> Vec<String> {
-        self.js
+        let mut urls = self.js
             .as_ref()
             .map(|js| js.fetched_urls())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        for frame in &self.frames {
+            urls.extend(frame.fetched_urls());
+        }
+        urls
     }
 
     /// Move network events recorded for script-initiated requests
@@ -4904,20 +4922,53 @@ mod tests {
                     let mut buf = [0u8; 2048];
                     let read = socket.read(&mut buf).await.unwrap_or(0);
                     let request = String::from_utf8_lossy(&buf[..read]).to_string();
-                    let body = if request.starts_with("GET /child.html ") {
-                        "<html><body><script>window.__ran = 'YES';</script></body></html>"
+                    let (content_type, body) = if request.starts_with("GET /child.html ") {
+                        (
+                            "text/html",
+                            "<html><body><script>window.__ran = 'YES';</script></body></html>",
+                        )
                     } else if request.starts_with("GET /plain.html ") {
-                        "<html><body><iframe src=\"/child.html\"></iframe></body></html>"
+                        (
+                            "text/html",
+                            "<html><body><iframe src=\"/child.html\"></iframe></body></html>",
+                        )
+                    } else if request.starts_with("GET /fixed-wait.html ") {
+                        (
+                            "text/html",
+                            "<html><body><script>\
+                             setTimeout(function () {\
+                               var f = document.createElement('iframe');\
+                               f.src = '/async-child.html';\
+                               document.body.appendChild(f);\
+                             }, 100);\
+                             </script></body></html>",
+                        )
+                    } else if request.starts_with("GET /async-child.html ") {
+                        (
+                            "text/html",
+                            "<html><body><script>\
+                             setTimeout(function () {\
+                               fetch('/frame-resource.txt')\
+                                 .then(function (response) { return response.text(); })\
+                                 .then(function (text) { window.__deferredFrameWork = text; });\
+                             }, 100);\
+                             </script></body></html>",
+                        )
+                    } else if request.starts_with("GET /frame-resource.txt ") {
+                        ("text/plain", "FRAME-READY")
                     } else {
+                        (
+                            "text/html",
                         "<html><body><div id=\"host\"></div><script>\
                          var r = document.getElementById('host').attachShadow({mode:'closed'});\
                          var f = document.createElement('iframe');\
                          f.src = '/child.html';\
                          r.appendChild(f);\
-                         </script></body></html>"
+                         </script></body></html>",
+                        )
                     };
                     let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
                     let _ = socket.write_all(resp.as_bytes()).await;
@@ -5005,6 +5056,37 @@ mod tests {
             .evaluate("Object.keys(globalThis.__obscura_frameObjects).length")
             .unwrap();
         assert_eq!(published.as_f64(), Some(1.0), "the page cannot reach the frame");
+    }
+
+    /// An explicit CLI `--wait` uses `settle_for_duration`. The fixed wait
+    /// previously attached a dynamically loaded frame only after the entire
+    /// delay, which left the child timer, fetch and every postMessage reply for
+    /// a later settle that the caller never requested.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fixed_settle_interleaves_deferred_child_frame_work() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let base = spawn_shadow_frame_server().await;
+        let mut page = frame_page("fixed-settle-frame-work");
+        page.navigate(&format!("{base}fixed-wait.html")).await.unwrap();
+
+        page.settle_for_duration(1_000).await;
+
+        assert_eq!(
+            page.frame_urls(),
+            vec![format!("{base}async-child.html")],
+            "the delayed iframe was not attached during the fixed wait",
+        );
+        assert_eq!(
+            page.evaluate_in_frame(0, "window.__deferredFrameWork")
+                .unwrap(),
+            serde_json::json!("FRAME-READY"),
+            "the child realm's deferred work was stranded after attachment",
+        );
+        assert!(
+            page.fetched_urls()
+                .contains(&format!("{base}frame-resource.txt")),
+            "a fetch made by the child realm was absent from page assets",
+        );
     }
 
     /// The sweep still does its job: an iframe removed from the document has

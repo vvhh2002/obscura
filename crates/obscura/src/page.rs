@@ -55,6 +55,11 @@ impl Page {
         self.inner.borrow().frame_urls()
     }
 
+    /// Absolute resource URLs fetched by the page and its child frames.
+    pub fn fetched_urls(&self) -> Vec<String> {
+        self.inner.borrow().fetched_urls()
+    }
+
     /// Execute JS inside one of the page's child frames. Each frame is its own
     /// realm with its own document, so this is the only way to observe one.
     pub fn evaluate_in_frame(&mut self, index: usize, expression: &str) -> Result<Value, String> {

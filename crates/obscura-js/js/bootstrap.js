@@ -5956,7 +5956,7 @@ class HTMLImageElement extends Element {
     try {
       const op = Deno.core.ops.op_load_image_metadata;
       if (typeof op === "function") {
-        Promise.resolve(op(this._nid >>> 0)).then(
+        Promise.resolve(op(_realmFrameId, this._nid >>> 0)).then(
           raw => {
             let metadata = null;
             try { metadata = JSON.parse(raw); }
@@ -5980,7 +5980,7 @@ class HTMLImageElement extends Element {
     try {
       const op = Deno.core.ops.op_image_metadata;
       if (typeof op !== "function") return;
-      const metadata = JSON.parse(op(this._nid >>> 0, true));
+      const metadata = JSON.parse(op(_realmFrameId, this._nid >>> 0, true));
       if (!metadata) return;
       const selected = metadata.currentSrc ? String(metadata.currentSrc) : "";
       if (selected !== this._imageCurrentSrc) {
