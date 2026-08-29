@@ -157,8 +157,9 @@ impl Page {
         self.inner.get_mut().has_pending_resource_work()
     }
 
-    /// Stable reasons the current final-document response archive is known to
-    /// be incomplete. Navigation replaces the previous document's reasons.
+    /// Sorted human-readable reasons the current final-document response
+    /// archive is known to be incomplete. Navigation replaces the previous
+    /// document's reasons; diagnostic wording is not a versioned schema.
     pub fn resource_archive_incomplete_reasons(&mut self) -> Vec<String> {
         self.inner
             .get_mut()

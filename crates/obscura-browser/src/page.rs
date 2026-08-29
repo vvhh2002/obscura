@@ -1911,9 +1911,10 @@ impl Page {
         diagnostics
     }
 
-    /// Stable, de-duplicated reasons the current final-document resource
-    /// archive must not claim completeness. The set resets at every committed
-    /// top-level document, including JavaScript navigation chains.
+    /// De-duplicated, sorted human-readable reasons the current final-document
+    /// resource archive must not claim completeness. The text is diagnostic,
+    /// not a versioned machine-readable schema. The set resets at every
+    /// committed top-level document, including JavaScript navigation chains.
     pub fn resource_archive_incomplete_reasons(&mut self) -> Vec<String> {
         let frame_diagnostics = self.frame_resource_diagnostics();
         let mut reasons = self.resource_archive_incomplete_reasons.clone();

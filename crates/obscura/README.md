@@ -13,7 +13,7 @@ first build is large and slow.
 ```toml
 [dependencies]
 obscura = { git = "https://github.com/h4ckf0r0day/obscura", features = ["api"] }
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
 ```
 
@@ -47,6 +47,13 @@ real top-level navigation starts a new document generation, so after HTTP or
 JavaScript redirects the drained capture contains only the final document and
 requests initiated by it and its live child frames.
 
+For this workflow, enable `render` instead of `api`; `render` includes the Rust
+API and exposes the renderer resource warmup report used below:
+
+```toml
+obscura = { git = "https://github.com/h4ckf0r0day/obscura", features = ["render"] }
+```
+
 ```rust,no_run
 use obscura::{Browser, ResourceCaptureLimits};
 
@@ -57,17 +64,48 @@ async fn main() -> anyhow::Result<()> {
     page.enable_resource_capture(ResourceCaptureLimits::default());
     page.goto("https://example.com").await?;
     page.settle_following_navigations(5_000).await?;
-    #[cfg(feature = "render")]
-    {
+
+    // Repeat because loading one resource can run an onload handler that
+    // inserts another resource or commits a replacement document.
+    let mut warmup_complete = false;
+    for round in 0..4 {
+        let before = page.url();
         let warmup = page.prepare_screenshot_resources_with_report(5_000).await;
-        anyhow::ensure!(warmup.is_complete(), "resource warmup incomplete: {warmup:?}");
+        page.settle_following_navigations(5_000).await?;
+        if page.url() != before {
+            continue;
+        }
+        anyhow::ensure!(
+            warmup.failed == 0 && warmup.timed_out == 0,
+            "resource warmup failed or timed out: {warmup:?}",
+        );
+        let post_settle = page.prepare_screenshot_resources_with_report(0).await;
+        if round != 0
+            && warmup.remaining == 0
+            && post_settle.remaining == 0
+            && !page.has_pending_resource_work()
+        {
+            warmup_complete = true;
+            break;
+        }
     }
     anyhow::ensure!(
-        page.resource_archive_incomplete_reasons().is_empty(),
-        "engine reported incomplete resource work",
+        warmup_complete,
+        "resource work did not reach a complete bounded capture state",
+    );
+    let incomplete_reasons = page.resource_archive_incomplete_reasons();
+    anyhow::ensure!(
+        incomplete_reasons.is_empty(),
+        "engine reported an incomplete archive: {incomplete_reasons:?}",
     );
 
     let capture = page.take_resource_capture().expect("capture enabled");
+    anyhow::ensure!(
+        capture.omitted_resources == 0 && capture.omitted_bytes == 0,
+        "capture limits omitted {} resources ({} bytes)",
+        capture.omitted_resources,
+        capture.omitted_bytes,
+    );
     for response in capture.resources {
         println!("{}: {} bytes", response.final_url, response.body.len());
     }
