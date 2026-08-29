@@ -40,4 +40,39 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+## Capture final-page resource responses
+
+Resource capture is opt-in because it retains byte-exact response bodies. A
+real top-level navigation starts a new document generation, so after HTTP or
+JavaScript redirects the drained capture contains only the final document and
+requests initiated by it and its live child frames.
+
+```rust,no_run
+use obscura::{Browser, ResourceCaptureLimits};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let browser = Browser::new()?;
+    let mut page = browser.new_page().await?;
+    page.enable_resource_capture(ResourceCaptureLimits::default());
+    page.goto("https://example.com").await?;
+    page.settle_following_navigations(5_000).await?;
+    #[cfg(feature = "render")]
+    {
+        let warmup = page.prepare_screenshot_resources_with_report(5_000).await;
+        anyhow::ensure!(warmup.is_complete(), "resource warmup incomplete: {warmup:?}");
+    }
+    anyhow::ensure!(
+        page.resource_archive_incomplete_reasons().is_empty(),
+        "engine reported incomplete resource work",
+    );
+
+    let capture = page.take_resource_capture().expect("capture enabled");
+    for response in capture.resources {
+        println!("{}: {} bytes", response.final_url, response.body.len());
+    }
+    Ok(())
+}
+```
+
 See `examples/basic.rs` for a runnable version (`cargo run --example basic`).

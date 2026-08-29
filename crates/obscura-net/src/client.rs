@@ -122,6 +122,15 @@ pub struct RequestInfo {
     pub method: String,
     pub headers: HashMap<String, String>,
     pub resource_type: ResourceType,
+    /// Top-level document generation that initiated this request. Page-scoped
+    /// response archives use it to discard late completions from a document
+    /// that has already navigated away.
+    pub document_generation: u64,
+    /// Browsing-context id that initiated the request. Zero is the top-level
+    /// page; child-frame realms use their native frame id.
+    pub frame_id: u32,
+    /// Document or module URL that initiated the request, when one exists.
+    pub initiator: Option<Url>,
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -168,6 +177,8 @@ impl RequestMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceRequest {
     pub resource_type: ResourceType,
+    /// Browsing-context id that owns this request. Zero is the top-level page.
+    pub frame_id: u32,
     /// Origin-bearing environment that owns the request. This controls CORS,
     /// credentials, and Sec-Fetch-Site and must remain the document/realm for
     /// every descendant in a module graph.
@@ -187,6 +198,7 @@ impl ResourceRequest {
     pub fn navigation() -> Self {
         Self {
             resource_type: ResourceType::Document,
+            frame_id: 0,
             initiator: None,
             referrer: None,
             mode: RequestMode::Navigate,
@@ -216,6 +228,7 @@ impl ResourceRequest {
         };
         Self {
             resource_type,
+            frame_id: 0,
             initiator: Some(initiator.clone()),
             referrer: Some(initiator.clone()),
             mode,
@@ -238,6 +251,7 @@ impl ResourceRequest {
     pub fn module_script(initiator: &Url, referrer: &Url) -> Self {
         Self {
             resource_type: ResourceType::Script,
+            frame_id: 0,
             initiator: Some(initiator.clone()),
             referrer: Some(referrer.clone()),
             mode: RequestMode::Cors,
@@ -248,6 +262,11 @@ impl ResourceRequest {
 
     pub fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
         self.max_response_bytes = max_response_bytes;
+        self
+    }
+
+    pub fn in_frame(mut self, frame_id: u32) -> Self {
+        self.frame_id = frame_id;
         self
     }
 
@@ -455,6 +474,7 @@ pub struct CallbackRegistry {
     on_request: RwLock<Vec<(u64, RequestCallback)>>,
     on_response: RwLock<Vec<(u64, ResponseCallback)>>,
     id_counter: std::sync::atomic::AtomicU64,
+    document_generation: std::sync::atomic::AtomicU64,
 }
 
 impl CallbackRegistry {
@@ -463,7 +483,23 @@ impl CallbackRegistry {
             on_request: RwLock::new(Vec::new()),
             on_response: RwLock::new(Vec::new()),
             id_counter: std::sync::atomic::AtomicU64::new(1),
+            document_generation: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Start a new top-level document generation and return its id. Requests
+    /// snapshot this value when they start, so a response that completes after
+    /// a later navigation remains attributable to the document that initiated
+    /// it rather than contaminating the final page's resource archive.
+    pub fn begin_document(&self) -> u64 {
+        self.document_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .wrapping_add(1)
+    }
+
+    pub fn document_generation(&self) -> u64 {
+        self.document_generation
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn next_id(&self) -> u64 {
@@ -1226,12 +1262,26 @@ impl ObscuraHttpClient {
         callbacks: Option<&CallbackRegistry>,
         request: ResourceRequest,
     ) -> Result<Response, ObscuraNetError> {
+        // Snapshot navigation identity before any cache lookup or follower wait.
+        // A coalesced request can finish after the page has navigated; reading
+        // the registry's then-current generation at completion would attribute
+        // the old document's bytes to the new one.
+        let document_generation = callbacks
+            .map(CallbackRegistry::document_generation)
+            .unwrap_or(0);
         let Some(cache_key) = self
             .resource_cache_key(&initial_method, url, &initial_body, &request)
             .await
         else {
             return self
-                .fetch_with_profile_uncached(initial_method, url, initial_body, callbacks, request)
+                .fetch_with_profile_uncached(
+                    initial_method,
+                    url,
+                    initial_body,
+                    callbacks,
+                    request,
+                    document_generation,
+                )
                 .await;
         };
 
@@ -1261,8 +1311,14 @@ impl ObscuraHttpClient {
 
         match acquisition {
             Acquisition::Cached(response) => {
-                self.fire_logical_resource_callbacks(callbacks, url, &request, &response)
-                    .await;
+                self.fire_logical_resource_callbacks(
+                    callbacks,
+                    url,
+                    &request,
+                    &response,
+                    document_generation,
+                )
+                .await;
                 Ok(response)
             }
             Acquisition::Follower(mut receiver) => loop {
@@ -1271,7 +1327,11 @@ impl ObscuraHttpClient {
                     break match outcome {
                         SharedFetchOutcome::Cacheable(response) => {
                             self.fire_logical_resource_callbacks(
-                                callbacks, url, &request, &response,
+                                callbacks,
+                                url,
+                                &request,
+                                &response,
+                                document_generation,
                             )
                             .await;
                             Ok(response)
@@ -1283,6 +1343,7 @@ impl ObscuraHttpClient {
                                 initial_body,
                                 callbacks,
                                 request,
+                                document_generation,
                             )
                             .await
                         }
@@ -1296,6 +1357,7 @@ impl ObscuraHttpClient {
                             initial_body,
                             callbacks,
                             request,
+                            document_generation,
                         )
                         .await;
                 }
@@ -1317,6 +1379,7 @@ impl ObscuraHttpClient {
                         initial_body,
                         callbacks,
                         request,
+                        document_generation,
                     )
                     .await;
                 let shared_outcome = match &result {
@@ -1348,6 +1411,7 @@ impl ObscuraHttpClient {
         url: &Url,
         request: &ResourceRequest,
         response: &Response,
+        document_generation: u64,
     ) {
         let Some(callbacks) = callbacks else {
             return;
@@ -1357,6 +1421,9 @@ impl ObscuraHttpClient {
             method: Method::GET.to_string(),
             headers: self.extra_headers.read().await.clone(),
             resource_type: request.resource_type,
+            document_generation,
+            frame_id: request.frame_id,
+            initiator: request.initiator.clone(),
         };
         callbacks.fire_request(&request_info).await;
         callbacks.fire_response(&request_info, response).await;
@@ -1369,12 +1436,29 @@ impl ObscuraHttpClient {
         initial_body: Option<Vec<u8>>,
         callbacks: Option<&CallbackRegistry>,
         request: ResourceRequest,
+        document_generation: u64,
     ) -> Result<Response, ObscuraNetError> {
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
 
         if url.scheme() == "file" {
-            return fetch_file_url(url, request.max_response_bytes).await;
+            let request_info = RequestInfo {
+                url: url.clone(),
+                method: initial_method.to_string(),
+                headers: self.extra_headers.read().await.clone(),
+                resource_type: request.resource_type,
+                document_generation,
+                frame_id: request.frame_id,
+                initiator: request.initiator.clone(),
+            };
+            if let Some(cbs) = callbacks {
+                cbs.fire_request(&request_info).await;
+            }
+            let response = fetch_file_url(url, request.max_response_bytes).await?;
+            if let Some(cbs) = callbacks {
+                cbs.fire_response(&request_info, &response).await;
+            }
+            return Ok(response);
         }
 
         let mut method = initial_method;
@@ -1407,6 +1491,9 @@ impl ObscuraHttpClient {
                 method: method.to_string(),
                 headers: self.extra_headers.read().await.clone(),
                 resource_type: request.resource_type.clone(),
+                document_generation,
+                frame_id: request.frame_id,
+                initiator: request.initiator.clone(),
             };
 
             if let Some(interceptor) = self.interceptor.read().await.as_ref() {
@@ -1415,7 +1502,23 @@ impl ObscuraHttpClient {
                     InterceptAction::Block => {
                         return Err(ObscuraNetError::Blocked(current_url.to_string()));
                     }
-                    InterceptAction::Fulfill(response) => {
+                    InterceptAction::Fulfill(mut response) => {
+                        if !request_callback_fired {
+                            if let Some(cbs) = callbacks {
+                                cbs.fire_request(&request_info).await;
+                            }
+                        }
+                        // Preserve any real redirect hops completed before an
+                        // interceptor fulfilled a later hop. The interceptor's
+                        // byte body remains untouched.
+                        if !redirects.is_empty() {
+                            let mut redirected_from = redirects.clone();
+                            redirected_from.extend(response.redirected_from);
+                            response.redirected_from = redirected_from;
+                        }
+                        if let Some(cbs) = callbacks {
+                            cbs.fire_response(&request_info, &response).await;
+                        }
                         return Ok(response);
                     }
                     InterceptAction::ModifyHeaders(headers) => {
@@ -1443,14 +1546,20 @@ impl ObscuraHttpClient {
                 HeaderValue::from_str(&sec_ch_ua)
                     .unwrap_or_else(|_| HeaderValue::from_static("\"Not:A-Brand\";v=\"99\", \"Google Chrome\";v=\"145\", \"Chromium\";v=\"145\"")),
             );
-            headers.insert(HeaderName::from_static("sec-ch-ua-mobile"), HeaderValue::from_static("?0"));
+            headers.insert(
+                HeaderName::from_static("sec-ch-ua-mobile"),
+                HeaderValue::from_static("?0"),
+            );
             headers.insert(
                 HeaderName::from_static("sec-ch-ua-platform"),
                 HeaderValue::from_str(&sec_ch_ua_platform)
                     .unwrap_or_else(|_| HeaderValue::from_static("\"Windows\"")),
             );
             if request.mode == RequestMode::Navigate {
-                headers.insert(HeaderName::from_static("upgrade-insecure-requests"), HeaderValue::from_static("1"));
+                headers.insert(
+                    HeaderName::from_static("upgrade-insecure-requests"),
+                    HeaderValue::from_static("1"),
+                );
             }
             headers.insert(USER_AGENT, HeaderValue::from_str(&ua).unwrap_or_else(|_| {
                 HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
@@ -1468,7 +1577,10 @@ impl ObscuraHttpClient {
                 HeaderValue::from_static(request.mode.header_value()),
             );
             if request.mode == RequestMode::Navigate {
-                headers.insert(HeaderName::from_static("sec-fetch-user"), HeaderValue::from_static("?1"));
+                headers.insert(
+                    HeaderName::from_static("sec-fetch-user"),
+                    HeaderValue::from_static("?1"),
+                );
             }
             headers.insert(
                 HeaderName::from_static("sec-fetch-dest"),
@@ -1554,9 +1666,10 @@ impl ObscuraHttpClient {
             }
 
             let in_flight = InFlightGuard::new(&self.in_flight);
-            let resp = req_builder.send().await.map_err(|e| {
-                ObscuraNetError::Network(format!("{}: {}", current_url, e))
-            })?;
+            let resp = req_builder
+                .send()
+                .await
+                .map_err(|e| ObscuraNetError::Network(format!("{}: {}", current_url, e)))?;
 
             let status = resp.status();
             validate_reqwest_cors_response(
@@ -1577,7 +1690,12 @@ impl ObscuraHttpClient {
             let response_headers: HashMap<String, String> = resp
                 .headers()
                 .iter()
-                .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
+                .map(|(k, v)| {
+                    (
+                        k.as_str().to_lowercase(),
+                        v.to_str().unwrap_or("").to_string(),
+                    )
+                })
                 .collect();
 
             if status.is_redirection() {
@@ -1680,10 +1798,11 @@ pub enum ObscuraNetError {
 mod ssrf_tests {
     use super::{
         is_forbidden_ip, request_fetch_site, request_referrer, validate_url,
-        CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCredentials, RequestMode,
-        ResourceRequest, ResourceType, SsrfGuardResolver,
+        CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCredentials, RequestInfo, RequestMode,
+        ResourceRequest, ResourceType, Response, SsrfGuardResolver,
     };
     use crate::cookies::CookieJar;
+    use crate::interceptor::{InterceptAction, RequestInterceptor};
     use reqwest::dns::{Name, Resolve};
     use std::collections::HashMap;
     use std::net::IpAddr;
@@ -2232,6 +2351,114 @@ mod ssrf_tests {
         assert_eq!(responses.load(Ordering::SeqCst), 1);
     }
 
+    struct FulfillInterceptor {
+        response: Response,
+    }
+
+    #[async_trait::async_trait]
+    impl RequestInterceptor for FulfillInterceptor {
+        async fn intercept(&self, _request: &RequestInfo) -> InterceptAction {
+            InterceptAction::Fulfill(self.response.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn interceptor_fulfill_fires_callbacks_with_raw_body_and_context() {
+        let target = Url::parse("https://example.test/asset.bin").unwrap();
+        let initiator = Url::parse("https://example.test/frame/document.html").unwrap();
+        let raw_body = vec![0, 0xff, 0x80, b'O', b'K'];
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        *client.interceptor.write().await = Some(Box::new(FulfillInterceptor {
+            response: Response {
+                url: target.clone(),
+                status: 206,
+                headers: HashMap::from([(
+                    "content-type".to_string(),
+                    "application/octet-stream".to_string(),
+                )]),
+                body: raw_body.clone(),
+                redirected_from: Vec::new(),
+            },
+        }));
+
+        let callbacks = CallbackRegistry::new();
+        let generation = callbacks.begin_document();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<RequestInfo>::new()));
+        let responses = Arc::new(std::sync::Mutex::new(Vec::<(RequestInfo, Response)>::new()));
+        let observed_requests = requests.clone();
+        callbacks.add_request(Arc::new(move |request| {
+            observed_requests.lock().unwrap().push(request.clone());
+        }));
+        let observed_responses = responses.clone();
+        callbacks.add_response(Arc::new(move |request, response| {
+            observed_responses
+                .lock()
+                .unwrap()
+                .push((request.clone(), response.clone()));
+        }));
+
+        let response = client
+            .fetch_resource_with_callbacks(
+                &target,
+                ResourceRequest::subresource(ResourceType::Image, &initiator).in_frame(17),
+                Some(&callbacks),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.body, raw_body);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].document_generation, generation);
+        assert_eq!(requests[0].frame_id, 17);
+        assert_eq!(requests[0].initiator.as_ref(), Some(&initiator));
+        let responses = responses.lock().unwrap();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].0.document_generation, generation);
+        assert_eq!(responses[0].0.frame_id, 17);
+        assert_eq!(responses[0].0.initiator.as_ref(), Some(&initiator));
+        assert_eq!(responses[0].1.body, raw_body);
+    }
+
+    #[tokio::test]
+    async fn file_resource_fires_callbacks_with_raw_body_and_context() {
+        use std::io::Write as _;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let raw_body = vec![0, 0xff, 0x80, b'f', b'i', b'l', b'e'];
+        file.write_all(&raw_body).unwrap();
+        let target = Url::from_file_path(file.path()).unwrap();
+        let initiator = target.join("document.html").unwrap();
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let callbacks = CallbackRegistry::new();
+        let generation = callbacks.begin_document();
+        let responses = Arc::new(std::sync::Mutex::new(Vec::<(RequestInfo, Response)>::new()));
+        let observed = responses.clone();
+        callbacks.add_response(Arc::new(move |request, response| {
+            observed
+                .lock()
+                .unwrap()
+                .push((request.clone(), response.clone()));
+        }));
+
+        let response = client
+            .fetch_resource_with_callbacks(
+                &target,
+                ResourceRequest::subresource(ResourceType::Image, &initiator).in_frame(23),
+                Some(&callbacks),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.body, raw_body);
+        let responses = responses.lock().unwrap();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].0.document_generation, generation);
+        assert_eq!(responses[0].0.frame_id, 23);
+        assert_eq!(responses[0].0.initiator.as_ref(), Some(&initiator));
+        assert_eq!(responses[0].1.body, raw_body);
+    }
+
     async fn cacheable_resource_fixture(
         status: u16,
         headers: &'static str,
@@ -2317,12 +2544,69 @@ mod ssrf_tests {
     }
 
     #[tokio::test]
+    async fn cache_follower_keeps_generation_snapshotted_at_request_start() {
+        let (url, _) =
+            cacheable_resource_fixture(200, "Cache-Control: public, max-age=3600\r\n").await;
+        let initiator = url.join("/page.html").unwrap();
+        let client = Arc::new(ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        ));
+        let callbacks = Arc::new(CallbackRegistry::new());
+        let first_generation = callbacks.begin_document();
+        let response_generations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = response_generations.clone();
+        callbacks.add_response(Arc::new(move |request, _| {
+            observed.lock().unwrap().push(request.document_generation);
+        }));
+
+        let spawn_fetch = |client: Arc<ObscuraHttpClient>, callbacks: Arc<CallbackRegistry>| {
+            let url = url.clone();
+            let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+            tokio::spawn(async move {
+                client
+                    .fetch_resource_with_callbacks(&url, request, Some(&callbacks))
+                    .await
+                    .unwrap()
+            })
+        };
+        let leader = spawn_fetch(client.clone(), callbacks.clone());
+        let follower = spawn_fetch(client.clone(), callbacks.clone());
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let follower_is_waiting = client
+                    .resource_loader
+                    .lock()
+                    .unwrap()
+                    .shared_fetches
+                    .values()
+                    .next()
+                    .is_some_and(|sender| sender.receiver_count() > 0);
+                if follower_is_waiting {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("follower did not join the shared fetch");
+        assert_eq!(callbacks.begin_document(), first_generation + 1);
+
+        leader.await.unwrap();
+        follower.await.unwrap();
+        let generations = response_generations.lock().unwrap();
+        assert_eq!(generations.len(), 2);
+        assert!(generations
+            .iter()
+            .all(|generation| *generation == first_generation));
+    }
+
+    #[tokio::test]
     async fn cacheable_identical_module_scripts_share_one_in_flight_request() {
-        let (url, network_requests) = cacheable_resource_fixture(
-            200,
-            "Cache-Control: public, max-age=3600\r\n",
-        )
-        .await;
+        let (url, network_requests) =
+            cacheable_resource_fixture(200, "Cache-Control: public, max-age=3600\r\n").await;
         let initiator = url.join("/app.js").unwrap();
         let client = Arc::new(ObscuraHttpClient::with_full_options(
             Arc::new(CookieJar::new()),

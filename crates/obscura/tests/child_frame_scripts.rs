@@ -416,6 +416,11 @@ async fn a_rejected_child_frame_does_not_leave_js_references() {
     page.settle(2000).await;
 
     assert!(page.frame_urls().is_empty(), "the frame cap was not applied");
+    assert_eq!(
+        page.resource_archive_incomplete_reasons(),
+        vec!["live frame cap reached (0 realms)".to_string()],
+        "refusing the realm must make a final resource archive incomplete",
+    );
     for registry in [
         "__obscura_frameObjects",
         "__obscura_frameWindows",

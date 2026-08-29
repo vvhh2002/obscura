@@ -24,6 +24,33 @@ struct RuntimeCanvasSurfaceSource<'a>(
     &'a HashMap<NodeId, crate::ops::CanvasBackingSurface>,
 );
 
+/// Every connected node in the document and its nested shadow trees.
+///
+/// `DomTree::descendants(document)` deliberately follows only ordinary DOM
+/// parent links. Resource loading is shadow-including instead: a closed shadow
+/// root can paint an image or CSS background just as an open one can. Keep the
+/// traversal native so it can see closed roots without exposing them through
+/// `querySelectorAll()` or weakening the JavaScript shadow-DOM boundary.
+#[cfg(feature = "render")]
+fn shadow_including_document_descendants(dom: &DomTree) -> Vec<NodeId> {
+    let mut result = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = dom.children(dom.document());
+    stack.reverse();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) || !dom.is_connected(id) {
+            continue;
+        }
+        result.push(id);
+        let mut children = dom.children(id);
+        if let Some(shadow_children) = dom.shadow_children(id) {
+            children.extend(shadow_children);
+        }
+        stack.extend(children.into_iter().rev());
+    }
+    result
+}
+
 #[cfg(feature = "render")]
 impl obscura_render::CanvasSurfaceSource for RuntimeCanvasSurfaceSource<'_> {
     fn surface(&self, node: NodeId) -> Option<obscura_render::CanvasSurface<'_>> {
@@ -409,6 +436,7 @@ impl ObscuraJsRuntime {
         let scope = &mut v8::ContextScope::new(scope, context);
 
         let handoff_key = v8::String::new(scope, "__obscura_core_handoff")?;
+        let deno_key = v8::String::new(scope, "Deno")?;
         let ops_key = v8::String::new(scope, "ops")?;
         let global = context.global(scope);
 
@@ -420,6 +448,30 @@ impl ObscuraJsRuntime {
         }
         let ops = v8::Global::new(scope, ops);
         global.delete(scope, handoff_key.into());
+        let deno_deleted = global.delete(scope, deno_key.into()).unwrap_or(false);
+        if !deno_deleted {
+            // Be fail-closed if a deno_core version ever makes the property
+            // non-configurable: erase the value and pin it as an immutable,
+            // non-enumerable `undefined` rather than running with exposed ops.
+            let undefined = v8::undefined(scope);
+            let value_cleared = global
+                .set(scope, deno_key.into(), undefined.into())
+                .unwrap_or(false);
+            let value_locked = global
+                .define_own_property(
+                    scope,
+                    deno_key.into(),
+                    undefined.into(),
+                    v8::PropertyAttribute::READ_ONLY
+                        | v8::PropertyAttribute::DONT_ENUM
+                        | v8::PropertyAttribute::DONT_DELETE,
+                )
+                .unwrap_or(false);
+            assert!(
+                value_cleared && value_locked,
+                "failed to hide deno_core's Deno global"
+            );
+        }
         Some(ops)
     }
 
@@ -444,6 +496,9 @@ impl ObscuraJsRuntime {
         let scope = &mut v8::ContextScope::new(scope, context);
 
         let Some(handoff_key) = v8::String::new(scope, "__obscura_core_handoff") else {
+            return false;
+        };
+        let Some(deno_key) = v8::String::new(scope, "Deno") else {
             return false;
         };
         let Some(ops_key) = v8::String::new(scope, "ops") else {
@@ -486,7 +541,27 @@ impl ObscuraJsRuntime {
         }
         // The child realm must not expose the handoff to frame script either.
         global.delete(scope, handoff_key.into());
-        copied > 0
+        let deno_deleted = global.delete(scope, deno_key.into()).unwrap_or(false);
+        let deno_hidden = if deno_deleted {
+            true
+        } else {
+            let undefined = v8::undefined(scope);
+            let value_cleared = global
+                .set(scope, deno_key.into(), undefined.into())
+                .unwrap_or(false);
+            let value_locked = global
+                .define_own_property(
+                    scope,
+                    deno_key.into(),
+                    undefined.into(),
+                    v8::PropertyAttribute::READ_ONLY
+                        | v8::PropertyAttribute::DONT_ENUM
+                        | v8::PropertyAttribute::DONT_DELETE,
+                )
+                .unwrap_or(false);
+            value_cleared && value_locked
+        };
+        copied > 0 && deno_hidden
     }
 
     /// Runs `source` inside `realm` and returns its value as a string. Errors
@@ -513,6 +588,90 @@ impl ObscuraJsRuntime {
             Some(value) => Ok(value.to_rust_string_lossy(scope)),
             None => Err(exception_text(scope)),
         }
+    }
+
+    /// Installs one CDP `Runtime.addBinding` function in `context` without
+    /// making deno_core's op table page-visible again.
+    ///
+    /// The returned page function closes over the native `op_binding_called`
+    /// function and binding name. Neither value is stored on the global
+    /// object, so author script can invoke the binding but cannot recover a
+    /// generic host-op bridge or choose a different binding name.
+    fn install_cdp_binding_in_context(
+        &mut self,
+        context: &deno_core::v8::Global<deno_core::v8::Context>,
+        name: &str,
+    ) -> Result<(), String> {
+        use deno_core::v8;
+
+        let ops = self
+            .ops_handoff
+            .clone()
+            .ok_or_else(|| "native op table is unavailable".to_string())?;
+        let isolate = self.runtime.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+        let context = v8::Local::new(scope, context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let scope = &mut v8::TryCatch::new(scope);
+
+        let ops = v8::Local::new(scope, ops)
+            .to_object(scope)
+            .ok_or_else(|| "native op table is not an object".to_string())?;
+        let op_key = v8::String::new(scope, "op_binding_called")
+            .ok_or_else(|| "could not allocate binding op key".to_string())?;
+        let op = ops
+            .get(scope, op_key.into())
+            .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+            .ok_or_else(|| "native binding op is unavailable".to_string())?;
+
+        // Compile the factory in the destination realm so the public wrapper
+        // has the correct Function prototype. The only privileged value it
+        // receives is the single-purpose binding op, captured lexically.
+        let source = v8::String::new(
+            scope,
+            "(function(__call,__name){const __String=String;return function(arg){if(arguments.length!==1)return;try{const payload=typeof arg==='string'?arg:__String(arg);__call(__name,payload);}catch(_){}};})",
+        )
+        .ok_or_else(|| "could not allocate binding factory source".to_string())?;
+        let script = v8::Script::compile(scope, source, None)
+            .ok_or_else(|| exception_text(scope))?;
+        let factory = script
+            .run(scope)
+            .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+            .ok_or_else(|| exception_text(scope))?;
+        let binding_name = v8::String::new(scope, name)
+            .ok_or_else(|| "binding name is too large".to_string())?;
+        let receiver = v8::undefined(scope);
+        let arguments = [op.into(), binding_name.into()];
+        let wrapper = factory
+            .call(scope, receiver.into(), &arguments)
+            .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+            .ok_or_else(|| exception_text(scope))?;
+
+        let global_key = v8::String::new(scope, name)
+            .ok_or_else(|| "binding name is too large".to_string())?;
+        if !context
+            .global(scope)
+            .set(scope, global_key.into(), wrapper.into())
+            .unwrap_or(false)
+        {
+            return Err(format!("could not install CDP binding {name}"));
+        }
+        Ok(())
+    }
+
+    /// Installs a CDP binding in the main page realm.
+    pub fn install_cdp_binding(&mut self, name: &str) -> Result<(), String> {
+        let context = self.runtime.main_context();
+        self.install_cdp_binding_in_context(&context, name)
+    }
+
+    /// Installs a CDP binding in a child-frame realm.
+    pub(crate) fn install_cdp_binding_in_realm(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+        name: &str,
+    ) -> Result<(), String> {
+        self.install_cdp_binding_in_context(realm, name)
     }
 
     /// Copies the browser-identity globals from the main realm into `realm`.
@@ -711,6 +870,42 @@ impl ObscuraJsRuntime {
         std::mem::take(&mut state.pending_frames)
     }
 
+    /// Frame documents which have completed fetching but still await a realm.
+    /// Archive callers use this as a final-state barrier instead of treating a
+    /// not-yet-drained native queue as an empty frame tree.
+    pub fn pending_frame_document_queue(&self) -> (usize, usize) {
+        let state = self.state.borrow();
+        (
+            state
+                .pending_frames
+                .len()
+                .saturating_add(state.reserved_frame_ids.len()),
+            state.pending_frame_bytes,
+        )
+    }
+
+    /// Bounded frame-queue failures observed in this document generation.
+    /// The set is page-state owned, naturally resetting with each new runtime.
+    pub fn resource_archive_incomplete_reasons(&self) -> Vec<String> {
+        self.state
+            .borrow()
+            .resource_archive_incomplete_reasons
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// postMessage deliveries queued for another page or frame realm.
+    /// Archive readiness must not declare the document quiet while this native
+    /// queue can still run a receiver which starts further resource requests.
+    pub fn pending_frame_message_queue(&self) -> (usize, usize) {
+        let state = self.state.borrow();
+        (
+            state.pending_frame_messages.len(),
+            state.pending_frame_message_bytes,
+        )
+    }
+
     /// postMessage traffic waiting to be delivered to another realm.
     pub fn take_pending_frame_messages(&self) -> Vec<crate::ops::PendingFrameMessage> {
         let mut state = self.state.borrow_mut();
@@ -832,6 +1027,8 @@ impl ObscuraJsRuntime {
         let mut state = self.state.borrow_mut();
         if state.url != url {
             state.url = url.to_string();
+            state.inherited_base_url = None;
+            state.inherited_origin = None;
             #[cfg(feature = "render")]
             {
                 // Relative resources use the document URL when no <base> is
@@ -1342,13 +1539,23 @@ impl ObscuraJsRuntime {
     /// transport before synchronous layout or paint observes the cache.
     #[cfg(feature = "render")]
     pub fn pending_render_image_urls(&self) -> Vec<(String, crate::ops::ImageRequestProfile)> {
-        let state = self.state.borrow();
-        let base_url = document_base_url(&state);
+        Self::pending_render_image_urls_for_state(&self.state.borrow())
+    }
+
+    /// Discover unresolved responsive image and poster candidates in any
+    /// document realm. Child frames keep their DOM in a separate
+    /// [`ObscuraState`], so the browser layer uses this same selector/cache
+    /// logic for every live realm instead of approximating it from attributes.
+    #[cfg(feature = "render")]
+    pub(crate) fn pending_render_image_urls_for_state(
+        state: &ObscuraState,
+    ) -> Vec<(String, crate::ops::ImageRequestProfile)> {
+        let base_url = document_base_url(state);
         let Some(dom) = state.dom.as_ref() else {
             return Vec::new();
         };
         let mut urls = Vec::new();
-        for id in dom.descendants(dom.document()) {
+        for id in shadow_including_document_descendants(dom) {
             let Some(node) = dom.get_node(id) else {
                 continue;
             };
@@ -1389,6 +1596,165 @@ impl ObscuraJsRuntime {
         urls.sort();
         urls.dedup();
         urls
+    }
+
+    /// CSS text and SVG-use references which can initiate renderer resource
+    /// requests in this document, including nested closed shadow roots.
+    ///
+    /// The returned strings deliberately mirror the browser layer's existing
+    /// scanner input: `<style>` text and `style=` values are already CSS, while
+    /// SVG `<use href>` is represented as one `url(...)` token. Keeping URL
+    /// resolution in the browser layer preserves the owning document base URL.
+    #[cfg(feature = "render")]
+    pub fn render_resource_style_sources(&self) -> Vec<String> {
+        Self::render_resource_style_sources_for_state(&self.state.borrow())
+    }
+
+    #[cfg(feature = "render")]
+    pub(crate) fn render_resource_style_sources_for_state(
+        state: &ObscuraState,
+    ) -> Vec<String> {
+        let Some(dom) = state.dom.as_ref() else {
+            return Vec::new();
+        };
+        let mut sources = Vec::new();
+        for id in shadow_including_document_descendants(dom) {
+            let Some(node) = dom.get_node(id) else {
+                continue;
+            };
+            if node
+                .as_element()
+                .is_some_and(|element| element.local.as_ref() == "style")
+            {
+                sources.push(dom.text_content(id));
+            }
+            if let Some(style) = node.get_attribute("style") {
+                sources.push(style.to_string());
+            }
+            if node
+                .as_element()
+                .is_some_and(|element| element.local.as_ref() == "use")
+            {
+                if let Some(href) = node
+                    .get_attribute("href")
+                    .or_else(|| node.get_attribute("xlink:href"))
+                {
+                    sources.push(format!("url({href})"));
+                }
+            }
+        }
+        sources
+    }
+
+    /// Inline stylesheet text owned by a shadow tree, including nested closed
+    /// roots. The browser archive layer uses this narrower view to detect
+    /// `@import` rules which cannot yet be materialized through document-level
+    /// selectors. Direct `url(...)` dependencies remain handled by
+    /// [`Self::render_resource_style_sources`].
+    #[cfg(feature = "render")]
+    pub fn shadow_inline_stylesheet_sources(&self) -> Vec<String> {
+        Self::shadow_inline_stylesheet_sources_for_state(&self.state.borrow())
+    }
+
+    #[cfg(feature = "render")]
+    pub(crate) fn shadow_inline_stylesheet_sources_for_state(
+        state: &ObscuraState,
+    ) -> Vec<String> {
+        let Some(dom) = state.dom.as_ref() else {
+            return Vec::new();
+        };
+        shadow_including_document_descendants(dom)
+            .into_iter()
+            .filter(|id| dom.containing_shadow_root(*id).is_some())
+            .filter_map(|id| {
+                dom.get_node(id)
+                    .is_some_and(|node| {
+                        node.as_element()
+                            .is_some_and(|element| element.local.as_ref() == "style")
+                    })
+                    .then(|| dom.text_content(id))
+            })
+            .collect()
+    }
+
+    /// Shadow-owned linked stylesheets which have no materialized style bridge.
+    /// Dynamic links normally create a sibling `<style data-obscura-linked>`
+    /// through the bootstrap loader. Parser/declarative-shadow links currently
+    /// have no safe CSSOM owner in the host, so archive callers must report them
+    /// as incomplete instead of silently ignoring their response graph.
+    #[cfg(feature = "render")]
+    pub fn unresolved_shadow_stylesheet_hrefs(&self) -> Vec<String> {
+        Self::unresolved_shadow_stylesheet_hrefs_for_state(&self.state.borrow())
+    }
+
+    #[cfg(feature = "render")]
+    pub(crate) fn unresolved_shadow_stylesheet_hrefs_for_state(
+        state: &ObscuraState,
+    ) -> Vec<String> {
+        let Some(dom) = state.dom.as_ref() else {
+            return Vec::new();
+        };
+        let base_url = document_base_url(state)
+            .and_then(|base| url::Url::parse(&base).ok());
+        let mut materialized = std::collections::HashSet::new();
+        let nodes = shadow_including_document_descendants(dom);
+        for id in &nodes {
+            let Some(node) = dom.get_node(*id) else {
+                continue;
+            };
+            if dom.containing_shadow_root(*id).is_none()
+                || !node
+                    .as_element()
+                    .is_some_and(|element| element.local.as_ref() == "style")
+            {
+                continue;
+            }
+            let Some(href) = node.get_attribute("data-obscura-linked") else {
+                continue;
+            };
+            let resolved = base_url
+                .as_ref()
+                .and_then(|base| base.join(href).ok())
+                .map(|url| url.to_string())
+                .unwrap_or_else(|| href.to_string());
+            materialized.insert(resolved);
+        }
+
+        let mut unresolved = Vec::new();
+        for id in nodes {
+            let Some(node) = dom.get_node(id) else {
+                continue;
+            };
+            if dom.containing_shadow_root(id).is_none()
+                || !node
+                    .as_element()
+                    .is_some_and(|element| element.local.as_ref() == "link")
+            {
+                continue;
+            }
+            let rel = node.get_attribute("rel").unwrap_or_default();
+            if !rel
+                .split_ascii_whitespace()
+                .any(|token| token.eq_ignore_ascii_case("stylesheet"))
+                || node.get_attribute("disabled").is_some()
+            {
+                continue;
+            }
+            let Some(href) = node.get_attribute("href") else {
+                continue;
+            };
+            let resolved = base_url
+                .as_ref()
+                .and_then(|base| base.join(href).ok())
+                .map(|url| url.to_string())
+                .unwrap_or_else(|| href.to_string());
+            if !materialized.contains(&resolved) {
+                unresolved.push(resolved);
+            }
+        }
+        unresolved.sort();
+        unresolved.dedup();
+        unresolved
     }
 
     /// Insert one page-transport resource outcome into the retained renderer
@@ -1480,6 +1846,111 @@ impl ObscuraJsRuntime {
             .execute_runtime_script("<eval>", wrapped)
             .map_err(|e| format!("JS error: {}", e))?;
         self.v8_to_json(result)
+    }
+
+    #[cfg(test)]
+    fn set_test_ops_visible(&mut self, visible: bool) -> Result<(), String> {
+        use deno_core::v8;
+
+        let ops = visible
+            .then(|| self.ops_handoff.clone())
+            .flatten()
+            .ok_or_else(|| "host op table unavailable".to_string());
+        let main = self.runtime.main_context();
+        let isolate = self.runtime.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+        let context = v8::Local::new(scope, main);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let key = v8::String::new(scope, "__obscura_test_ops")
+            .ok_or_else(|| "could not allocate test op key".to_string())?;
+        if visible {
+            let ops = ops?;
+            let ops = v8::Local::new(scope, ops);
+            if !context
+                .global(scope)
+                .set(scope, key.into(), ops)
+                .unwrap_or(false)
+            {
+                return Err("could not expose test op table".to_string());
+            }
+        } else {
+            context.global(scope).delete(scope, key.into());
+        }
+        Ok(())
+    }
+
+    /// Deliberately exposes the captured op table for one unit-test expression
+    /// so tests can replace a transport/geometry op and exercise failure
+    /// paths. Production page evaluation never installs this property.
+    #[cfg(test)]
+    fn evaluate_with_ops_for_test(
+        &mut self,
+        expression: &str,
+    ) -> Result<serde_json::Value, String> {
+        self.set_test_ops_visible(true)?;
+
+        let result = self.evaluate(expression);
+        self.set_test_ops_visible(false)?;
+        result
+    }
+
+    #[cfg(test)]
+    fn execute_script_with_ops_for_test(
+        &mut self,
+        name: &str,
+        source: &str,
+    ) -> Result<(), String> {
+        self.set_test_ops_visible(true)?;
+        let result = self.execute_script(name, source);
+        self.set_test_ops_visible(false)?;
+        result
+    }
+
+    /// Inline author stylesheets in stable author order. Bridge styles created
+    /// for linked, imported, or adopted sheets are excluded because their
+    /// network owner is represented elsewhere in the DOM.
+    pub fn inline_stylesheet_sources(
+        &mut self,
+    ) -> Result<Vec<(usize, String, String)>, String> {
+        let value = self.evaluate(
+            r#"[...document.querySelectorAll('style')]
+                .filter(node => {
+                    if (node.hasAttribute('data-obscura-adopted')
+                        || node.hasAttribute('data-obscura-linked')
+                        || node.hasAttribute('data-obscura-external-stylesheets')
+                        || node.hasAttribute('data-obscura-inline-import')
+                        || node.hasAttribute('data-obscura-imports-materialized')) return false;
+                    var type = (node.getAttribute('type') || '').trim().toLowerCase();
+                    return !type || type === 'text/css';
+                })
+                .map((node, author_index) => [
+                    author_index,
+                    node.textContent || '',
+                    node.getAttribute('media') || '',
+                ])"#,
+        )?;
+        serde_json::from_value(value)
+            .map_err(|error| format!("could not decode inline stylesheets: {error}"))
+    }
+
+    /// Not-yet-materialized linked stylesheets in current document order.
+    /// Synthetic links used for `@import` recursion intentionally enter this
+    /// same list so they retain ordinary cascade ordering and load semantics.
+    pub fn external_stylesheet_urls(&mut self) -> Result<Vec<(usize, String, u8)>, String> {
+        let value = self.evaluate(
+            r#"[...document.querySelectorAll('link[rel~="stylesheet"]')]
+                .map((node, link_index) => ({
+                    link_index,
+                    href: node.getAttribute('href') || '',
+                    disabled: node.hasAttribute('disabled'),
+                    loaded: node.sheet != null,
+                    import_depth: Number(node.getAttribute('data-obscura-import-depth') || 0),
+                }))
+                .filter(sheet => !sheet.disabled && !sheet.loaded && sheet.href)
+                .map(sheet => [sheet.link_index, sheet.href, sheet.import_depth])"#,
+        )?;
+        serde_json::from_value(value)
+            .map_err(|error| format!("could not decode linked stylesheets: {error}"))
     }
 
     pub async fn evaluate_for_cdp(
@@ -2346,12 +2817,19 @@ impl ObscuraJsRuntime {
         self.state.borrow().activity_generation
     }
 
-    fn has_pending_network_requests(&self) -> bool {
-        let state = self.state.borrow();
-        state
+    /// Number of page-network operations which have started but have not yet
+    /// produced a response or error. Child realms share this counter with the
+    /// top-level realm, so it is also a cheap page-wide resource barrier for
+    /// callers which need a lossless final-document archive.
+    pub fn pending_network_request_count(&self) -> u32 {
+        self.state
+            .borrow()
             .page_in_flight
             .load(std::sync::atomic::Ordering::Relaxed)
-            > 0
+    }
+
+    fn has_pending_network_requests(&self) -> bool {
+        self.pending_network_request_count() > 0
     }
 
     fn next_pending_timeout_delay_ms(&mut self) -> Option<f64> {
@@ -3193,6 +3671,33 @@ mod tests {
     }
 
     #[test]
+    fn page_cannot_reach_host_ops_after_bootstrap() {
+        let mut rt = setup_runtime("<html><body><p id='ok'>ready</p></body></html>");
+
+        assert_eq!(
+            rt.evaluate(
+                r#"({
+                    deno: typeof Deno,
+                    core: typeof _core,
+                    handoff: typeof globalThis.__obscura_core_handoff,
+                    ownerHelper: typeof _fetchWithResourceOwner,
+                    dom: document.getElementById('ok').textContent,
+                    fetch: typeof fetch,
+                })"#,
+            )
+            .unwrap(),
+            serde_json::json!({
+                "deno": "undefined",
+                "core": "undefined",
+                "handoff": "undefined",
+                "ownerHelper": "undefined",
+                "dom": "ready",
+                "fetch": "function",
+            }),
+        );
+    }
+
+    #[test]
     fn iframe_content_window_exposes_realm_globals() {
         let mut rt = setup_runtime("<html><body></body></html>");
 
@@ -3242,6 +3747,54 @@ mod tests {
                 "utilities": vec![true; 6],
             })
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_request_reservations_cancel_on_replace_remove_and_failure() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+
+        rt.evaluate_with_ops_for_test(
+            r#"(() => {
+               globalThis.__originalFrameFetchOp = globalThis.__obscura_test_ops.op_fetch_url;
+               globalThis.__obscura_test_ops.op_fetch_url = () => new Promise(() => {});
+               globalThis.__reservationFrame = document.createElement('iframe');
+               document.body.appendChild(globalThis.__reservationFrame);
+               globalThis.__reservationFrame.src = 'file:///superseded.html';
+             })()"#,
+        )
+        .unwrap();
+        assert_eq!(rt.pending_frame_document_queue(), (1, 0));
+
+        rt.evaluate("globalThis.__reservationFrame.src = 'file:///replacement.html'")
+            .unwrap();
+        assert_eq!(
+            rt.pending_frame_document_queue(),
+            (1, 0),
+            "src replacement must cancel the old id before reserving the new one",
+        );
+
+        rt.evaluate("globalThis.__reservationFrame.remove()")
+            .unwrap();
+        assert_eq!(rt.pending_frame_document_queue(), (0, 0));
+
+        rt.evaluate_with_ops_for_test(
+            r#"(() => {
+               globalThis.__obscura_test_ops.op_fetch_url = () => Promise.reject(new Error('transport failed'));
+               globalThis.__failedFrame = document.createElement('iframe');
+               document.body.appendChild(globalThis.__failedFrame);
+               globalThis.__failedFrame.src = 'file:///transport-failure.html';
+             })()"#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.pending_frame_document_queue(),
+            (0, 0),
+            "a rejected iframe transport must release its reserved owner id",
+        );
+        assert!(rt.resource_archive_incomplete_reasons().is_empty());
+        rt.evaluate_with_ops_for_test("globalThis.__obscura_test_ops.op_fetch_url = globalThis.__originalFrameFetchOp")
+            .unwrap();
     }
 
     #[test]
@@ -9801,26 +10354,26 @@ mod tests {
         rt.set_dom(dom);
         rt.set_viewport(400.0, 300.0);
         rt.run_page_init();
-        rt.execute_script(
+        rt.execute_script_with_ops_for_test(
             "batch-resize-observer-targets",
             r#"
                 globalThis.__resizeBulkCalls = 0;
                 globalThis.__resizeBulkSizes = [];
                 globalThis.__resizeLegacyGeometryCalls = 0;
                 globalThis.__resizeComputedStyleCalls = 0;
-                const nativeBulk = Deno.core.ops.op_resize_observer_measurements;
-                const nativeGeometry = Deno.core.ops.op_layout_geometry;
-                const nativeComputedStyle = Deno.core.ops.op_computed_style;
-                Deno.core.ops.op_resize_observer_measurements = input => {
+                const nativeBulk = globalThis.__obscura_test_ops.op_resize_observer_measurements;
+                const nativeGeometry = globalThis.__obscura_test_ops.op_layout_geometry;
+                const nativeComputedStyle = globalThis.__obscura_test_ops.op_computed_style;
+                globalThis.__obscura_test_ops.op_resize_observer_measurements = input => {
                     __resizeBulkCalls++;
                     __resizeBulkSizes.push(JSON.parse(input).length);
                     return nativeBulk(input);
                 };
-                Deno.core.ops.op_layout_geometry = (...args) => {
+                globalThis.__obscura_test_ops.op_layout_geometry = (...args) => {
                     __resizeLegacyGeometryCalls++;
                     return nativeGeometry(...args);
                 };
-                Deno.core.ops.op_computed_style = (...args) => {
+                globalThis.__obscura_test_ops.op_computed_style = (...args) => {
                     __resizeComputedStyleCalls++;
                     return nativeComputedStyle(...args);
                 };
@@ -9969,12 +10522,12 @@ mod tests {
             Some(1.0)
         );
 
-        rt.execute_script(
+        rt.execute_script_with_ops_for_test(
             "count-scroll-geometry-reads",
             r#"
                 globalThis.__scrollGeometryReads = 0;
-                globalThis.__nativeLayoutGeometry = Deno.core.ops.op_layout_geometry;
-                Deno.core.ops.op_layout_geometry = (...args) => {
+                globalThis.__nativeLayoutGeometry = globalThis.__obscura_test_ops.op_layout_geometry;
+                globalThis.__obscura_test_ops.op_layout_geometry = (...args) => {
                     __scrollGeometryReads++;
                     return __nativeLayoutGeometry(...args);
                 };
@@ -9986,9 +10539,9 @@ mod tests {
         let result = rt
             .evaluate("[scrollY, __scrollGeometryReads, __scrollResizeRecords]")
             .unwrap();
-        rt.execute_script(
+        rt.execute_script_with_ops_for_test(
             "restore-layout-geometry-op",
-            "Deno.core.ops.op_layout_geometry = __nativeLayoutGeometry;",
+            "globalThis.__obscura_test_ops.op_layout_geometry = __nativeLayoutGeometry;",
         )
         .unwrap();
         assert_eq!(result, serde_json::json!([50, 0, 1]));
@@ -10168,26 +10721,26 @@ mod tests {
         rt.set_dom(dom);
         rt.set_viewport(300.0, 200.0);
         rt.run_page_init();
-        rt.execute_script(
+        rt.execute_script_with_ops_for_test(
             "batch-intersection-observer-clip-graph",
             r#"
                 globalThis.__intersectionBulkCalls = 0;
                 globalThis.__intersectionBulkSizes = [];
                 globalThis.__intersectionLegacyGeometryCalls = 0;
                 globalThis.__intersectionComputedStyleCalls = 0;
-                const nativeBulk = Deno.core.ops.op_intersection_observer_measurements;
-                const nativeGeometry = Deno.core.ops.op_layout_geometry;
-                const nativeComputedStyle = Deno.core.ops.op_computed_style;
-                Deno.core.ops.op_intersection_observer_measurements = input => {
+                const nativeBulk = globalThis.__obscura_test_ops.op_intersection_observer_measurements;
+                const nativeGeometry = globalThis.__obscura_test_ops.op_layout_geometry;
+                const nativeComputedStyle = globalThis.__obscura_test_ops.op_computed_style;
+                globalThis.__obscura_test_ops.op_intersection_observer_measurements = input => {
                     __intersectionBulkCalls++;
                     __intersectionBulkSizes.push(JSON.parse(input).length);
                     return nativeBulk(input);
                 };
-                Deno.core.ops.op_layout_geometry = (...args) => {
+                globalThis.__obscura_test_ops.op_layout_geometry = (...args) => {
                     __intersectionLegacyGeometryCalls++;
                     return nativeGeometry(...args);
                 };
-                Deno.core.ops.op_computed_style = (...args) => {
+                globalThis.__obscura_test_ops.op_computed_style = (...args) => {
                     __intersectionComputedStyleCalls++;
                     return nativeComputedStyle(...args);
                 };
@@ -11765,6 +12318,15 @@ mod tests {
                 "Reflect.ownKeys(globalThis).includes('__obscura_nextPendingTimeoutDelay')"
             )
             .unwrap(),
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            rt.evaluate("typeof _fetchWithResourceOwner").unwrap(),
+            serde_json::json!("undefined")
+        );
+        assert_eq!(
+            rt.evaluate("Reflect.ownKeys(globalThis).includes('_fetchWithResourceOwner')")
+                .unwrap(),
             serde_json::json!(false)
         );
     }
@@ -14253,12 +14815,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn test_fetch_url_input_decodes_binary_body_base64() {
         let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_test_ops_visible(true).unwrap();
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
-                const originalFetchOp = Deno.core.ops.op_fetch_url;
+                const originalFetchOp = globalThis.__obscura_test_ops.op_fetch_url;
                 try {
-                    Deno.core.ops.op_fetch_url = (url) => {
+                    globalThis.__obscura_test_ops.op_fetch_url = (url) => {
                         globalThis.__capturedFetchUrl = url;
                         return JSON.stringify({
                             status: 200,
@@ -14271,7 +14834,7 @@ mod tests {
                     const bytes = Array.from(new Uint8Array(await response.arrayBuffer()));
                     return { url: globalThis.__capturedFetchUrl, bytes };
                 } finally {
-                    Deno.core.ops.op_fetch_url = originalFetchOp;
+                    globalThis.__obscura_test_ops.op_fetch_url = originalFetchOp;
                 }
             }"#,
                 None,
@@ -14281,6 +14844,7 @@ mod tests {
             )
             .await
             .unwrap();
+        rt.set_test_ops_visible(false).unwrap();
 
         assert_eq!(
             result.value.unwrap(),
@@ -14294,13 +14858,14 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn fetch_and_xhr_forward_browser_credentials_modes() {
         let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_test_ops_visible(true).unwrap();
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
-                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const originalFetchOp = globalThis.__obscura_test_ops.op_fetch_url;
                     const calls = [];
                     try {
-                        Deno.core.ops.op_fetch_url =
+                        globalThis.__obscura_test_ops.op_fetch_url =
                             (url, method, headers, body, origin, mode, credentials) => {
                                 calls.push({ url, credentials });
                                 return JSON.stringify({
@@ -14338,7 +14903,7 @@ mod tests {
 
                         return { calls, invalidFetchRejected };
                     } finally {
-                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                        globalThis.__obscura_test_ops.op_fetch_url = originalFetchOp;
                     }
                 }"#,
                 None,
@@ -14348,6 +14913,7 @@ mod tests {
             )
             .await
             .unwrap();
+        rt.set_test_ops_visible(false).unwrap();
 
         assert_eq!(
             result.value.unwrap(),
@@ -14478,12 +15044,13 @@ mod tests {
     async fn dynamic_linked_stylesheet_enters_the_live_dom_with_imports_rebased() {
         let mut rt =
             setup_runtime("<html><head></head><body><div class=\"card\"></div></body></html>");
+        rt.set_test_ops_visible(true).unwrap();
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
-                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const originalFetchOp = globalThis.__obscura_test_ops.op_fetch_url;
                     try {
-                        Deno.core.ops.op_fetch_url = (url) => JSON.stringify({
+                        globalThis.__obscura_test_ops.op_fetch_url = (url) => JSON.stringify({
                             status: 200,
                             headers: { "content-type": "text/css" },
                             body: url.endsWith("/assets/route.css")
@@ -14529,7 +15096,7 @@ mod tests {
                                 && list.length === 0,
                         };
                     } finally {
-                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                        globalThis.__obscura_test_ops.op_fetch_url = originalFetchOp;
                     }
                 }"#,
                 None,
@@ -14539,6 +15106,7 @@ mod tests {
             )
             .await
             .unwrap();
+        rt.set_test_ops_visible(false).unwrap();
 
         assert_eq!(
             result.value.unwrap(),
@@ -14563,12 +15131,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn unsuccessful_dynamic_script_response_fires_error_without_evaluating_body() {
         let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        rt.set_test_ops_visible(true).unwrap();
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
-                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const originalFetchOp = globalThis.__obscura_test_ops.op_fetch_url;
                     try {
-                        Deno.core.ops.op_fetch_url = (url) => JSON.stringify({
+                        globalThis.__obscura_test_ops.op_fetch_url = (url) => JSON.stringify({
                             status: 401,
                             headers: { "content-type": "application/json" },
                             body: "globalThis.__executedFailedScript = true",
@@ -14586,7 +15155,7 @@ mod tests {
                             executed: globalThis.__executedFailedScript === true,
                         };
                     } finally {
-                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                        globalThis.__obscura_test_ops.op_fetch_url = originalFetchOp;
                     }
                 }"#,
                 None,
@@ -14596,6 +15165,7 @@ mod tests {
             )
             .await
             .unwrap();
+        rt.set_test_ops_visible(false).unwrap();
 
         assert_eq!(
             result.value.unwrap(),
@@ -14609,13 +15179,14 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn dynamic_classic_scripts_are_async_by_default_but_honor_async_false_order() {
         let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        rt.set_test_ops_visible(true).unwrap();
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
-                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const originalFetchOp = globalThis.__obscura_test_ops.op_fetch_url;
                     const runPair = async (explicitlyInOrder) => {
                         globalThis.__dynamicOrder = [];
-                        Deno.core.ops.op_fetch_url = (url) => new Promise(resolve => {
+                        globalThis.__obscura_test_ops.op_fetch_url = (url) => new Promise(resolve => {
                             const slow = url.includes("slow");
                             setTimeout(() => resolve(JSON.stringify({
                                 status: 200,
@@ -14643,7 +15214,7 @@ mod tests {
                             pending: globalThis.__obscura_hasPendingDynamicScripts(),
                         };
                     } finally {
-                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                        globalThis.__obscura_test_ops.op_fetch_url = originalFetchOp;
                     }
                 }"#,
                 None,
@@ -14653,6 +15224,7 @@ mod tests {
             )
             .await
             .unwrap();
+        rt.set_test_ops_visible(false).unwrap();
 
         assert_eq!(
             result.value.unwrap(),
@@ -16327,7 +16899,7 @@ mod tests {
     fn html_string_scripts_remain_inert_when_connected() {
         let mut rt = setup_runtime("<html><head></head><body><div id=target></div></body></html>");
         let result = rt
-            .evaluate(
+            .evaluate_with_ops_for_test(
                 r#"
                 var scriptTestSetup = true;
                 globalThis.__fragmentScriptRuns = 0;
@@ -16363,9 +16935,9 @@ mod tests {
                 document.body.appendChild(parsed.querySelector("script"));
 
                 let externalFetches = 0;
-                const originalFetchOp = Deno.core.ops.op_fetch_url;
+                const originalFetchOp = globalThis.__obscura_test_ops.op_fetch_url;
                 try {
-                    Deno.core.ops.op_fetch_url = () => {
+                    globalThis.__obscura_test_ops.op_fetch_url = () => {
                         externalFetches++;
                         return JSON.stringify({
                             status: 200,
@@ -16378,7 +16950,7 @@ mod tests {
                     external.innerHTML = "<script src=/inert.js><\/script>";
                     document.head.appendChild(external.firstChild);
                 } finally {
-                    Deno.core.ops.op_fetch_url = originalFetchOp;
+                    globalThis.__obscura_test_ops.op_fetch_url = originalFetchOp;
                 }
                 return [globalThis.__fragmentScriptRuns, externalFetches];
                 "#,

@@ -1137,6 +1137,8 @@ async fn do_navigate(
     }
 
     let preload_scripts: Vec<String> = ctx.preload_scripts.iter().map(|(_, s)| s.clone()).collect();
+    let mut preload_bindings: Vec<String> = ctx.binding_names.iter().cloned().collect();
+    preload_bindings.sort_unstable();
 
     let (frame_id, loader_id, network_events, page_url, page_id, reached_network_idle) = {
         let page = ctx
@@ -1145,10 +1147,11 @@ async fn do_navigate(
         let frame_id = page.frame_id.clone();
         let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
 
-        // Preloads (addBinding shims, addScriptToEvaluateOnNewDocument sources)
+        // Preloads (Runtime bindings and addScriptToEvaluateOnNewDocument sources)
         // must run BEFORE the page's own scripts (CDP contract). Hand them to
         // the page so navigate_single can inject them at the right point.
         page.set_preload_scripts(preload_scripts);
+        page.set_preload_bindings(preload_bindings);
 
         let nav_method = params
             .get("__method")

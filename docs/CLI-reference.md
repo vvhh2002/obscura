@@ -29,6 +29,10 @@ Load a URL and print its content or an evaluated expression.
     --wait-until <LEVEL>     domcontentloaded | load | networkidle2 | networkidle0
                              (default load)
     --user-agent <UA>        Override the User-Agent
+    --assets-dir <DIR>       With --dump assets, save final-page response files and manifest
+    --assets-max-bytes <N>   Maximum captured response bytes (default 536870912)
+    --assets-max-resources <N>
+                             Maximum captured responses (default 4096)
     --proxy <URL>            HTTP or SOCKS5 proxy
     --stealth                Consistent browser fingerprint + tracker blocking (global)
 -e, --eval <JS>              Evaluate JS, print the result as JSON
@@ -58,6 +62,41 @@ requests a fixed `N`-second delay. `--timeout` separately bounds navigation.
 | `assets`   | Every external resource, one JSON object per line (DOM assets plus `fetch()`/XHR requests) |
 | `original` | Raw HTTP response body (binary-safe, bypasses the engine) |
 | `cookies`  | All cookies in the jar as a JSON array, including HttpOnly cookies invisible to `document.cookie` |
+
+`--dump assets` keeps its line-oriented URL output for compatibility. Add
+`--assets-dir DIR` to also create a byte-exact archive of the responses loaded
+by the final top-level document and its live child frames. Obscura follows HTTP
+redirects and JavaScript top-level navigations during the configured settle
+window; when a new document commits, responses from the replaced document are
+discarded.
+
+The archive contains `manifest.json`, the rendered `page.html`, child documents
+under `frames/`, and content-addressed response bodies under `resources/`.
+`manifest.json` records request and final URLs, redirect chains, resource type,
+frame id, status, MIME type, byte count, SHA-256, and file path. Before writing,
+the archive driver also drains resource work in the top document and every live
+frame. If a configured capture limit is reached, a network/dynamic-script task
+is still pending, renderer discovery reports a failed/timed-out/unresolved
+image or font, a live frame cannot be serialized, a classic script in the
+final DOM has no response owned by that frame, or a live child frame contains
+an unsupported module or pending navigation, the manifest is written with
+`complete: false` and the command exits unsuccessfully instead of silently
+claiming a complete archive. Internal stylesheet/frame count or depth caps and
+frame diagnostic failures are reported the same way. This mode requires a build with the `render`
+feature. The destination must be absent or empty and cannot be a symlink;
+`--output` and `--screenshot` must be outside the archive tree.
+
+Live frame images, posters, inline CSS URLs, dynamically inserted stylesheets,
+and bounded recursive `@import` graphs are archived with their owning frame id.
+
+`complete: true` describes the bounded final-page snapshot after the requested
+settle window. A page can always defer new work until a future timer, user
+gesture, or lazy-scroll event, so choose `--wait` to cover the state you need
+and retain the manifest with the files.
+
+```bash
+obscura fetch https://example.com --dump assets --assets-dir ./example-assets --wait 5
+```
 
 ## `obscura serve`
 

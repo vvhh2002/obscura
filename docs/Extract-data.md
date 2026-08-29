@@ -50,6 +50,45 @@ Every external resource (stylesheets, scripts, images, fonts, iframes), plus the
 obscura fetch https://example.com --dump assets
 ```
 
+To save the response files rather than only list URLs, add `--assets-dir`:
+
+```bash
+obscura fetch https://example.com \
+  --dump assets \
+  --assets-dir ./example-assets \
+  --wait 5
+```
+
+The directory contains `manifest.json`, rendered `page.html`, child documents
+under `frames/`, and response bodies under `resources/`. Bodies are stored
+byte-for-byte and named by SHA-256, so query strings, duplicate filenames, and
+identical content cannot overwrite one another. The manifest maps every
+request to its saved file and records its final URL after HTTP redirects,
+resource type, owning frame, status, MIME type, and size.
+
+Top-level HTTP redirects and JavaScript `location` navigations are followed
+during the settle window. Committing a replacement document resets the capture,
+so scripts and images belonging only to an intermediate page do not appear in
+the final archive. This mode requires a render-enabled build and refuses a
+non-empty or symlinked destination directory. `--output` and `--screenshot`
+must also remain outside that directory. Capture-limit failures, failed,
+timed-out, or unresolved renderer resources, network or dynamic-script work
+still pending at the archive deadline, a live frame that cannot be serialized,
+final-DOM classic scripts without a response owned by their frame, and detected
+unsupported child-frame module or navigation work still write a
+manifest with `complete: false`, then return a non-zero exit status.
+Internal stylesheet/frame safety caps and frame-inspection failures also make
+the archive explicitly incomplete.
+
+Live child-frame images, responsive `<picture>` candidates, video posters,
+inline CSS resources, dynamically inserted stylesheets, and bounded recursive
+`@import` graphs are fetched through the owning frame's page transport and keep
+that frame's id and final document URL as their archive attribution.
+
+The manifest describes a bounded snapshot after the configured settle window;
+future user-triggered or lazy-loaded work is outside that snapshot. Increase
+`--wait` when the page deliberately delays the state you want to archive.
+
 ## `original`
 
 The raw HTML the server sent, before JavaScript ran.

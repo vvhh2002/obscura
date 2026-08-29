@@ -41,6 +41,14 @@ pub struct FrameRealm {
     origin: String,
 }
 
+/// Resource state read from one live frame realm without converting realm or
+/// JSON failures into an apparently empty document.
+pub struct FrameResourceProbe {
+    pub unsupported_module_scripts: usize,
+    pub style_sources: Vec<String>,
+    pub pending_dynamic_scripts: bool,
+}
+
 impl Drop for FrameRealm {
     fn drop(&mut self) {
         self.realms.borrow_mut().forget(&self.context);
@@ -60,6 +68,21 @@ impl FrameRealm {
         url: &str,
         html: &str,
     ) -> Option<Self> {
+        Self::new_with_inherited_context(parent, frame_id, parent_frame_id, url, None, None, html)
+    }
+
+    /// Builds an inline frame with separately inherited base and origin.
+    /// They must remain distinct because `<base href>` can be cross-origin
+    /// without changing the embedding document's principal.
+    pub fn new_with_inherited_context(
+        parent: &mut ObscuraJsRuntime,
+        frame_id: u32,
+        parent_frame_id: u32,
+        url: &str,
+        inherited_base_url: Option<&str>,
+        inherited_origin: Option<&str>,
+        html: &str,
+    ) -> Option<Self> {
         let context = parent.create_realm_context()?;
         if !parent.share_ops_with_realm(&context) {
             return None;
@@ -70,7 +93,9 @@ impl FrameRealm {
         // keeps its own security token, so V8 answers `undefined` for any
         // property the page tries to read out of it, and nothing about it is
         // published below.
-        let origin = origin_of(url);
+        let origin = inherited_origin
+            .map(str::to_string)
+            .unwrap_or_else(|| origin_of(url));
         let same_origin = origin != "null" && origin == parent.page_origin();
         if same_origin {
             parent.share_security_token_with_realm(&context);
@@ -79,6 +104,8 @@ impl FrameRealm {
         let mut state = ObscuraState::new();
         state.dom = Some(parse_html(html));
         state.url = url.to_string();
+        state.inherited_base_url = inherited_base_url.map(str::to_string);
+        state.inherited_origin = inherited_origin.map(str::to_string);
         state.frame_id = frame_id;
         parent.share_resources_with(&mut state);
 
@@ -237,6 +264,16 @@ impl FrameRealm {
         self.run(parent, source).map(|_| ())
     }
 
+    /// Installs a CDP Runtime binding in this realm while keeping the native
+    /// op table outside the frame's global object.
+    pub fn install_cdp_binding(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+        name: &str,
+    ) -> Result<(), String> {
+        parent.install_cdp_binding_in_realm(&self.context, name)
+    }
+
     /// Evaluates an expression inside the frame and decodes it as JSON.
     pub fn evaluate(
         &self,
@@ -263,6 +300,7 @@ impl FrameRealm {
         parent: &mut ObscuraJsRuntime,
         load_external: impl Fn(&str) -> Option<String>,
     ) -> Vec<String> {
+        let document_base = self.document_base_url(parent);
         let scripts = match self.list_scripts(parent) {
             Ok(scripts) => scripts,
             Err(error) => return vec![error],
@@ -280,7 +318,7 @@ impl FrameRealm {
             let (name, source) = if script.src.is_empty() {
                 (format!("inline {index}"), script.text.clone())
             } else {
-                let resolved = self.resolve(&script.src);
+                let resolved = self.resolve_from(document_base.as_ref(), &script.src);
                 match load_external(&resolved) {
                     Some(source) => (resolved, source),
                     None => {
@@ -304,21 +342,311 @@ impl FrameRealm {
     /// A caller that fetches over the network needs the list before running
     /// anything, because `run_document_scripts` resolves sources synchronously.
     pub fn external_script_urls(&self, parent: &mut ObscuraJsRuntime) -> Vec<String> {
+        let document_base = self.document_base_url(parent);
         self.list_scripts(parent)
             .unwrap_or_default()
             .iter()
             .filter(|script| script.is_classic() && !script.src.is_empty())
-            .map(|script| self.resolve(&script.src))
+            .map(|script| self.resolve_from(document_base.as_ref(), &script.src))
             .collect()
+    }
+
+    /// Linked author stylesheets in document order, with their index among all
+    /// stylesheet links. The index lets the page materialize fetched CSS next
+    /// to the link that owns it without moving the sheet in cascade order.
+    pub fn external_stylesheet_urls(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+    ) -> Vec<(usize, String, u8)> {
+        let base = self.document_base_url(parent);
+        self.list_stylesheets(parent)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|stylesheet| {
+                !stylesheet.disabled && !stylesheet.loaded && !stylesheet.href.is_empty()
+            })
+            .map(|stylesheet| {
+                let resolved = base
+                    .as_ref()
+                    .and_then(|base| base.join(&stylesheet.href).ok())
+                    .map(|url| url.to_string())
+                    .unwrap_or(stylesheet.href);
+                (stylesheet.link_index, resolved, stylesheet.import_depth)
+            })
+            .collect()
+    }
+
+    /// CSS authored directly in this document, including `<style>` contents
+    /// and `style=` declarations. The page transport scans these for paint and
+    /// font URLs because they never pass through an external-sheet response.
+    pub fn style_sources(&self, parent: &mut ObscuraJsRuntime) -> Vec<String> {
+        self.try_style_sources(parent).unwrap_or_default()
+    }
+
+    /// Renderer resource-bearing CSS from the frame's ordinary DOM and all of
+    /// its nested open or closed shadow roots. This reads the frame-owned native
+    /// DomTree rather than JavaScript selectors, which intentionally cannot
+    /// pierce a closed root.
+    #[cfg(feature = "render")]
+    pub fn render_resource_style_sources(&self) -> Vec<String> {
+        let Some(state) = self.realms.borrow().by_frame_id(self.frame_id) else {
+            return Vec::new();
+        };
+        let sources = ObscuraJsRuntime::render_resource_style_sources_for_state(&state.borrow());
+        sources
+    }
+
+    /// Inline stylesheet text in this frame's nested open and closed shadow
+    /// roots. It is separate from the general CSS resource scan so archive
+    /// callers can conservatively diagnose unsupported shadow `@import`
+    /// ownership without blocking direct background/font URL capture.
+    #[cfg(feature = "render")]
+    pub fn shadow_inline_stylesheet_sources(&self) -> Vec<String> {
+        let Some(state) = self.realms.borrow().by_frame_id(self.frame_id) else {
+            return Vec::new();
+        };
+        let sources =
+            ObscuraJsRuntime::shadow_inline_stylesheet_sources_for_state(&state.borrow());
+        sources
+    }
+
+    /// Shadow-root stylesheet links for which no dynamic-loader style bridge
+    /// exists. Until those parser-created owners can be materialized in-place,
+    /// archive callers use this list to avoid a false `complete: true` result.
+    #[cfg(feature = "render")]
+    pub fn unresolved_shadow_stylesheet_hrefs(&self) -> Vec<String> {
+        let Some(state) = self.realms.borrow().by_frame_id(self.frame_id) else {
+            return Vec::new();
+        };
+        let hrefs =
+            ObscuraJsRuntime::unresolved_shadow_stylesheet_hrefs_for_state(&state.borrow());
+        hrefs
+    }
+
+    /// Inline author stylesheets in stable author order. Obscura's bridge
+    /// styles are excluded: they represent a linked/imported owner elsewhere
+    /// in the DOM and treating them as new author sheets would fetch an
+    /// `@import` twice and disturb cascade order.
+    pub fn inline_stylesheet_sources(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+    ) -> Result<Vec<(usize, String, String)>, String> {
+        self.evaluate(
+            parent,
+            r#"[...document.querySelectorAll('style')]
+                .filter(node => {
+                    if (node.hasAttribute('data-obscura-adopted')
+                        || node.hasAttribute('data-obscura-linked')
+                        || node.hasAttribute('data-obscura-external-stylesheets')
+                        || node.hasAttribute('data-obscura-inline-import')
+                        || node.hasAttribute('data-obscura-imports-materialized')) return false;
+                    var type = (node.getAttribute('type') || '').trim().toLowerCase();
+                    return !type || type === 'text/css';
+                })
+                .map((node, author_index) => [
+                    author_index,
+                    node.textContent || '',
+                    node.getAttribute('media') || '',
+                ])"#,
+        )
+        .map_err(|error| format!("could not list frame inline stylesheets: {error}"))
+        .and_then(|value| {
+            serde_json::from_value(value)
+                .map_err(|error| format!("could not decode frame inline stylesheets: {error}"))
+        })
+    }
+
+    fn try_style_sources(&self, parent: &mut ObscuraJsRuntime) -> Result<Vec<String>, String> {
+        self.evaluate(
+            parent,
+            r#"[
+                ...[...document.querySelectorAll('style')].map(node => node.textContent || ''),
+                ...[...document.querySelectorAll('[style]')].map(node => node.getAttribute('style') || ''),
+            ]"#,
+        )
+        .map_err(|error| format!("could not list frame style sources: {error}"))
+        .and_then(|value| {
+            serde_json::from_value(value)
+                .map_err(|error| format!("could not decode frame style sources: {error}"))
+        })
+    }
+
+    /// Number of module scripts still present in this live frame. Frame module
+    /// execution is not wired up yet, so callers use this to mark a resource
+    /// archive incomplete instead of silently claiming full coverage.
+    pub fn unsupported_module_script_count(&self, parent: &mut ObscuraJsRuntime) -> usize {
+        self.try_unsupported_module_script_count(parent)
+            .unwrap_or_default()
+    }
+
+    fn try_unsupported_module_script_count(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+    ) -> Result<usize, String> {
+        Ok(self
+            .list_scripts(parent)?
+            .iter()
+            .filter(|script| script.type_attribute == "module")
+            .count())
+    }
+
+    /// Whether this realm still has a dynamically inserted script being
+    /// fetched/evaluated or queued for execution. The queue lives inside each
+    /// realm's bootstrap closure, so asking only the top-level runtime misses
+    /// exactly the kind of late work used by embedded challenge widgets.
+    pub fn has_pending_dynamic_scripts(&self, parent: &mut ObscuraJsRuntime) -> bool {
+        self.try_has_pending_dynamic_scripts(parent).unwrap_or(false)
+    }
+
+    fn try_has_pending_dynamic_scripts(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+    ) -> Result<bool, String> {
+        self.evaluate(
+            parent,
+            "globalThis.__obscura_hasPendingDynamicScripts?.() === true",
+        )
+        .map_err(|error| format!("could not inspect frame dynamic scripts: {error}"))?
+        .as_bool()
+        .ok_or_else(|| "could not decode frame dynamic-script state".to_string())
+    }
+
+    /// Read every frame resource diagnostic with fallible realm evaluation.
+    /// Archive completeness must not interpret an evaluation failure as zero
+    /// scripts, zero styles, and no pending work.
+    pub fn resource_archive_probe(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+    ) -> Result<FrameResourceProbe, String> {
+        Ok(FrameResourceProbe {
+            unsupported_module_scripts: self.try_unsupported_module_script_count(parent)?,
+            style_sources: self.try_style_sources(parent)?,
+            pending_dynamic_scripts: self.try_has_pending_dynamic_scripts(parent)?,
+        })
+    }
+
+    /// A navigation requested by this realm but not committed by the host.
+    /// Child-frame navigation is intentionally separate from top navigation;
+    /// surfacing it lets archive callers report the unsupported transition.
+    pub fn pending_navigation_url(&self) -> Option<String> {
+        let state = self.realms.borrow().by_frame_id(self.frame_id)?;
+        let pending_url = state
+            .borrow()
+            .pending_navigation
+            .as_ref()
+            .map(|(url, _, _)| url.clone());
+        pending_url
+    }
+
+    /// Seed a frame's retained render cache with a resource already fetched by
+    /// the page transport, avoiding a second renderer-side download.
+    #[cfg(feature = "render")]
+    pub fn seed_render_resource(&self, url: String, bytes: Option<Vec<u8>>) {
+        let Some(state) = self.realms.borrow().by_frame_id(self.frame_id) else {
+            return;
+        };
+        let mut state = state.borrow_mut();
+        match bytes {
+            Some(bytes) => {
+                state.render_resources.seed(url, bytes);
+                crate::ops::invalidate_render_resource_geometry(&mut state);
+            }
+            None => state.render_resources.seed_missing(url),
+        }
+    }
+
+    /// Return unresolved responsive `<img>`/`<picture>` candidates and video
+    /// posters from this frame's own DOM. The selection and cache check are
+    /// shared with the top-level runtime so `srcset`, `sizes`, media queries,
+    /// and CORS profiles cannot diverge between browsing contexts.
+    #[cfg(feature = "render")]
+    pub fn pending_render_image_urls(
+        &self,
+    ) -> Vec<(String, crate::ops::ImageRequestProfile)> {
+        let Some(state) = self.realms.borrow().by_frame_id(self.frame_id) else {
+            return Vec::new();
+        };
+        let urls = ObscuraJsRuntime::pending_render_image_urls_for_state(&state.borrow());
+        urls
+    }
+
+    /// Seed one profiled frame image response after the page transport has
+    /// fetched it. A CORS image and an ordinary no-CORS image intentionally do
+    /// not share cache outcomes.
+    #[cfg(feature = "render")]
+    pub fn seed_render_image_resource(
+        &self,
+        url: String,
+        profile: crate::ops::ImageRequestProfile,
+        bytes: Option<Vec<u8>>,
+    ) {
+        let Some(state) = self.realms.borrow().by_frame_id(self.frame_id) else {
+            return;
+        };
+        let mut state = state.borrow_mut();
+        match bytes {
+            Some(bytes) if obscura_render::image_intrinsic_dimensions(&bytes).is_some() => {
+                let needs_geometry = match (&state.prepared_render, &state.dom) {
+                    (Some(prepared), Some(dom)) => {
+                        prepared.image_resource_needs_geometry(dom, &url, profile)
+                    }
+                    _ => true,
+                };
+                state.render_resources.seed_image(url, profile, bytes);
+                state.activity_generation = state.activity_generation.wrapping_add(1);
+                if needs_geometry {
+                    crate::ops::invalidate_render_resource_geometry(&mut state);
+                }
+            }
+            _ => state.render_resources.seed_image_missing(url, profile),
+        }
+    }
+
+    /// Whether a non-profiled CSS image/font outcome is already retained in
+    /// this frame's render cache.
+    #[cfg(feature = "render")]
+    pub fn render_resource_is_known(&self, url: &str) -> bool {
+        self.realms
+            .borrow()
+            .by_frame_id(self.frame_id)
+            .is_some_and(|state| state.borrow().render_resources.has_live_outcome(url))
     }
 
     /// Resolves a subresource URL against the frame's own document URL, not the
     /// parent's. A relative `src` in a frame is relative to the frame.
-    fn resolve(&self, src: &str) -> String {
-        url::Url::parse(&self.url)
-            .and_then(|base| base.join(src))
+    fn resolve_from(&self, base: Option<&url::Url>, src: &str) -> String {
+        base.cloned()
+            .or_else(|| url::Url::parse(&self.url).ok())
+            .and_then(|base| base.join(src).ok())
             .map(|url| url.to_string())
-            .unwrap_or_else(|_| src.to_string())
+            .unwrap_or_else(|| src.to_string())
+    }
+
+    /// Effective HTML document base used by inline CSS and other relative
+    /// document-owned resources.
+    pub fn document_base_url(&self, parent: &mut ObscuraJsRuntime) -> Option<url::Url> {
+        let document_url = self
+            .realms
+            .borrow()
+            .by_frame_id(self.frame_id)
+            .and_then(|state| {
+                let state = state.borrow();
+                state
+                    .inherited_base_url
+                    .as_deref()
+                    .and_then(|base| url::Url::parse(base).ok())
+            })
+            .or_else(|| url::Url::parse(&self.url).ok())?;
+        let base_href = self
+            .evaluate(
+                parent,
+                "document.querySelector('base[href]')?.getAttribute('href') || null",
+            )
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string));
+        base_href
+            .and_then(|href| document_url.join(&href).ok())
+            .or(Some(document_url))
     }
 
     fn list_scripts(&self, parent: &mut ObscuraJsRuntime) -> Result<Vec<DocumentScript>, String> {
@@ -331,8 +659,30 @@ impl FrameRealm {
             }))"#,
         );
         match listed {
-            Ok(value) => Ok(serde_json::from_value(value).unwrap_or_default()),
+            Ok(value) => serde_json::from_value(value)
+                .map_err(|error| format!("could not decode frame scripts: {error}")),
             Err(error) => Err(format!("could not list frame scripts: {error}")),
+        }
+    }
+
+    fn list_stylesheets(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+    ) -> Result<Vec<DocumentStylesheet>, String> {
+        let listed = self.evaluate(
+            parent,
+            r#"[...document.querySelectorAll('link[rel~="stylesheet"]')].map((node, link_index) => ({
+                link_index,
+                href: node.getAttribute('href') || '',
+                disabled: node.hasAttribute('disabled'),
+                loaded: node.sheet != null,
+                import_depth: Number(node.getAttribute('data-obscura-import-depth') || 0),
+            }))"#,
+        );
+        match listed {
+            Ok(value) => serde_json::from_value(value)
+                .map_err(|error| format!("could not decode frame stylesheets: {error}")),
+            Err(error) => Err(format!("could not list frame stylesheets: {error}")),
         }
     }
 }
@@ -343,6 +693,15 @@ struct DocumentScript {
     #[serde(rename = "type")]
     type_attribute: String,
     text: String,
+}
+
+#[derive(serde::Deserialize)]
+struct DocumentStylesheet {
+    link_index: usize,
+    href: String,
+    disabled: bool,
+    loaded: bool,
+    import_depth: u8,
 }
 
 impl DocumentScript {
@@ -447,6 +806,198 @@ mod tests {
         assert_eq!(frame.frame_id(), 1);
         assert!(!frame.is_same_origin_as("https://parent.example"));
         assert!(frame.is_same_origin_as("https://child.example"));
+    }
+
+    #[test]
+    fn frame_cannot_reach_host_ops_after_handoff() {
+        let mut parent = page(
+            "https://parent.example/",
+            "<html><body><p id='parent'>parent</p></body></html>",
+        );
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/frame",
+            "<html><body><p id='child'>child</p></body></html>",
+        )
+        .expect("frame realm");
+
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    r#"({
+                        deno: typeof Deno,
+                        core: typeof _core,
+                        handoff: typeof globalThis.__obscura_core_handoff,
+                        ownerHelper: typeof _fetchWithResourceOwner,
+                        dom: document.getElementById('child').textContent,
+                        fetch: typeof fetch,
+                    })"#,
+                )
+                .unwrap(),
+            serde_json::json!({
+                "deno": "undefined",
+                "core": "undefined",
+                "handoff": "undefined",
+                "ownerHelper": "undefined",
+                "dom": "child",
+                "fetch": "function",
+            }),
+        );
+    }
+
+    #[test]
+    fn frame_shadow_ops_use_the_frame_dom_when_node_ids_collide() {
+        const HTML: &str = "<!doctype html><main id='outer'></main>";
+        const SCRIPT: &str = r#"
+            globalThis.__shadowRuns = (globalThis.__shadowRuns || 0) + 1;
+            const outer = document.getElementById('outer');
+            const outerRoot = outer.attachShadow({ mode: 'closed' });
+            const inner = document.createElement('section');
+            outerRoot.appendChild(inner);
+            const innerRoot = inner.attachShadow({ mode: 'closed' });
+            innerRoot.appendChild(document.createElement('span'));
+            globalThis.__outerHost = outer;
+            globalThis.__innerHost = inner;
+        "#;
+
+        let mut parent = page("https://parent.example/", HTML);
+        parent.execute_script("<top-shadow>", SCRIPT).unwrap();
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://parent.example/frame.html",
+            HTML,
+        )
+        .expect("frame realm");
+
+        // Node ids are document-local and deliberately collide here. Shadow
+        // ops must therefore resolve the realm before consulting the tree.
+        let parent_host_nid = parent
+            .evaluate("document.getElementById('outer')._nid")
+            .unwrap()
+            .as_f64();
+        let frame_host_nid = frame
+            .evaluate(&mut parent, "document.getElementById('outer')._nid")
+            .unwrap()
+            .as_f64();
+        assert_eq!(parent_host_nid, frame_host_nid);
+        frame
+            .execute_script(&mut parent, SCRIPT)
+            .expect("frame nested closed shadows");
+
+        assert_eq!(
+            parent
+                .evaluate("globalThis.__shadowRuns")
+                .unwrap()
+                .as_f64(),
+            Some(1.0),
+        );
+        assert_eq!(
+            frame
+                .evaluate(&mut parent, "globalThis.__shadowRuns")
+                .unwrap()
+                .as_f64(),
+            Some(1.0),
+        );
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "__outerHost.shadowRoot === null && __innerHost.shadowRoot === null",
+                )
+                .unwrap(),
+            serde_json::json!(true),
+        );
+    }
+
+    #[test]
+    fn parser_created_srcdoc_keeps_about_location_and_inherits_parent_base() {
+        let mut parent = page(
+            "https://parent.example/path/page.html",
+            concat!(
+                "<!doctype html><base href='https://cdn.example/assets/'>",
+                "<iframe src='https://ignored.example/frame.html' ",
+                "srcdoc=\"<!doctype html><script src='child.js'></script>",
+                "<img src='child.png'>\"></iframe>",
+            ),
+        );
+        let pending = parent.take_pending_frames();
+        assert_eq!(pending.len(), 1);
+        let pending = pending.into_iter().next().unwrap();
+        assert_eq!(pending.url, "about:srcdoc");
+        assert_eq!(
+            pending.inherited_base_url.as_deref(),
+            Some("https://cdn.example/assets/"),
+        );
+        assert_eq!(
+            pending.inherited_origin.as_deref(),
+            Some("https://parent.example"),
+        );
+
+        let frame = FrameRealm::new_with_inherited_context(
+            &mut parent,
+            pending.frame_id,
+            pending.parent_frame_id,
+            &pending.url,
+            pending.inherited_base_url.as_deref(),
+            pending.inherited_origin.as_deref(),
+            &pending.html,
+        )
+        .expect("srcdoc frame realm");
+        let requested = std::cell::RefCell::new(Vec::new());
+        let problems = frame.run_document_scripts(&mut parent, |url| {
+            requested.borrow_mut().push(url.to_string());
+            Some("globalThis.__srcdocExternalRan = true;".to_string())
+        });
+        assert!(problems.is_empty(), "srcdoc script problems: {problems:?}");
+        assert_eq!(
+            requested.into_inner(),
+            vec!["https://cdn.example/assets/child.js"],
+        );
+        assert_eq!(frame.url(), "about:srcdoc");
+        assert_eq!(frame.origin(), "https://parent.example");
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "({url:document.URL,base:document.baseURI,ran:globalThis.__srcdocExternalRan,img:document.querySelector('img').src})",
+                )
+                .unwrap(),
+            serde_json::json!({
+                "url": "about:srcdoc",
+                "base": "https://cdn.example/assets/",
+                "ran": true,
+                "img": "https://cdn.example/assets/child.png",
+            }),
+        );
+    }
+
+    #[test]
+    fn parser_created_srcdoc_inside_declarative_shadow_root_is_queued() {
+        let parent = page(
+            "https://parent.example/path/page.html",
+            concat!(
+                "<!doctype html><section><template shadowrootmode='closed'>",
+                "<iframe srcdoc=\"<p data-shadow='srcdoc'>inside</p>\"></iframe>",
+                "</template></section>",
+            ),
+        );
+        let pending = parent.take_pending_frames();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].url, "about:srcdoc");
+        assert_eq!(
+            pending[0].inherited_base_url.as_deref(),
+            Some("https://parent.example/path/page.html"),
+        );
+        assert_eq!(
+            pending[0].inherited_origin.as_deref(),
+            Some("https://parent.example"),
+        );
+        assert!(pending[0].html.contains("data-shadow='srcdoc'"));
     }
 
     #[test]
@@ -861,8 +1412,17 @@ mod tests {
             )
             .unwrap();
 
+        let (queued_entries, queued_bytes) = parent.pending_frame_message_queue();
+        assert_eq!(queued_entries, 64, "the pending queue count was hidden");
+        assert!(queued_bytes > 0, "the pending queue byte count was hidden");
+        assert_eq!(
+            parent.resource_archive_incomplete_reasons(),
+            vec!["frame postMessage queue entry cap reached (64 message(s))".to_string()],
+            "dropping messages must make a byte-exact archive incomplete",
+        );
         let queued = parent.take_pending_frame_messages();
         assert_eq!(queued.len(), 64, "the queue was not capped");
+        assert_eq!(parent.pending_frame_message_queue(), (0, 0));
         // The messages kept are the earliest, which is the half of a handshake
         // that matters.
         assert_eq!(queued[0].data_json, r#"{"v":0}"#);

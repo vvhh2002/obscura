@@ -279,8 +279,27 @@ impl StealthHttpClient {
     ) -> Result<Response, ObscuraNetError> {
         validate_url(url, false)?;
         validate_request_mode(&request, url)?;
+        let document_generation = callbacks
+            .map(CallbackRegistry::document_generation)
+            .unwrap_or(0);
         if url.scheme() == "file" {
-            return fetch_file_url(url, request.max_response_bytes).await;
+            let request_info = RequestInfo {
+                url: url.clone(),
+                method: "GET".to_string(),
+                headers: self.extra_headers.read().await.clone(),
+                resource_type: request.resource_type,
+                document_generation,
+                frame_id: request.frame_id,
+                initiator: request.initiator.clone(),
+            };
+            if let Some(callbacks) = callbacks {
+                callbacks.fire_request(&request_info).await;
+            }
+            let response = fetch_file_url(url, request.max_response_bytes).await?;
+            if let Some(callbacks) = callbacks {
+                callbacks.fire_response(&request_info, &response).await;
+            }
+            return Ok(response);
         }
 
         let mut current_url = url.clone();
@@ -301,7 +320,6 @@ impl StealthHttpClient {
         let mut redirects = Vec::new();
         let mut redirect_tainted = false;
         let mut request_callback_fired = false;
-
         for _ in 0..20 {
             validate_request_mode(&request, &current_url)?;
             let mut req = self.client.get(current_url.as_str());
@@ -345,6 +363,9 @@ impl StealthHttpClient {
                 method: "GET".to_string(),
                 headers: self.extra_headers.read().await.clone(),
                 resource_type: request.resource_type,
+                document_generation,
+                frame_id: request.frame_id,
+                initiator: request.initiator.clone(),
             };
             if !request_callback_fired {
                 if let Some(callbacks) = callbacks {
@@ -524,7 +545,10 @@ mod tests {
     use url::Url;
 
     use super::{StealthHttpClient, send_get_with_connection_reset_retry};
-    use crate::client::{ObscuraNetError, SsrfGuardResolver};
+    use crate::client::{
+        CallbackRegistry, ObscuraNetError, RequestInfo, ResourceRequest, ResourceType, Response,
+        SsrfGuardResolver,
+    };
     use crate::cookies::CookieJar;
     use wreq::dns::{Name, Resolve};
 
@@ -640,6 +664,57 @@ mod tests {
 
         assert!(matches!(error, ObscuraNetError::Network(_)));
         assert_eq!(server.join().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn stealth_file_resource_fires_callbacks_once_with_raw_body_and_context() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let raw_body = vec![0, 0xff, 0x80, b'f', b'i', b'l', b'e'];
+        file.write_all(&raw_body).unwrap();
+        let target = Url::from_file_path(file.path()).unwrap();
+        let initiator = target.join("document.html").unwrap();
+        let client = StealthHttpClient::new(Arc::new(CookieJar::new()));
+        let callbacks = CallbackRegistry::new();
+        let generation = callbacks.begin_document();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<RequestInfo>::new()));
+        let responses = Arc::new(std::sync::Mutex::new(Vec::<(RequestInfo, Response)>::new()));
+        let observed_requests = requests.clone();
+        callbacks.add_request(Arc::new(move |request| {
+            observed_requests.lock().unwrap().push(request.clone());
+        }));
+        let observed_responses = responses.clone();
+        callbacks.add_response(Arc::new(move |request, response| {
+            observed_responses
+                .lock()
+                .unwrap()
+                .push((request.clone(), response.clone()));
+        }));
+
+        let response = client
+            .fetch_resource_with_callbacks(
+                &target,
+                ResourceRequest::subresource(ResourceType::Image, &initiator).in_frame(23),
+                Some(&callbacks),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.body, raw_body);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url, target);
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].resource_type, ResourceType::Image);
+        assert_eq!(requests[0].document_generation, generation);
+        assert_eq!(requests[0].frame_id, 23);
+        assert_eq!(requests[0].initiator.as_ref(), Some(&initiator));
+        let responses = responses.lock().unwrap();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].0.url, target);
+        assert_eq!(responses[0].0.document_generation, generation);
+        assert_eq!(responses[0].0.frame_id, 23);
+        assert_eq!(responses[0].0.initiator.as_ref(), Some(&initiator));
+        assert_eq!(responses[0].1.body, raw_body);
     }
 
     /// Serve one `Content-Encoding: gzip` response on an ephemeral port.

@@ -257,6 +257,9 @@ obscura fetch https://picsum.photos/200/300 --dump original > photo.jpg
 # List every sub-resource URL the page would fetch (NDJSON; one record per asset)
 obscura fetch https://example.com --dump assets
 
+# Save final-page HTML, frame documents, JS/images/etc. and a resource manifest
+obscura fetch https://example.com --dump assets --assets-dir ./page-assets --wait 5
+
 # Fetch through an HTTP or SOCKS proxy
 obscura --proxy socks5://127.0.0.1:1080 fetch https://example.com --dump text
 
@@ -491,6 +494,7 @@ Fetch and render a single page.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--dump` | `html` | Output: `html`, `text`, `links`, `markdown`, `assets` (NDJSON of every sub-resource URL the page references), or `original` (raw response body) |
+| `--assets-dir` | — | With `--dump assets`, save final-document HTML, frame HTML, a manifest, and byte-exact content-addressed response files (render build required) |
 | `--eval` | — | JavaScript expression to evaluate |
 | `--wait-until` | `load` | Wait: `load`, `domcontentloaded`, `networkidle0` |
 | `--timeout` | `30` | Maximum navigation time in seconds |

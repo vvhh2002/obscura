@@ -101,6 +101,16 @@ pub(crate) struct CanvasBackingSurface {
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub url: String,
+    /// Base URL inherited by an inline child document such as `about:srcdoc`.
+    ///
+    /// `url` remains the document's observable location. Keeping the inherited
+    /// base separately lets `document.URL` report `about:srcdoc` while relative
+    /// resources still resolve against the embedding document.
+    pub inherited_base_url: Option<String>,
+    /// Origin inherited by an inline child document. This is deliberately
+    /// separate from the base URL: a cross-origin `<base href>` changes URL
+    /// resolution but never changes a document's origin.
+    pub inherited_origin: Option<String>,
     /// WHATWG canonical name of the document's character encoding (e.g.
     /// "UTF-8", "EUC-JP"). Backs `document.characterSet` and the URL query
     /// encoding override for `<a>`/`<area>` hrefs in legacy-charset documents.
@@ -148,7 +158,17 @@ pub struct ObscuraState {
     pub pending_frames: Vec<PendingFrame>,
     /// Total URL and HTML bytes held by `pending_frames`.
     pub pending_frame_bytes: usize,
+    /// Frame ids reserved while an iframe document request is in flight,
+    /// mapped to the parent realm which made the reservation. Reserving before
+    /// the response arrives lets passive response capture attribute the
+    /// document to the child browsing context; binding it to its native caller
+    /// prevents a forged fetch argument from borrowing another realm's owner.
+    pub reserved_frame_ids: HashMap<u32, u32>,
     pub frame_id_counter: u32,
+    /// Resource-archive completeness failures observed while accepting frame
+    /// documents. The page drains frame documents asynchronously, so queue
+    /// refusals would otherwise disappear behind the JS-facing zero id.
+    pub resource_archive_incomplete_reasons: std::collections::BTreeSet<String>,
     /// Which frame this state belongs to; 0 is the page's own realm.
     pub frame_id: u32,
     // postMessage traffic between realms, waiting to be delivered. A realm
@@ -256,6 +276,11 @@ pub struct ObscuraState {
 pub struct PendingFrame {
     pub frame_id: u32,
     pub url: String,
+    /// The embedding document base inherited by an `about:srcdoc` document.
+    /// Ordinary URL-backed frames leave this unset.
+    pub inherited_base_url: Option<String>,
+    /// Embedding document origin inherited by `about:srcdoc`.
+    pub inherited_origin: Option<String>,
     pub html: String,
     pub viewport_width: u64,
     pub viewport_height: u64,
@@ -283,6 +308,8 @@ impl ObscuraState {
         ObscuraState {
             dom: None,
             url: "about:blank".to_string(),
+            inherited_base_url: None,
+            inherited_origin: None,
             encoding: "UTF-8".to_string(),
             title: String::new(),
             referrer: String::new(),
@@ -304,7 +331,9 @@ impl ObscuraState {
             js_network_events: Vec::new(),
             pending_frames: Vec::new(),
             pending_frame_bytes: 0,
+            reserved_frame_ids: HashMap::new(),
             frame_id_counter: 0,
+            resource_archive_incomplete_reasons: std::collections::BTreeSet::new(),
             frame_id: 0,
             pending_frame_messages: Vec::new(),
             pending_frame_message_bytes: 0,
@@ -455,6 +484,66 @@ fn response_body_byte_limit() -> usize {
         .unwrap_or(2 * 1024 * 1024)
 }
 
+/// Retain a script-initiated response for CDP using a byte-exact encoding and
+/// emit its matching network event. UTF-8 responses keep Chrome's convenient
+/// text representation; arbitrary binary is stored as base64 instead of being
+/// passed through `from_utf8_lossy`.
+fn record_js_network_response(
+    state: &Rc<RefCell<OpState>>,
+    url: &str,
+    method: &str,
+    status: u16,
+    response_headers: &HashMap<String, String>,
+    body: &[u8],
+) -> String {
+    let state_borrow = state.borrow();
+    let gs = state_borrow.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    gs.network_response_body_counter += 1;
+    let request_id = format!("fetch-{}", gs.network_response_body_counter);
+    let max_entries = response_body_entry_limit();
+    let max_bytes = response_body_byte_limit();
+    if max_entries > 0 && max_bytes > 0 && body.len() <= max_bytes {
+        let (body, base64_encoded) = match std::str::from_utf8(body) {
+            Ok(text) => (text.to_string(), false),
+            Err(_) => (BASE64.encode(body), true),
+        };
+        gs.network_response_bodies.insert(
+            request_id.clone(),
+            StoredNetworkResponseBody {
+                body,
+                base64_encoded,
+            },
+        );
+        gs.network_response_body_order.push_back(request_id.clone());
+        while gs.network_response_body_order.len() > max_entries {
+            if let Some(oldest) = gs.network_response_body_order.pop_front() {
+                gs.network_response_bodies.remove(&oldest);
+            }
+        }
+    }
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    gs.js_network_events.push(JsNetworkEvent {
+        request_id: request_id.clone(),
+        url: url.to_string(),
+        method: method.to_string(),
+        status,
+        response_headers: response_headers.clone(),
+        body_size: body.len(),
+        timestamp,
+    });
+    const MAX_JS_NETWORK_EVENTS: usize = 4096;
+    if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
+        let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
+        gs.js_network_events.drain(0..overflow);
+    }
+    request_id
+}
+
 pub type SharedState = Rc<RefCell<ObscuraState>>;
 
 /// Which document belongs to which realm.
@@ -549,7 +638,6 @@ fn node_is_connected(dom: &DomTree, node: NodeId) -> bool {
     dom.is_connected(node)
 }
 
-#[cfg(feature = "render")]
 fn shadow_including_connected_nodes(dom: &DomTree) -> HashSet<NodeId> {
     let mut connected = HashSet::new();
     let mut stack = vec![dom.document()];
@@ -997,8 +1085,8 @@ fn fragment_context_and_html(arg: &str) -> (html5ever::QualName, &str) {
 }
 
 #[op2(fast)]
-fn op_script_mark_started(state: &OpState, nid: u32) -> bool {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_script_mark_started(state: &OpState, nid: u32, frame_id: u32) -> bool {
+    let shared = frame_state(state, frame_id);
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return false;
@@ -1014,8 +1102,8 @@ fn op_script_mark_started(state: &OpState, nid: u32) -> bool {
 /// Atomically claim an executable script.  A false result means the node was
 /// created inert by an HTML-string API or has already been prepared once.
 #[op2(fast)]
-fn op_script_try_start(state: &OpState, nid: u32) -> bool {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_script_try_start(state: &OpState, nid: u32, frame_id: u32) -> bool {
+    let shared = frame_state(state, frame_id);
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return false;
@@ -1032,13 +1120,18 @@ fn op_script_try_start(state: &OpState, nid: u32) -> bool {
 /// tree. Layout intentionally remains unaware of the detached root until
 /// scoped style, slot assignment, and composed-tree paint are implemented.
 #[op2(fast)]
-fn op_shadow_attach(state: &OpState, host_nid: u32, #[string] mode: String) -> i32 {
+fn op_shadow_attach(
+    state: &OpState,
+    host_nid: u32,
+    #[string] mode: String,
+    frame_id: u32,
+) -> i32 {
     let mode = match mode.as_str() {
         "open" => ShadowRootMode::Open,
         "closed" => ShadowRootMode::Closed,
         _ => return -1,
     };
-    let shared = state.borrow::<SharedState>().clone();
+    let shared = frame_state(state, frame_id);
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return -1;
@@ -1055,8 +1148,8 @@ fn op_shadow_attach(state: &OpState, host_nid: u32, #[string] mode: String) -> i
 /// visibility in bootstrap.js.
 #[op2]
 #[string]
-fn op_shadow_root_info(state: &OpState, host_nid: u32) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_shadow_root_info(state: &OpState, host_nid: u32, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return String::new();
@@ -1297,6 +1390,26 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             serde_json::to_string(&title).unwrap_or("\"\"".into())
         }
         "document_url" => serde_json::to_string(&gs.url).unwrap_or("\"\"".into()),
+        "document_base_url" => serde_json::to_string(
+            &document_base_url(&gs).unwrap_or_else(|| gs.url.clone()),
+        )
+        .unwrap_or("\"\"".into()),
+        "document_origin" => serde_json::to_string(&document_origin(&gs))
+            .unwrap_or("\"null\"".into()),
+        "connected_iframes" => {
+            let mut ids = shadow_including_connected_nodes(dom)
+                .into_iter()
+                .filter(|id| {
+                    dom.get_node(*id).is_some_and(|node| {
+                        node.as_element()
+                            .is_some_and(|name| name.local.as_ref() == "iframe")
+                    })
+                })
+                .map(|id| id.index())
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_string())
+        }
         "document_referrer" => serde_json::to_string(&gs.referrer).unwrap_or("\"\"".into()),
         "document_encoding" => serde_json::to_string(&gs.encoding).unwrap_or("\"UTF-8\"".into()),
         "document_element" => {
@@ -2153,6 +2266,18 @@ fn cors_response_allows(
     }
 }
 
+fn resource_owner_is_reserved_for(
+    page: &ObscuraState,
+    realm_frame_id: u32,
+    resource_owner_frame_id: u32,
+) -> bool {
+    resource_owner_frame_id == 0
+        || page
+            .reserved_frame_ids
+            .get(&resource_owner_frame_id)
+            .is_some_and(|parent_frame_id| *parent_frame_id == realm_frame_id)
+}
+
 #[op2(async)]
 #[string]
 async fn op_fetch_url(
@@ -2164,16 +2289,44 @@ async fn op_fetch_url(
     #[string] origin: String,
     #[string] mode: String,
     #[string] credentials: String,
+    #[string] frame_context_json: String,
 ) -> Result<String, deno_error::JsErrorBox> {
+    // deno_core async ops currently accept at most nine generated arguments
+    // (including OpState). Keep the executing realm and archive owner in one
+    // internal tuple rather than growing this already-wide transport op.
+    let (realm_frame_id, resource_owner_frame_id): (u32, u32) =
+        serde_json::from_str(&frame_context_json).map_err(|error| {
+            deno_error::JsErrorBox::generic(format!("invalid fetch frame context: {error}"))
+        })?;
+    let resource_owner_valid = {
+        let state_borrow = state.borrow();
+        let page = state_borrow.borrow::<SharedState>().clone();
+        let page = page.borrow();
+        resource_owner_is_reserved_for(&page, realm_frame_id, resource_owner_frame_id)
+    };
+    if !resource_owner_valid {
+        return Err(deno_error::JsErrorBox::generic(format!(
+            "resource owner frame {resource_owner_frame_id} is not reserved for realm {realm_frame_id}"
+        )));
+    }
     tracing::debug!(
         "op_fetch_url called: {} {} (intercept check pending)",
         method,
         url
     );
 
-    let (cookie_jar, in_flight, page_in_flight, intercept_tx, proxy_url, callbacks, http_client) = {
+    let (
+        cookie_jar,
+        in_flight,
+        page_in_flight,
+        proxy_url,
+        callbacks,
+        http_client,
+        frame_id,
+        initiator,
+    ) = {
         let state_borrow = state.borrow();
-        let gs = state_borrow.borrow::<SharedState>().clone();
+        let gs = frame_state(&state_borrow, realm_frame_id);
         let mut gs = gs.borrow_mut();
         for pattern in &gs.blocked_urls {
             if pattern == "*" || url.contains(pattern) || glob_match(pattern, &url) {
@@ -2200,29 +2353,55 @@ async fn op_fetch_url(
             .http_client
             .as_ref()
             .and_then(|c| c.proxy_url().map(|s| s.to_string()));
-        tracing::debug!(
-            "op_fetch_url: intercept_enabled={}, has_tx={}",
-            gs.intercept_enabled,
-            gs.intercept_tx.is_some()
-        );
-        let itx = if gs.intercept_enabled {
-            gs.intercept_counter += 1;
-            gs.intercept_tx
-                .clone()
-                .map(|tx| (tx, format!("intercept-{}", gs.intercept_counter)))
-        } else {
-            None
-        };
+        let initiator = url::Url::parse(&gs.url)
+            .ok()
+            .or_else(|| url::Url::parse(&origin).ok());
         (
             jar,
             in_flight,
             Arc::clone(&gs.page_in_flight),
-            itx,
             proxy_url,
             gs.callbacks.clone(),
             gs.http_client.clone(),
+            if resource_owner_frame_id == 0 {
+                gs.frame_id
+            } else {
+                resource_owner_frame_id
+            },
+            initiator,
         )
     };
+    let resource_type = if resource_owner_frame_id == 0 {
+        ResourceType::Fetch
+    } else {
+        ResourceType::Document
+    };
+    // Fetch interception belongs to the page/CDP session, not to an individual
+    // realm. Frame states inherit the enabled flag but deliberately do not own
+    // the channel or request-id counter, so resolve these from the page state
+    // after releasing the realm borrow above.
+    let intercept_tx = {
+        let state_borrow = state.borrow();
+        let page = state_borrow.borrow::<SharedState>().clone();
+        let mut page = page.borrow_mut();
+        tracing::debug!(
+            "op_fetch_url: intercept_enabled={}, has_tx={}",
+            page.intercept_enabled,
+            page.intercept_tx.is_some()
+        );
+        if page.intercept_enabled {
+            page.intercept_counter += 1;
+            page.intercept_tx
+                .clone()
+                .map(|tx| (tx, format!("intercept-{}", page.intercept_counter)))
+        } else {
+            None
+        }
+    };
+    let callback_generation = callbacks
+        .as_ref()
+        .map(|callbacks| callbacks.document_generation())
+        .unwrap_or(0);
     // The private-network opt-in is a BrowserContext policy, not only a
     // process-wide environment setting.  Navigation already honours the
     // context's configured HTTP client; scripted fetch/XHR must use the same
@@ -2268,7 +2447,11 @@ async fn op_fetch_url(
             url: url.clone(),
             method: method.clone(),
             headers: custom_headers.clone(),
-            resource_type: "Fetch".to_string(),
+            resource_type: if resource_type == ResourceType::Document {
+                "Document".to_string()
+            } else {
+                "Fetch".to_string()
+            },
             resolver: resolve_tx,
         };
         if tx.send(intercepted).is_ok() {
@@ -2279,9 +2462,41 @@ async fn op_fetch_url(
                     body: b,
                 }) => {
                     let resp_headers: HashMap<String, String> = h;
+                    let resp_bytes = b.as_bytes().to_vec();
+                    let resp_body_base64 = BASE64.encode(&resp_bytes);
+                    if let Some(ref cbs) = callbacks {
+                        let resp = fetch_response(
+                            &url,
+                            status,
+                            resp_headers.clone(),
+                            resp_bytes.clone(),
+                            Vec::new(),
+                        );
+                        let info = RequestInfo {
+                            url: resp.url.clone(),
+                            method: method.clone(),
+                            headers: custom_headers,
+                            resource_type,
+                            document_generation: callback_generation,
+                            frame_id,
+                            initiator: initiator.clone(),
+                        };
+                        cbs.fire_request(&info).await;
+                        cbs.fire_response(&info, &resp).await;
+                    }
+                    let response_request_id = record_js_network_response(
+                        &state,
+                        &url,
+                        &method,
+                        status,
+                        &resp_headers,
+                        &resp_bytes,
+                    );
                     return Ok(serde_json::json!({
                         "status": status,
                         "body": b,
+                        "bodyBase64": resp_body_base64,
+                        "requestId": response_request_id,
                         "url": url,
                         "headers": resp_headers,
                     })
@@ -2367,10 +2582,9 @@ async fn op_fetch_url(
     let custom_headers: std::collections::HashMap<String, String> =
         override_headers.unwrap_or_else(|| serde_json::from_str(&headers_json).unwrap_or_default());
 
-    // Passive request observation (non-blocking). Fires for every request that
-    // reaches the network (Fulfill/Fail from the interception channel short-
-    // circuit earlier). on_request/on_response previously fired only for
-    // navigation; this wires them for JS fetch()/XHR too.
+    // Passive request observation (non-blocking). Interception Fulfill is
+    // handled above because it never reaches this transport path; ordinary and
+    // Continue requests are observed here.
     if let Some(ref cbs) = callbacks {
         if cbs.has_request_callbacks().await {
             if let Ok(parsed) = url::Url::parse(&url) {
@@ -2378,7 +2592,10 @@ async fn op_fetch_url(
                     url: parsed,
                     method: method.clone(),
                     headers: custom_headers.clone(),
-                    resource_type: ResourceType::Fetch,
+                    resource_type,
+                    document_generation: callback_generation,
+                    frame_id,
+                    initiator: initiator.clone(),
                 };
                 cbs.fire_request(&info).await;
             }
@@ -2444,7 +2661,7 @@ async fn op_fetch_url(
     {
         let stealth = {
             let st = state.borrow();
-            let gs = st.borrow::<SharedState>().clone();
+            let gs = frame_state(&st, realm_frame_id);
             let client = gs.borrow().stealth_client.clone();
             client
         };
@@ -2460,6 +2677,10 @@ async fn op_fetch_url(
                 credentials,
                 callbacks.clone(),
                 allow_private_network,
+                callback_generation,
+                frame_id,
+                initiator.clone(),
+                resource_type,
             )
             .await;
         }
@@ -2473,6 +2694,7 @@ async fn op_fetch_url(
     let mut current_method = req_method;
     let mut current_body = body;
     let mut redirects_followed: usize = 0;
+    let mut redirected_from = Vec::new();
     let response = loop {
         let mut req = client
             .request(current_method.clone(), &current_url)
@@ -2602,6 +2824,7 @@ async fn op_fetch_url(
             current_body.clear();
         }
 
+        redirected_from.push(base);
         current_url = next_url.to_string();
     };
 
@@ -2612,6 +2835,38 @@ async fn op_fetch_url(
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
+
+    // CORS controls whether page JavaScript may observe a response; it does
+    // not erase the response which the browser transport actually received.
+    // Read and publish those exact bytes to passive archive/Network observers
+    // before returning the opaque CORS failure to fetch(). Otherwise a page
+    // can make a real response silently disappear from a `complete: true`
+    // resource archive merely by omitting ACAO.
+    let resp_bytes = response
+        .bytes()
+        .await
+        .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+    if let Some(ref cbs) = callbacks {
+        if cbs.has_response_callbacks().await {
+            let resp = fetch_response(
+                &current_url,
+                status,
+                resp_headers.clone(),
+                resp_bytes.to_vec(),
+                redirected_from.clone(),
+            );
+            let info = RequestInfo {
+                url: resp.url.clone(),
+                method: method.clone(),
+                headers: custom_headers.clone(),
+                resource_type,
+                document_generation: callback_generation,
+                frame_id,
+                initiator: initiator.clone(),
+            };
+            cbs.fire_response(&info, &resp).await;
+        }
+    }
 
     let final_is_cross_origin = request_origin(&current_url)
         .map(|request_origin| request_origin != page_origin)
@@ -2646,71 +2901,16 @@ async fn op_fetch_url(
         }
     }
 
-    let resp_bytes = response
-        .bytes()
-        .await
-        .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
     let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
     let resp_body_base64 = BASE64.encode(&resp_bytes);
-    if let Some(ref cbs) = callbacks {
-        if cbs.has_response_callbacks().await {
-            let resp = fetch_response(&url, status, resp_headers.clone(), resp_bytes.to_vec());
-            let info = RequestInfo {
-                url: resp.url.clone(),
-                method: method.clone(),
-                headers: resp_headers.clone(),
-                resource_type: ResourceType::Fetch,
-            };
-            cbs.fire_response(&info, &resp).await;
-        }
-    }
-    let response_request_id = {
-        let state_borrow = state.borrow();
-        let gs = state_borrow.borrow::<SharedState>().clone();
-        let mut gs = gs.borrow_mut();
-        gs.network_response_body_counter += 1;
-        let request_id = format!("fetch-{}", gs.network_response_body_counter);
-        let max_entries = response_body_entry_limit();
-        let max_bytes = response_body_byte_limit();
-        if max_entries > 0 && max_bytes > 0 && resp_bytes.len() <= max_bytes {
-            gs.network_response_bodies.insert(
-                request_id.clone(),
-                StoredNetworkResponseBody {
-                    body: resp_body.clone(),
-                    base64_encoded: false,
-                },
-            );
-            gs.network_response_body_order.push_back(request_id.clone());
-            while gs.network_response_body_order.len() > max_entries {
-                if let Some(oldest) = gs.network_response_body_order.pop_front() {
-                    gs.network_response_bodies.remove(&oldest);
-                }
-            }
-        }
-        // Record a network event so the CDP layer emits requestWillBeSent /
-        // responseReceived for this script-initiated request (#406). Keyed by
-        // the same fetch-{N} id as the stored body so Network.getResponseBody
-        // resolves. Capped to keep a long-lived page from growing unbounded.
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        gs.js_network_events.push(JsNetworkEvent {
-            request_id: request_id.clone(),
-            url: url.clone(),
-            method: method.clone(),
-            status,
-            response_headers: resp_headers.clone(),
-            body_size: resp_bytes.len(),
-            timestamp,
-        });
-        const MAX_JS_NETWORK_EVENTS: usize = 4096;
-        if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
-            let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
-            gs.js_network_events.drain(0..overflow);
-        }
-        request_id
-    };
+    let response_request_id = record_js_network_response(
+        &state,
+        &current_url,
+        &method,
+        status,
+        &resp_headers,
+        &resp_bytes,
+    );
 
     tracing::debug!(
         "op_fetch_url completed: {} {} ({} bytes)",
@@ -2724,7 +2924,7 @@ async fn op_fetch_url(
         "body": resp_body,
         "bodyBase64": resp_body_base64,
         "requestId": response_request_id,
-        "url": url,
+        "url": current_url,
         "headers": resp_headers,
     })
     .to_string())
@@ -2738,13 +2938,14 @@ fn fetch_response(
     status: u16,
     headers: HashMap<String, String>,
     body: Vec<u8>,
+    redirected_from: Vec<url::Url>,
 ) -> Response {
     Response {
         url: url::Url::parse(url).unwrap_or_else(|_| url::Url::parse("http://0.0.0.0/").unwrap()),
         status,
         headers,
         body,
-        redirected_from: Vec::new(),
+        redirected_from,
     }
 }
 
@@ -2766,11 +2967,17 @@ async fn stealth_fetch_all(
     credentials: FetchCredentials,
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
+    document_generation: u64,
+    frame_id: u32,
+    initiator: Option<url::Url>,
+    resource_type: ResourceType,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
+    let request_method = method.clone();
     let mut current_method = method;
     let mut current_body = body;
     let mut redirects_followed: usize = 0;
+    let mut redirected_from = Vec::new();
 
     let (status, resp_headers, resp_bytes): (u16, HashMap<String, String>, Vec<u8>) = loop {
         let parsed_current = match url::Url::parse(&current_url) {
@@ -2839,8 +3046,34 @@ async fn stealth_fetch_all(
             current_method = "GET".to_string();
             current_body.clear();
         }
+        redirected_from.push(parsed_current);
         current_url = next_url.to_string();
     };
+
+    // Keep passive response capture independent of the page-facing CORS
+    // decision, exactly like the ordinary reqwest transport above. The bytes
+    // have already arrived here; JS still receives a CORS rejection below.
+    if let Some(ref cbs) = callbacks {
+        if cbs.has_response_callbacks().await {
+            let resp = fetch_response(
+                &current_url,
+                status,
+                resp_headers.clone(),
+                resp_bytes.clone(),
+                redirected_from.clone(),
+            );
+            let info = RequestInfo {
+                url: resp.url.clone(),
+                method: request_method,
+                headers: custom_headers,
+                resource_type,
+                document_generation,
+                frame_id,
+                initiator,
+            };
+            cbs.fire_response(&info, &resp).await;
+        }
+    }
 
     let final_is_cross_origin = request_origin(&current_url)
         .map(|request_origin| request_origin != page_origin)
@@ -2876,24 +3109,12 @@ async fn stealth_fetch_all(
 
     let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
     let resp_body_base64 = BASE64.encode(&resp_bytes);
-    if let Some(ref cbs) = callbacks {
-        if cbs.has_response_callbacks().await {
-            let resp = fetch_response(&url, status, resp_headers.clone(), resp_bytes.clone());
-            let info = RequestInfo {
-                url: resp.url.clone(),
-                method: current_method.clone(),
-                headers: resp_headers.clone(),
-                resource_type: ResourceType::Fetch,
-            };
-            cbs.fire_response(&info, &resp).await;
-        }
-    }
 
     Ok(serde_json::json!({
         "status": status,
         "body": resp_body,
         "bodyBase64": resp_body_base64,
-        "url": url,
+        "url": current_url,
         "headers": resp_headers,
     })
     .to_string())
@@ -2928,7 +3149,13 @@ fn glob_match(pattern: &str, url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{cors_response_allows, glob_match, validate_fetch_url, FetchCredentials};
+    use super::{
+        cors_response_allows, glob_match, queue_pending_frame_document,
+        reserve_pending_frame_id, resource_owner_is_reserved_for, validate_fetch_url,
+        FetchCredentials, InterceptResolution, ObscuraState, MAX_PENDING_FRAME_BYTES,
+        MAX_PENDING_FRAME_DOCUMENTS,
+    };
+    use crate::frame::FrameRealm;
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
 
@@ -2936,12 +3163,202 @@ mod tests {
     use super::{
         ensure_prepared_geometry, ensure_prepared_render, node_is_connected,
         queue_retained_style_mutation, retained_style_mutation,
-        shadow_including_connected_nodes, ObscuraState, MAX_PENDING_STYLE_MUTATIONS,
+        shadow_including_connected_nodes, MAX_PENDING_STYLE_MUTATIONS,
     };
     #[cfg(feature = "render")]
     use obscura_dom::ShadowRootMode;
 
     use super::{pbkdf2_derive, PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES};
+
+    #[test]
+    fn bounded_frame_document_queue_records_each_refusal_once() {
+        let mut state = ObscuraState::new();
+        for index in 0..MAX_PENDING_FRAME_DOCUMENTS {
+            assert_ne!(
+                queue_pending_frame_document(
+                    &mut state,
+                    &format!("https://example.test/{index}"),
+                    None,
+                    None,
+                    "<p>frame</p>",
+                    100,
+                    50,
+                    0,
+                    0,
+                ),
+                0,
+            );
+        }
+        assert_eq!(
+            queue_pending_frame_document(
+                &mut state,
+                "https://example.test/refused",
+                None,
+                None,
+                "<p>frame</p>",
+                100,
+                50,
+                0,
+                0,
+            ),
+            0,
+        );
+        assert_eq!(
+            queue_pending_frame_document(
+                &mut state,
+                "https://example.test/refused-again",
+                None,
+                None,
+                "<p>frame</p>",
+                100,
+                50,
+                0,
+                0,
+            ),
+            0,
+        );
+        assert_eq!(
+            state
+                .resource_archive_incomplete_reasons
+                .iter()
+                .filter(|reason| reason.contains("queue entry cap"))
+                .count(),
+            1,
+        );
+
+        state.pending_frames.clear();
+        state.pending_frame_bytes = MAX_PENDING_FRAME_BYTES;
+        assert_eq!(
+            queue_pending_frame_document(
+                &mut state,
+                "https://example.test/too-large",
+                None,
+                None,
+                "x",
+                100,
+                50,
+                0,
+                0,
+            ),
+            0,
+        );
+        assert!(state
+            .resource_archive_incomplete_reasons
+            .contains(&format!(
+                "frame document queue byte cap reached ({MAX_PENDING_FRAME_BYTES} bytes)"
+            )));
+
+        state.pending_frame_bytes = 0;
+        state.frame_id_counter = u32::MAX;
+        assert_eq!(
+            queue_pending_frame_document(
+                &mut state,
+                "https://example.test/id-exhausted",
+                None,
+                None,
+                "x",
+                100,
+                50,
+                0,
+                0,
+            ),
+            0,
+        );
+        assert!(state
+            .resource_archive_incomplete_reasons
+            .contains("frame id space exhausted"));
+    }
+
+    #[test]
+    fn reserved_frame_id_transitions_into_the_pending_queue_without_leaking_capacity() {
+        let mut state = ObscuraState::new();
+        let frame_id = reserve_pending_frame_id(&mut state, 0);
+        assert_ne!(frame_id, 0);
+        assert_eq!(state.reserved_frame_ids.get(&frame_id), Some(&0));
+
+        assert_eq!(
+            queue_pending_frame_document(
+                &mut state,
+                "https://example.test/child",
+                None,
+                None,
+                "<p>frame</p>",
+                100,
+                50,
+                0,
+                frame_id,
+            ),
+            frame_id,
+        );
+        assert!(!state.reserved_frame_ids.contains_key(&frame_id));
+        assert_eq!(state.pending_frames.len(), 1);
+        assert_eq!(state.pending_frames[0].frame_id, frame_id);
+
+        // A canceled or superseded completion cannot resurrect the browsing
+        // context or consume another queue slot.
+        assert_eq!(
+            queue_pending_frame_document(
+                &mut state,
+                "https://example.test/stale",
+                None,
+                None,
+                "<p>stale</p>",
+                100,
+                50,
+                0,
+                frame_id,
+            ),
+            0,
+        );
+        assert_eq!(state.pending_frames.len(), 1);
+    }
+
+    #[test]
+    fn resource_owner_must_be_live_and_reserved_by_the_calling_realm() {
+        let mut state = ObscuraState::new();
+        let frame_id = reserve_pending_frame_id(&mut state, 7);
+        assert_ne!(frame_id, 0);
+
+        assert!(resource_owner_is_reserved_for(&state, 7, 0));
+        assert!(resource_owner_is_reserved_for(&state, 7, frame_id));
+        assert!(!resource_owner_is_reserved_for(&state, 0, frame_id));
+        assert!(!resource_owner_is_reserved_for(&state, 7, frame_id + 1));
+
+        assert_eq!(
+            queue_pending_frame_document(
+                &mut state,
+                "https://example.test/forged",
+                None,
+                None,
+                "<p>forged</p>",
+                100,
+                50,
+                0,
+                frame_id,
+            ),
+            0,
+        );
+        assert_eq!(
+            state.reserved_frame_ids.get(&frame_id),
+            Some(&7),
+            "a forged completion must not consume the legitimate reservation",
+        );
+    }
+
+    #[test]
+    fn in_flight_frame_reservations_share_the_pending_document_cap() {
+        let mut state = ObscuraState::new();
+        for _ in 0..MAX_PENDING_FRAME_DOCUMENTS {
+            assert_ne!(reserve_pending_frame_id(&mut state, 0), 0);
+        }
+        assert_eq!(state.reserved_frame_ids.len(), MAX_PENDING_FRAME_DOCUMENTS);
+        assert_eq!(reserve_pending_frame_id(&mut state, 0), 0);
+        assert!(state
+            .resource_archive_incomplete_reasons
+            .contains(&format!(
+                "frame document queue entry cap reached ({MAX_PENDING_FRAME_DOCUMENTS} documents)"
+            )));
+    }
 
     // SEC-006 / #580 — PBKDF2 parameters arrive straight from page JS. Without
     // caps, a huge iteration count pins the single-threaded runtime and a huge
@@ -3065,6 +3482,335 @@ mod tests {
         assert!(
             err.to_lowercase().contains("scheme"),
             "error should name the forbidden scheme: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn intercepted_fulfill_fires_lossless_callbacks_with_page_context() {
+        let mut runtime = ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html("<html><body></body></html>"));
+        runtime.set_url("https://example.com/frame/document.html");
+        runtime.run_page_init();
+
+        let callbacks = std::sync::Arc::new(obscura_net::CallbackRegistry::new());
+        let generation = callbacks.begin_document();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responses = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_requests = requests.clone();
+        callbacks.add_request(std::sync::Arc::new(move |request| {
+            observed_requests.lock().unwrap().push(request.clone());
+        }));
+        let observed_responses = responses.clone();
+        callbacks.add_response(std::sync::Arc::new(move |request, response| {
+            observed_responses
+                .lock()
+                .unwrap()
+                .push((request.clone(), response.clone()));
+        }));
+        runtime.set_callbacks(callbacks);
+
+        let (intercept_tx, mut intercept_rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime.set_intercept_tx(intercept_tx);
+        runtime.set_intercept_enabled(true);
+        let raw_body = "fulfilled\0body".to_string();
+        let expected_body = raw_body.as_bytes().to_vec();
+        let responder = tokio::spawn(async move {
+            let intercepted = intercept_rx.recv().await.expect("intercepted request");
+            assert_eq!(intercepted.url, "https://example.com/assets/mock.bin");
+            assert_eq!(intercepted.method, "GET");
+            intercepted
+                .resolver
+                .send(InterceptResolution::Fulfill {
+                    status: 206,
+                    headers: std::collections::HashMap::from([(
+                        "content-type".to_string(),
+                        "application/octet-stream".to_string(),
+                    )]),
+                    body: raw_body,
+                })
+                .unwrap();
+        });
+
+        let result = runtime
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const response = await fetch("/assets/mock.bin", {
+                        headers: { "x-capture-test": "yes" },
+                    });
+                    return {
+                        status: response.status,
+                        url: response.url,
+                        bytes: Array.from(new Uint8Array(await response.arrayBuffer())),
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        responder.await.unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "status": 206,
+                "url": "https://example.com/assets/mock.bin",
+                "bytes": expected_body.clone(),
+            })
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].document_generation, generation);
+        assert_eq!(requests[0].frame_id, 0);
+        assert_eq!(
+            requests[0].initiator.as_ref().map(url::Url::as_str),
+            Some("https://example.com/frame/document.html")
+        );
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("x-capture-test")
+                .map(String::as_str),
+            Some("yes")
+        );
+        let responses = responses.lock().unwrap();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].0.document_generation, generation);
+        assert_eq!(responses[0].0.frame_id, 0);
+        assert_eq!(responses[0].1.body, expected_body);
+        drop(responses);
+
+        let events = runtime.take_js_network_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].url, "https://example.com/assets/mock.bin");
+        assert_eq!(events[0].status, 206);
+        let stored = runtime
+            .get_network_response_body(&events[0].request_id)
+            .expect("fulfilled response body retained");
+        assert!(!stored.base64_encoded);
+        assert_eq!(stored.body.as_bytes(), expected_body);
+    }
+
+    #[cfg(feature = "stealth")]
+    fn spawn_cors_denied_response_server() -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let body = b"cors-denied-response\0\xff";
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len(),
+            );
+            stream.write_all(headers.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+        });
+        (format!("http://{address}/blocked.bin"), server)
+    }
+
+    #[cfg(feature = "stealth")]
+    async fn assert_cors_denied_response_is_passively_captured(use_stealth: bool) {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (target, server) = spawn_cors_denied_response_server();
+        let mut runtime = ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html("<html><body></body></html>"));
+        runtime.set_url("https://origin.example/page.html");
+        runtime.run_page_init();
+        if use_stealth {
+            runtime.set_stealth_client(std::sync::Arc::new(
+                obscura_net::StealthHttpClient::new(std::sync::Arc::new(
+                    obscura_net::CookieJar::new(),
+                )),
+            ));
+        }
+
+        let callbacks = std::sync::Arc::new(obscura_net::CallbackRegistry::new());
+        let generation = callbacks.begin_document();
+        let responses = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = responses.clone();
+        callbacks.add_response(std::sync::Arc::new(move |request, response| {
+            observed
+                .lock()
+                .unwrap()
+                .push((request.clone(), response.clone()));
+        }));
+        runtime.set_callbacks(callbacks);
+
+        let target_json = serde_json::to_string(&target).unwrap();
+        let result = runtime
+            .call_function_on_for_cdp(
+                &format!(
+                    r#"async () => {{
+                        try {{
+                            await fetch({target_json});
+                            return "unexpectedly-visible";
+                        }} catch (error) {{
+                            return error && error.name;
+                        }}
+                    }}"#,
+                ),
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(result.value, Some(serde_json::json!("TypeError")));
+        let responses = responses.lock().unwrap();
+        assert_eq!(responses.len(), 1, "stealth={use_stealth}");
+        let (request, response) = &responses[0];
+        assert_eq!(request.document_generation, generation);
+        assert_eq!(request.frame_id, 0);
+        assert_eq!(request.resource_type, obscura_net::ResourceType::Fetch);
+        assert_eq!(
+            request.initiator.as_ref().map(url::Url::as_str),
+            Some("https://origin.example/page.html"),
+        );
+        assert_eq!(response.url.as_str(), target);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"cors-denied-response\0\xff");
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn cors_denied_response_bytes_reach_passive_capture_for_both_transports() {
+        assert_cors_denied_response_is_passively_captured(false).await;
+        assert_cors_denied_response_is_passively_captured(true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_dynamic_scripts_use_realm_state_and_page_interception() {
+        let mut runtime = ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html(
+            "<html><head></head><body><div id=parent-only></div></body></html>",
+        ));
+        runtime.set_url("https://parent.example/root.html");
+        runtime.run_page_init();
+
+        let callbacks = std::sync::Arc::new(obscura_net::CallbackRegistry::new());
+        let generation = callbacks.begin_document();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responses = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_requests = requests.clone();
+        callbacks.add_request(std::sync::Arc::new(move |request| {
+            observed_requests.lock().unwrap().push(request.clone());
+        }));
+        let observed_responses = responses.clone();
+        callbacks.add_response(std::sync::Arc::new(move |request, response| {
+            observed_responses
+                .lock()
+                .unwrap()
+                .push((request.clone(), response.clone()));
+        }));
+        runtime.set_callbacks(callbacks);
+
+        // Interception is page-scoped. FrameRealm intentionally does not copy
+        // this sender, so a frame-aware fetch op must still consult the page
+        // for interception while using the frame for request attribution.
+        let (intercept_tx, mut intercept_rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime.set_intercept_tx(intercept_tx);
+        runtime.set_intercept_enabled(true);
+
+        let frame = FrameRealm::new(
+            &mut runtime,
+            17,
+            0,
+            "https://child.example/frame/document.html",
+            "<html><head></head><body><script id=parser>globalThis.__frameParserRuns += 1;</script></body></html>",
+        )
+        .expect("frame realm");
+
+        let responder = tokio::spawn(async move {
+            let intercepted = intercept_rx.recv().await.expect("intercepted frame script");
+            assert_eq!(
+                intercepted.url,
+                "https://child.example/frame/dynamic.js"
+            );
+            assert_eq!(intercepted.method, "GET");
+            intercepted
+                .resolver
+                .send(InterceptResolution::Fulfill {
+                    status: 200,
+                    headers: std::collections::HashMap::from([(
+                        "content-type".to_string(),
+                        "text/javascript".to_string(),
+                    )]),
+                    body: "globalThis.__frameExternalRuns += 1;".to_string(),
+                })
+                .unwrap();
+        });
+
+        frame
+            .execute_script(
+                &mut runtime,
+                r#"
+                    globalThis.__frameParserRuns = 0;
+                    const parser = document.getElementById("parser");
+                    globalThis.__markParserScripts([parser._nid]);
+                    document.head.appendChild(parser);
+
+                    globalThis.__frameExternalRuns = 0;
+                    const external = document.createElement("script");
+                    external.src = "dynamic.js";
+                    document.body.appendChild(external);
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            frame
+                .evaluate(&mut runtime, "globalThis.__frameParserRuns")
+                .unwrap(),
+            serde_json::json!(0),
+            "moving a parser-started frame script executed it again"
+        );
+
+        runtime.run_event_loop_bounded(500).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), responder)
+            .await
+            .expect("frame script never reached page interception")
+            .expect("interception responder failed");
+
+        assert_eq!(
+            frame
+                .evaluate(&mut runtime, "globalThis.__frameExternalRuns")
+                .unwrap(),
+            serde_json::json!(1),
+            "the fetched script did not execute in its frame realm"
+        );
+        assert_eq!(
+            frame.fetched_urls(),
+            vec!["https://child.example/frame/dynamic.js".to_string()]
+        );
+        assert!(
+            runtime.fetched_urls().is_empty(),
+            "the frame request leaked into the page realm's fetched URLs"
+        );
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].document_generation, generation);
+        assert_eq!(requests[0].frame_id, 17);
+        assert_eq!(
+            requests[0].initiator.as_ref().map(url::Url::as_str),
+            Some("https://child.example/frame/document.html")
+        );
+        drop(requests);
+
+        let responses = responses.lock().unwrap();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].0.frame_id, 17);
+        assert_eq!(
+            responses[0].0.initiator.as_ref().map(url::Url::as_str),
+            Some("https://child.example/frame/document.html")
         );
     }
 
@@ -3572,6 +4318,18 @@ fn op_post_frame_message(
         .saturating_add(data_json.len())
         > frame_message_queue_byte_limit();
     if over_entries || over_bytes {
+        if over_entries {
+            gs.resource_archive_incomplete_reasons.insert(format!(
+                "frame postMessage queue entry cap reached ({} message(s))",
+                frame_message_queue_entry_limit(),
+            ));
+        }
+        if over_bytes {
+            gs.resource_archive_incomplete_reasons.insert(format!(
+                "frame postMessage queue byte cap reached ({} bytes)",
+                frame_message_queue_byte_limit(),
+            ));
+        }
         tracing::warn!(
             "dropping a postMessage for frame {}: {} already queued, {} bytes",
             target_frame_id,
@@ -3604,6 +4362,121 @@ async fn op_sleep(#[number] millis: u64) {
 const MAX_PENDING_FRAME_DOCUMENTS: usize = 64;
 const MAX_PENDING_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
+fn reserve_pending_frame_id(state: &mut ObscuraState, parent_frame_id: u32) -> u32 {
+    let pending_documents = state
+        .pending_frames
+        .len()
+        .saturating_add(state.reserved_frame_ids.len());
+    if pending_documents >= MAX_PENDING_FRAME_DOCUMENTS {
+        state.resource_archive_incomplete_reasons.insert(format!(
+            "frame document queue entry cap reached ({MAX_PENDING_FRAME_DOCUMENTS} documents)"
+        ));
+        tracing::warn!(
+            "refusing a frame document reservation: {} pending documents, {} bytes",
+            pending_documents,
+            state.pending_frame_bytes,
+        );
+        return 0;
+    }
+    let Some(frame_id) = state.frame_id_counter.checked_add(1) else {
+        state
+            .resource_archive_incomplete_reasons
+            .insert("frame id space exhausted".to_string());
+        tracing::warn!("frame id space exhausted");
+        return 0;
+    };
+    state.frame_id_counter = frame_id;
+    state
+        .reserved_frame_ids
+        .insert(frame_id, parent_frame_id);
+    frame_id
+}
+
+fn queue_pending_frame_document(
+    state: &mut ObscuraState,
+    url: &str,
+    inherited_base_url: Option<&str>,
+    inherited_origin: Option<&str>,
+    html: &str,
+    viewport_width: u64,
+    viewport_height: u64,
+    parent_frame_id: u32,
+    reserved_frame_id: u32,
+) -> u32 {
+    let frame_id = if reserved_frame_id == 0 {
+        reserve_pending_frame_id(state, parent_frame_id)
+    } else {
+        reserved_frame_id
+    };
+    if frame_id == 0
+        || state.reserved_frame_ids.get(&frame_id).copied() != Some(parent_frame_id)
+    {
+        // A superseding src/srcdoc mutation can cancel an in-flight request
+        // before its completion microtask reaches this op. That stale
+        // completion, or a completion forged by another realm, is ignored and
+        // cannot consume the legitimate parent's reservation.
+        return 0;
+    }
+    state.reserved_frame_ids.remove(&frame_id);
+    let bytes = url
+        .len()
+        .saturating_add(inherited_base_url.map_or(0, str::len))
+        .saturating_add(inherited_origin.map_or(0, str::len))
+        .saturating_add(html.len());
+    if state
+        .pending_frames
+        .len()
+        .saturating_add(state.reserved_frame_ids.len())
+        >= MAX_PENDING_FRAME_DOCUMENTS
+    {
+        state.resource_archive_incomplete_reasons.insert(format!(
+            "frame document queue entry cap reached ({MAX_PENDING_FRAME_DOCUMENTS} documents)"
+        ));
+        tracing::warn!(
+            "dropping frame document: {} pending documents, {} bytes",
+            state.pending_frames.len(),
+            state.pending_frame_bytes,
+        );
+        return 0;
+    }
+    if state.pending_frame_bytes.saturating_add(bytes) > MAX_PENDING_FRAME_BYTES {
+        state.resource_archive_incomplete_reasons.insert(format!(
+            "frame document queue byte cap reached ({MAX_PENDING_FRAME_BYTES} bytes)"
+        ));
+        tracing::warn!(
+            "dropping frame document: {} pending documents, {} bytes",
+            state.pending_frames.len(),
+            state.pending_frame_bytes,
+        );
+        return 0;
+    }
+    state.pending_frame_bytes = state.pending_frame_bytes.saturating_add(bytes);
+    state.pending_frames.push(PendingFrame {
+        frame_id,
+        url: url.to_string(),
+        inherited_base_url: inherited_base_url.map(str::to_string),
+        inherited_origin: inherited_origin.map(str::to_string),
+        html: html.to_string(),
+        viewport_width,
+        viewport_height,
+        parent_frame_id,
+    });
+    frame_id
+}
+
+/// Reserve the browsing-context id used to attribute an iframe document
+/// response while its request is still in flight. The same id is consumed by
+/// `op_frame_document_ready` after the bytes arrive, or canceled when the
+/// element is removed or its navigation is superseded.
+#[op2(fast)]
+fn op_reserve_frame_document(scope: &mut v8::HandleScope, state: &OpState) -> u32 {
+    let caller = realm_state(scope, state);
+    let parent_frame_id = caller.borrow().frame_id;
+    let shared = state.borrow::<SharedState>().clone();
+    let mut page = shared.borrow_mut();
+    reserve_pending_frame_id(&mut page, parent_frame_id)
+}
+
 // Hands a fetched frame document to the host and returns the id the frame will
 // have. The realm itself is built later, by whoever owns the runtime. A zero
 // id means the bounded native queue refused the document.
@@ -3612,42 +4485,65 @@ fn op_frame_document_ready(
     scope: &mut v8::HandleScope,
     state: &OpState,
     #[string] url: &str,
+    #[string] inherited_base_url: &str,
     #[string] html: &str,
     #[number] viewport_width: u64,
     #[number] viewport_height: u64,
+    reserved_frame_id: u32,
 ) -> u32 {
     // Whoever called this is the new frame's parent, which is how a frame
     // nested two deep gets `parent` pointing at the frame above it rather than
     // at the page.
-    let parent_frame_id = realm_state(scope, state).borrow().frame_id;
+    let caller = realm_state(scope, state);
+    let caller = caller.borrow();
+    let parent_frame_id = caller.frame_id;
+    let inherited_origin = (url == "about:srcdoc").then(|| document_origin(&caller));
+    drop(caller);
     let gs = state.borrow::<SharedState>().clone();
     let mut gs = gs.borrow_mut();
-    let bytes = url.len().saturating_add(html.len());
-    if gs.pending_frames.len() >= MAX_PENDING_FRAME_DOCUMENTS
-        || gs.pending_frame_bytes.saturating_add(bytes) > MAX_PENDING_FRAME_BYTES
-    {
-        tracing::warn!(
-            "dropping frame document: {} pending documents, {} bytes",
-            gs.pending_frames.len(),
-            gs.pending_frame_bytes,
-        );
-        return 0;
-    }
-    let Some(frame_id) = gs.frame_id_counter.checked_add(1) else {
-        tracing::warn!("frame id space exhausted");
-        return 0;
-    };
-    gs.frame_id_counter = frame_id;
-    gs.pending_frame_bytes = gs.pending_frame_bytes.saturating_add(bytes);
-    gs.pending_frames.push(PendingFrame {
-        frame_id,
-        url: url.to_string(),
-        html: html.to_string(),
+    queue_pending_frame_document(
+        &mut gs,
+        url,
+        (!inherited_base_url.is_empty()).then_some(inherited_base_url),
+        inherited_origin.as_deref(),
+        html,
         viewport_width,
         viewport_height,
         parent_frame_id,
+        reserved_frame_id,
+    )
+}
+
+/// Cancels a frame document queued before a newer `src` or `srcdoc` replaced
+/// it. Attached realms are discarded by the normal liveness sweep; this keeps
+/// a stale queued document from running scripts or requesting subresources.
+#[op2(fast)]
+fn op_cancel_frame_document(state: &OpState, frame_id: u32) {
+    if frame_id == 0 {
+        return;
+    }
+    let shared = state.borrow::<SharedState>().clone();
+    let mut state = shared.borrow_mut();
+    state.reserved_frame_ids.remove(&frame_id);
+    let mut removed_bytes = 0usize;
+    state.pending_frames.retain(|frame| {
+        if frame.frame_id == frame_id {
+            removed_bytes = removed_bytes
+                .saturating_add(frame.url.len())
+                .saturating_add(
+                    frame
+                        .inherited_base_url
+                        .as_deref()
+                        .map_or(0, str::len),
+                )
+                .saturating_add(frame.inherited_origin.as_deref().map_or(0, str::len))
+                .saturating_add(frame.html.len());
+            false
+        } else {
+            true
+        }
     });
-    frame_id
+    state.pending_frame_bytes = state.pending_frame_bytes.saturating_sub(removed_bytes);
 }
 
 /// Whether async host work can be scheduled without aborting the isolate.
@@ -4404,7 +5300,9 @@ pub fn build_extension() -> Extension {
         op_get_cookies(),
         op_set_cookie(),
         op_navigate(),
+        op_reserve_frame_document(),
         op_frame_document_ready(),
+        op_cancel_frame_document(),
         op_post_frame_message(),
         op_sleep(),
         op_async_runtime_available(),
@@ -4617,9 +5515,12 @@ fn op_waapi_control(
     changed
 }
 
-#[cfg(feature = "render")]
 pub(crate) fn document_base_url(state: &ObscuraState) -> Option<String> {
-    let document_url = url::Url::parse(&state.url).ok()?;
+    let document_url = state
+        .inherited_base_url
+        .as_deref()
+        .and_then(|base| url::Url::parse(base).ok())
+        .or_else(|| url::Url::parse(&state.url).ok())?;
     let base_href = state.dom.as_ref().and_then(|dom| {
         dom.query_selector("base[href]")
             .ok()
@@ -4633,6 +5534,19 @@ pub(crate) fn document_base_url(state: &ObscuraState) -> Option<String> {
         Some(href) => document_url.join(&href).ok().map(|url| url.to_string()),
         None => Some(document_url.to_string()),
     }
+}
+
+fn document_origin(state: &ObscuraState) -> String {
+    state
+        .inherited_origin
+        .clone()
+        .or_else(|| {
+            url::Url::parse(&state.url)
+                .ok()
+                .filter(|url| url.origin().is_tuple())
+                .map(|url| url.origin().ascii_serialization())
+        })
+        .unwrap_or_else(|| "null".to_string())
 }
 
 #[cfg(feature = "render")]
@@ -5079,7 +5993,8 @@ async fn op_load_image_metadata(
         let initiator = url::Url::parse(&gs.url)
             .or_else(|_| url::Url::parse(&selected_url))
             .unwrap_or_else(|_| url::Url::parse("about:blank").unwrap());
-        let mut request = ResourceRequest::subresource(ResourceType::Image, &initiator);
+        let mut request =
+            ResourceRequest::subresource(ResourceType::Image, &initiator).in_frame(gs.frame_id);
         match profile {
             ImageRequestProfile::CorsInclude => {
                 request.mode = RequestMode::Cors;

@@ -59,6 +59,10 @@ pub struct CdpContext {
     target_session_counter: u64,
     pub preload_scripts: Vec<(String, String)>, // (identifier, source)
     pub preload_counter: u32,
+    /// Runtime binding names to install natively in every new document. Kept
+    /// apart from preload source so the shim can close over one private op
+    /// without exposing `Deno.core.ops` to page-authored JavaScript.
+    pub binding_names: HashSet<String>,
     // Which sessions asked for each `Runtime.addBinding` name. A binding is a
     // session-scoped subscription in CDP, and a client discards any event whose
     // sessionId is not one it holds, so the call has to go back to the session
@@ -176,6 +180,7 @@ impl CdpContext {
             browser_context_counter: 0,
             target_session_counter: 0,
             preload_scripts: Vec::new(),
+            binding_names: HashSet::new(),
             binding_sessions: HashMap::new(),
             preload_counter: 0,
             fetch_intercept: FetchInterceptState::new(),
@@ -595,22 +600,17 @@ pub(crate) fn drain_binding_calls(ctx: &mut CdpContext) {
         };
         for (name, payload) in calls {
             // The sessions that asked for this binding, narrowed to the page the
-            // call came from. Falling back to every session of the page keeps a
-            // binding that was installed without a session (a preload, or a
-            // direct embedder) deliverable rather than silently dropped.
-            let registered = ctx.binding_sessions.get(&name);
+            // call came from. A stale page-held function after removeBinding is
+            // deliberately dropped: it must not turn into an unregistered event
+            // delivered to every session on the page.
+            let Some(registered) = ctx.binding_sessions.get(&name) else {
+                continue;
+            };
             let targets: Vec<&str> = page_sessions
                 .iter()
                 .copied()
-                .filter(|session| {
-                    registered.is_none_or(|owners| owners.iter().any(|owner| owner == session))
-                })
+                .filter(|session| registered.iter().any(|owner| owner == session))
                 .collect();
-            let targets = if targets.is_empty() {
-                page_sessions.clone()
-            } else {
-                targets
-            };
             for session_id in targets {
                 events.push(CdpEvent {
                     method: "Runtime.bindingCalled".into(),

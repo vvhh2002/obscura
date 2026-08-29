@@ -1,6 +1,12 @@
 "use strict";
 (function () {
 
+// deno_core installs its host bridge as a page-visible global while the
+// snapshot is restored. Capture it in this bootstrap closure before the host
+// removes globalThis.Deno; page scripts can use the web shims below, but can
+// never name the native op table or forge archive attribution arguments.
+const _core = Deno.core;
+
 // Pre-declare all internal globals as non-enumerable so they are invisible
 // to Object.keys(window) / for-in enumeration. Must run before any var
 // declarations or property assignments below: once a property is defined
@@ -27,7 +33,8 @@
     '__obscura_hw', '__obscura_mem',
     '__documentReadyState__', '__currentUrl',
     // internal helpers (var-declared throughout the file)
-    '__processDynScriptQueue', '_decodeDataScriptUrl', '_markNative', '_fpRand', '_fpNoise',
+    '__processDynScriptQueue', '_decodeDataScriptUrl', '_fetchWithResourceOwner',
+    '_cancelIframeDocumentsInSubtree', '_markNative', '_fpRand', '_fpNoise',
     '_fpCache', '_getFp', '_fp', '_splitAsciiWhitespace',
     '_getElementsByClassName', '_docEncoding', '_docIsUtf8',
     '_isSpecialScheme', '_applyDocQueryEncoding', '_anchorBase',
@@ -70,11 +77,11 @@
 
 // Handoff for child frame realms. deno_core binds ops into the main context
 // only, so a realm restored from the snapshot arrives with its own empty
-// `Deno.core.ops`. The host reads this to take the main realm's bound op table
+// `_core.ops`. The host reads this to take the main realm's bound op table
 // and to find each new realm's own table to fill, then deletes the global in
 // the same step, so page script never sees it (see runtime.rs
 // `take_ops_handoff` / `share_ops_with_realm`).
-globalThis.__obscura_core_handoff = Deno.core;
+globalThis.__obscura_core_handoff = _core;
 
 globalThis.__obscura_errors = [];
 
@@ -122,7 +129,7 @@ const _DOM_TREE_MUTATION_COMMANDS = new Set([
 let _realmFrameId = 0;
 
 const _dom = (cmd, a1, a2) => {
-  const result = Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""), _realmFrameId);
+  const result = _core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""), _realmFrameId);
   if (_DOM_MUTATION_COMMANDS.has(cmd)) {
     _domMutationEpoch++;
     // Resize observation is tied to rendering-invalidating DOM work. The
@@ -318,15 +325,18 @@ function _decodeDataScriptUrl(url) {
 // native per-document state so it survives wrapper churn, fragment parsing,
 // moves, and cloneNode().
 globalThis.__markParserScripts = function(nids) {
-  for (const nid of nids || []) Deno.core.ops.op_script_mark_started(+nid);
+  for (const nid of nids || []) {
+    _core.ops.op_script_mark_started(+nid, _realmFrameId);
+  }
 };
 async function __fetchDynClassicScript(task) {
   let body;
   if (task.url.startsWith('data:')) {
     body = _decodeDataScriptUrl(task.url);
   } else {
-    const raw = await Deno.core.ops.op_fetch_url(
-      task.url, "GET", "{}", "", task.pageOrigin, "no-cors", "same-origin"
+    const raw = await _core.ops.op_fetch_url(
+      task.url, "GET", "{}", "", task.pageOrigin, "no-cors", "same-origin",
+      JSON.stringify([_realmFrameId, 0])
     );
     const parsed = JSON.parse(raw);
     // The HTML script-fetch algorithm treats an unsuccessful HTTP response
@@ -551,8 +561,9 @@ function _cssImportApplies(media) {
 async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
   if (depth > 4 || seen.has(url)) return "";
   seen.add(url);
-  const raw = await Deno.core.ops.op_fetch_url(
-    url, "GET", "{}", "", pageOrigin, "no-cors", "same-origin"
+  const raw = await _core.ops.op_fetch_url(
+    url, "GET", "{}", "", pageOrigin, "no-cors", "same-origin",
+    JSON.stringify([_realmFrameId, 0])
   );
   const parsed = JSON.parse(raw);
   if (parsed.blocked || parsed.status >= 400 || parsed.status === 0) {
@@ -586,6 +597,13 @@ async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
 // event before revealing their content; firing it while discarding the CSS
 // left the DOM loaded but unstyled. Issue #409.
 async function _loadLinkedStylesheet(c) {
+  // Archive/render warmup turns @import rules into synthetic link owners so
+  // their response flows through the page transport with exact bytes, frame
+  // attribution, recursive depth limits, and explicit failure diagnostics.
+  // Its host fetches and materializes these links synchronously; starting the
+  // generic dynamic-link loader as well would issue a duplicate `fetch`-typed
+  // request and race the owner index used for cascade placement.
+  if (c.hasAttribute('data-obscura-page-transport')) return;
   // obscura does not yet reflect the `rel` IDL attribute back to the content
   // attribute, so `link.rel = "stylesheet"` leaves getAttribute('rel') null.
   // Read both so the property-assignment form (the common framework pattern)
@@ -739,7 +757,7 @@ function _getElementsByClassName(root, classNames) {
   return HTMLCollection._from(matched);
 }
 const _consoleFn = (level, args) => {
-  try { Deno.core.ops.op_console_msg(level, args.map(a => {
+  try { _core.ops.op_console_msg(level, args.map(a => {
     if (a === null) return "null";
     if (a === undefined) return "undefined";
     if (a instanceof Error) {
@@ -803,7 +821,7 @@ const _scheduleAfter = (delay, fn) => {
   // tasks, so leave them pending instead of aborting or incorrectly turning a
   // task into a microtask. Normal browser and CDP execution always takes the
   // task-queue path below.
-  if (!Deno.core.ops.op_async_runtime_available()) {
+  if (!_core.ops.op_async_runtime_available()) {
     return undefined;
   }
   // A child frame realm cannot use deno_core's timer queue: op_timer_queue
@@ -820,21 +838,21 @@ const _scheduleAfter = (delay, fn) => {
     const frameTimerId = -(++_frameTimerSeq);
     const state = { cancelled: false };
     _frameTimerStates.set(frameTimerId, state);
-    Deno.core.ops.op_sleep(d).then(() => {
+    _core.ops.op_sleep(d).then(() => {
       _frameTimerStates.delete(frameTimerId);
       if (state.cancelled) return;
-      Deno.core.ops.op_begin_render_task?.();
+      _core.ops.op_begin_render_task?.();
       fn();
     });
     return frameTimerId;
   }
   // The callback runs only when the embedder pumps the event loop, after the
   // current microtask checkpoint.
-  return Deno.core.queueUserTimer(0, false, d, () => {
+  return _core.queueUserTimer(0, false, d, () => {
     // HTML timer/observer/rAF delivery starts a new task. Freeze animation
     // time lazily on that task's first style/layout read so a callback that
     // waited in the host queue samples its actual delivery instant.
-    Deno.core.ops.op_begin_render_task?.();
+    _core.ops.op_begin_render_task?.();
     return fn();
   });
 };
@@ -845,7 +863,7 @@ const _cancelScheduled = (nativeId) => {
     if (state) state.cancelled = true;
     _frameTimerStates.delete(nativeId);
   }
-  else Deno.core.cancelTimer(nativeId);
+  else _core.cancelTimer(nativeId);
 };
 
 // Timers accept a string first arg per the HTML spec (e.g. the Aliyun WAF
@@ -1033,9 +1051,9 @@ let _browserPostedTaskWakePending = false;
 
 function _browserPostedTaskScheduleWake() {
   if (_browserPostedTaskWakePending) return;
-  if (!Deno.core.ops.op_async_runtime_available()) return;
+  if (!_core.ops.op_async_runtime_available()) return;
   _browserPostedTaskWakePending = true;
-  Deno.core.ops.op_posted_task().then(
+  _core.ops.op_posted_task().then(
     _browserPostedTaskRunOne,
     () => {
       _browserPostedTaskWakePending = false;
@@ -1063,7 +1081,7 @@ function _browserPostedTaskRunOne() {
   }
   if (!callback) return;
 
-  Deno.core.ops.op_begin_render_task?.();
+  _core.ops.op_begin_render_task?.();
   try { callback(); }
   catch (error) { console.error("Posted task error:", error); }
   finally {
@@ -1740,7 +1758,7 @@ function _eventTargetDispatch(target, event) {
 const _customElementConstructionStack = [];
 
 function __prepareInsertedScript(script) {
-  if (!Deno.core.ops.op_script_try_start(script._nid)) return;
+  if (!_core.ops.op_script_try_start(script._nid, _realmFrameId)) return;
   const scriptType = (script.getAttribute('type') || '').trim().toLowerCase();
   const isModule = scriptType === 'module';
   const isImportMap = scriptType === 'importmap';
@@ -1754,7 +1772,7 @@ function __prepareInsertedScript(script) {
         || globalThis.location?.href
         || 'about:blank';
       try {
-        error = Deno.core.ops.op_add_import_map(script.textContent || '', base) || '';
+        error = _core.ops.op_add_import_map(script.textContent || '', base) || '';
       } catch (e) {
         error = e && e.message ? e.message : String(e);
       }
@@ -1874,6 +1892,24 @@ function __prepareInsertedSubtree(root) {
   for (const script of scripts) __prepareInsertedScript(script);
 }
 
+// Cancel child-document reservations before a DOM mutation removes their
+// owning iframe. Attached realms are still released by the host liveness
+// sweep; this synchronous cleanup covers requests which have an owner id but
+// have not produced a realm yet.
+function _cancelIframeDocumentsInSubtree(root) {
+  if (!root || root._nid == null) return;
+  const frames = [];
+  if (root.nodeType === 1 && root.localName === 'iframe') frames.push(root);
+  const ids = _domParse('query_selector_all_scoped', root._nid, 'iframe') || [];
+  for (const nid of ids) {
+    const frame = _wrapEl(+nid);
+    if (frame && !frames.includes(frame)) frames.push(frame);
+  }
+  for (const frame of frames) {
+    if (typeof frame._resetIframeFrame === 'function') frame._resetIframeFrame();
+  }
+}
+
 function _seedDetachedTreeState(node) {
   node._treeDetachedExact = true;
   node._treeParent = null;
@@ -1923,6 +1959,11 @@ class Node {
   get baseURI() {
     try {
       const doc = globalThis.document;
+      // Native state already applies the first connected <base href> to the
+      // document URL (or srcdoc's inherited fallback). Do not join the same
+      // relative <base> a second time here.
+      const effective = _domParse("document_base_url");
+      if (effective) return effective;
       const docUrl = (doc && doc.URL) || "";
       const baseEl = (doc && doc.querySelector) ? doc.querySelector("base[href]") : null;
       if (baseEl) {
@@ -1941,7 +1982,10 @@ class Node {
     const oldChildren = _domParse("child_nodes", this._nid) || [];
     for (const c of oldChildren) {
       const child = _wrap(c);
-      if (child) _detachStyleSheetsInSubtree(child);
+      if (child) {
+        _cancelIframeDocumentsInSubtree(child);
+        _detachStyleSheetsInSubtree(child);
+      }
       _dom("remove_child", c);
     }
     let added = [];
@@ -2040,6 +2084,7 @@ class Node {
       _dom("remove_child", linkedStyle._nid);
       _linkedStylesheetNodes.delete(c);
     }
+    _cancelIframeDocumentsInSubtree(c);
     const parentConnected = this.isConnected;
     const removed = _dom("remove_child", c._nid) === "true";
     if (!removed) {
@@ -2074,6 +2119,7 @@ class Node {
     else if (newChild.parentNode) _detachStyleSheetsInSubtree(newChild);
     const parentConnected = this.isConnected;
     const removedWindowNames = _windowNamedNamesInTree(oldChild);
+    _cancelIframeDocumentsInSubtree(oldChild);
     const inserted = _dom("insert_before", newChild._nid, oldChild._nid) === "true";
     if (!inserted) {
       throw new DOMException(
@@ -2480,7 +2526,7 @@ function _applyDocQueryEncoding(u) {
   let decoded;
   try { decoded = decodeURIComponent(u.search.slice(1)); } catch (e) { return u; }
   let reencoded;
-  try { reencoded = Deno.core.ops.op_url_encode_query(decoded, _docEncoding(), _isSpecialScheme(u.protocol)); }
+  try { reencoded = _core.ops.op_url_encode_query(decoded, _docEncoding(), _isSpecialScheme(u.protocol)); }
   catch (e) { return u; }
   const newSearch = '?' + reencoded;
   if (newSearch === u.search) return u;
@@ -2945,7 +2991,7 @@ class Animation {
   }
   _native(action, value = 0) {
     try {
-      const changed = !!Deno.core.ops.op_waapi_control?.(this._nativeId, action, Number(value) || 0);
+      const changed = !!_core.ops.op_waapi_control?.(this._nativeId, action, Number(value) || 0);
       if (changed) _domMutationEpoch++;
       return changed;
     }
@@ -2965,7 +3011,7 @@ class Animation {
         : this.effect._timing.iterations,
       iterationsInfinite: this.effect._timing.iterations === Infinity,
     };
-    try { this._registered = !!Deno.core.ops.op_waapi_create?.(JSON.stringify(input)); }
+    try { this._registered = !!_core.ops.op_waapi_create?.(JSON.stringify(input)); }
     catch (_) { this._registered = false; }
     if (this._registered) {
       _waapiAnimations.add(this);
@@ -3162,6 +3208,7 @@ class Element extends Node {
     // every MutationObserver subscriber and downstream hydration / polling
     // logic stalls.
     const previousWindowNames = _windowNamedNamesInTree(this);
+    _cancelIframeDocumentsInSubtree(this);
     // Native fragment replacement bypasses Node.removeChild. Disassociate
     // descendant style sheets before the backing nodes leave the document so
     // retained CSSStyleSheet wrappers cannot keep stale owner/source nodes.
@@ -3294,8 +3341,14 @@ class Element extends Node {
     const value = String(v);
     _dom("set_attribute", this._nid, n + "\0" + value);
     if (n === "src" && this.localName === "iframe") {
-      if (value && value !== "about:blank") this._loadIframeSrc(value);
-      else this._resetIframeFrame();
+      // `srcdoc` wins whenever it is present, including an empty value.
+      if (!this.hasAttribute("srcdoc")) {
+        if (value && value !== "about:blank") this._loadIframeSrc(value);
+        else this._resetIframeFrame();
+      }
+    }
+    if (n === "srcdoc" && this.localName === "iframe") {
+      this._loadIframeSrcdoc(value);
     }
     if (this._nullNamespaceAttrs instanceof Map) {
       this._nullNamespaceAttrs.set(n, value);
@@ -3341,6 +3394,14 @@ class Element extends Node {
       ? this.getAttribute(n)
       : null;
     _dom("remove_attribute", this._nid, n);
+    if (this.localName === "iframe" && n === "srcdoc") {
+      const fallback = this.getAttribute("src");
+      if (fallback && fallback !== "about:blank") this._loadIframeSrc(fallback);
+      else this._resetIframeFrame();
+    } else if (this.localName === "iframe" && n === "src"
+               && !this.hasAttribute("srcdoc")) {
+      this._resetIframeFrame();
+    }
     if (this._nullNamespaceAttrs instanceof Map) {
       this._nullNamespaceAttrs.delete(n);
     }
@@ -4050,19 +4111,31 @@ class Element extends Node {
     // value (issue #255). getAttribute("src") still returns the literal.
     const v = this.getAttribute("src");
     if (!v) return "";
-    try { return new URL(v, globalThis.location?.href || "about:blank").href; }
+    try { return new URL(v, this.baseURI || globalThis.location?.href || "about:blank").href; }
     catch (e) { return v; }
   }
   set src(v) {
     this.setAttribute("src", v);
   }
+  get srcdoc() {
+    return this.localName === 'iframe' ? (this.getAttribute('srcdoc') || '') : undefined;
+  }
+  set srcdoc(v) {
+    if (this.localName === 'iframe') this.setAttribute('srcdoc', String(v));
+  }
   _resetIframeFrame() {
     const oldId = this._frameId;
+    const requestId = this._iframeRequestFrameId;
     if (oldId) {
+      _core.ops.op_cancel_frame_document(oldId);
       delete globalThis.__obscura_frameElements[oldId];
       delete globalThis.__obscura_frameWindows[oldId];
     }
+    if (requestId && requestId !== oldId) {
+      _core.ops.op_cancel_frame_document(requestId);
+    }
     this._frameId = 0;
+    this._iframeRequestFrameId = 0;
     this._iframeLoadingUrl = null;
     this._iframeDoc = new _IframeDocument(
       '<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
@@ -4071,28 +4144,40 @@ class Element extends Node {
   _loadIframeSrc(url) {
     let fullUrl = url;
     if (!url.includes('://')) {
-      try { fullUrl = new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) {}
+      try { fullUrl = new URL(url, _domParse("document_base_url") || _domParse("document_url") || "about:blank").href; } catch(e) {}
     }
     // Both the src setter and the parser sweep in __obscura_init reach here, so
     // a frame the page assigned before init must not be fetched a second time.
     if (this._iframeLoadingUrl === fullUrl) return;
     this._resetIframeFrame();
     this._iframeLoadingUrl = fullUrl;
+    const requestFrameId = _core.ops.op_reserve_frame_document();
+    if (!requestFrameId) return;
+    this._iframeRequestFrameId = requestFrameId;
     const el = this;
-    fetch(fullUrl, {mode: 'no-cors'}).then(async resp => {
-      if (el._iframeLoadingUrl !== fullUrl) return;
+    _fetchWithResourceOwner(fullUrl, {mode: 'no-cors'}, requestFrameId).then(async resp => {
+      if (el._iframeLoadingUrl !== fullUrl
+          || el._iframeRequestFrameId !== requestFrameId) return;
       if (resp.ok || resp.type === 'opaque') {
         const html = await resp.text();
+        if (el._iframeLoadingUrl !== fullUrl
+            || el._iframeRequestFrameId !== requestFrameId) return;
+        // `Response.url` is the URL after HTTP redirects. The fetched bytes,
+        // document URL, origin and every relative child resource all belong to
+        // that final URL rather than to the iframe's original `src`.
+        const documentUrl = resp.url || fullUrl;
         // Hand the document to the host, which gives this frame a realm of its
         // own and runs the scripts that came with it (issue #600). The shim
         // document below stays: it is what the parent reads through
         // contentDocument.
         const box = el.getBoundingClientRect();
-        el._frameId = Deno.core.ops.op_frame_document_ready(
-          fullUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150);
+        el._frameId = _core.ops.op_frame_document_ready(
+          documentUrl, '', html, Math.round(box.width) || 300,
+          Math.round(box.height) || 150, requestFrameId);
+        el._iframeRequestFrameId = 0;
         if (el._frameId) globalThis.__obscura_frameElements[el._frameId] = el;
-        el._iframeDoc = new _IframeDocument(html, fullUrl, el);
-        el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
+        el._iframeDoc = new _IframeDocument(html, documentUrl, el);
+        el._iframeWin = new _IframeWindow(el._iframeDoc, documentUrl);
         // Bind the window to the realm the host just queued. This is what makes
         // posting into the frame reach the frame's own listeners, and makes a
         // message coming back out arrive with this window as its `source`.
@@ -4102,6 +4187,8 @@ class Element extends Node {
           globalThis.__obscura_frameElements[el._frameId] = el;
         }
       } else {
+        _core.ops.op_cancel_frame_document(requestFrameId);
+        el._iframeRequestFrameId = 0;
         el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
       }
@@ -4111,11 +4198,39 @@ class Element extends Node {
       // directly bypasses listeners registered via addEventListener.
       el.dispatchEvent(new Event('load'));
     }).catch(() => {
-      if (el._iframeLoadingUrl !== fullUrl) return;
+      if (el._iframeLoadingUrl !== fullUrl
+          || el._iframeRequestFrameId !== requestFrameId) return;
+      _core.ops.op_cancel_frame_document(requestFrameId);
+      el._iframeRequestFrameId = 0;
       el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
       el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
 
       el.dispatchEvent(new Event('load'));
+    });
+  }
+  _loadIframeSrcdoc(html) {
+    this._resetIframeFrame();
+    this._iframeLoadingUrl = 'about:srcdoc';
+    const inheritedBase = _domParse("document_base_url")
+      || _domParse("document_url") || "about:blank";
+    const box = this.getBoundingClientRect();
+    this._frameId = _core.ops.op_frame_document_ready(
+      'about:srcdoc', inheritedBase, String(html),
+      Math.round(box.width) || 300, Math.round(box.height) || 150, 0);
+    if (this._frameId) globalThis.__obscura_frameElements[this._frameId] = this;
+    this._iframeDoc = new _IframeDocument(
+      String(html), 'about:srcdoc', this, inheritedBase);
+    this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:srcdoc');
+    if (this._frameId) {
+      this._iframeWin._frameId = this._frameId;
+      globalThis.__obscura_frameWindows[this._frameId] = this._iframeWin;
+      globalThis.__obscura_frameElements[this._frameId] = this;
+    }
+    const el = this;
+    Promise.resolve().then(() => {
+      if (el._iframeLoadingUrl === 'about:srcdoc') {
+        el.dispatchEvent(new Event('load'));
+      }
     });
   }
   get contentDocument() {
@@ -4125,7 +4240,7 @@ class Element extends Node {
     if (this._iframeDoc) {
       const pageOrigin = (function(){ try { return new URL(_domParse("document_url")).origin; } catch(e) { return ''; } })();
       const iframeOrigin = (function(url){ try { return new URL(url).origin; } catch(e) { return ''; } })(this.src);
-      if (pageOrigin === iframeOrigin || this.src === '' || this.src === 'about:blank' || !this.src.includes('://')) {
+      if (this.hasAttribute('srcdoc') || pageOrigin === iframeOrigin || this.src === '' || this.src === 'about:blank' || !this.src.includes('://')) {
         return this._iframeDoc;
       }
       return null; // Cross-origin: blocked
@@ -4265,10 +4380,10 @@ class Element extends Node {
 
     const encoded = pairs.join('&');
     if (method === 'POST') {
-      Deno.core.ops.op_navigate(targetUrl, 'POST', encoded);
+      _core.ops.op_navigate(targetUrl, 'POST', encoded);
     } else {
       const sep = targetUrl.includes('?') ? '&' : '?';
-      Deno.core.ops.op_navigate(targetUrl + (encoded ? sep + encoded : ''), 'GET', '');
+      _core.ops.op_navigate(targetUrl + (encoded ? sep + encoded : ''), 'GET', '');
     }
   }
   reset() {
@@ -4337,9 +4452,9 @@ class Element extends Node {
     return metrics ? metrics.height : 20;
   }
   _renderClientMetrics() {
-    if (typeof Deno.core.ops.op_layout_geometry !== 'function') return null;
+    if (typeof _core.ops.op_layout_geometry !== 'function') return null;
     try {
-      const raw = Deno.core.ops.op_layout_geometry(String(this._nid | 0));
+      const raw = _core.ops.op_layout_geometry(String(this._nid | 0));
       if (!raw) return { width: 0, height: 0 };
       const geometry = JSON.parse(raw);
       if (geometry
@@ -4362,9 +4477,9 @@ class Element extends Node {
   // CSSOM View returns an empty rect list for the latter, while the former
   // deliberately retains Obscura's compatibility geometry.
   _renderBoxGeometry() {
-    if (typeof Deno.core.ops.op_layout_geometry !== 'function') return undefined;
+    if (typeof _core.ops.op_layout_geometry !== 'function') return undefined;
     try {
-      const raw = Deno.core.ops.op_layout_geometry(String(this._nid | 0));
+      const raw = _core.ops.op_layout_geometry(String(this._nid | 0));
       if (!raw) return null;
       const geometry = JSON.parse(raw);
       if (geometry
@@ -4422,18 +4537,18 @@ class Element extends Node {
     return t === 'HTML' || t === 'BODY';
   }
   _renderScrollMetrics() {
-    if (typeof Deno.core.ops.op_layout_metrics !== 'function') return null;
+    if (typeof _core.ops.op_layout_metrics !== 'function') return null;
     try {
-      const raw = Deno.core.ops.op_layout_metrics();
+      const raw = _core.ops.op_layout_metrics();
       return raw ? JSON.parse(raw) : null;
     } catch (_e) {
       return null;
     }
   }
   _renderElementScrollMetrics() {
-    if (typeof Deno.core.ops.op_element_scroll_metrics !== 'function') return undefined;
+    if (typeof _core.ops.op_element_scroll_metrics !== 'function') return undefined;
     try {
-      const raw = Deno.core.ops.op_element_scroll_metrics(String(this._nid | 0));
+      const raw = _core.ops.op_element_scroll_metrics(String(this._nid | 0));
       if (!raw) return null;
       const metrics = JSON.parse(raw);
       return metrics && metrics.hasBox !== false ? metrics : null;
@@ -4442,27 +4557,27 @@ class Element extends Node {
     }
   }
   _renderScrollOffset() {
-    if (typeof Deno.core.ops.op_scroll_offset !== 'function') return null;
+    if (typeof _core.ops.op_scroll_offset !== 'function') return null;
     try {
-      const raw = Deno.core.ops.op_scroll_offset();
+      const raw = _core.ops.op_scroll_offset();
       return raw ? JSON.parse(raw) : null;
     } catch (_e) {
       return null;
     }
   }
   _setRenderScroll(x, y) {
-    if (typeof Deno.core.ops.op_scroll_to !== 'function') return null;
+    if (typeof _core.ops.op_scroll_to !== 'function') return null;
     try {
-      const raw = Deno.core.ops.op_scroll_to(+x || 0, +y || 0);
+      const raw = _core.ops.op_scroll_to(+x || 0, +y || 0);
       return raw ? JSON.parse(raw) : null;
     } catch (_e) {
       return null;
     }
   }
   _setRenderElementScroll(x, y) {
-    if (typeof Deno.core.ops.op_element_scroll_to !== 'function') return null;
+    if (typeof _core.ops.op_element_scroll_to !== 'function') return null;
     try {
-      const raw = Deno.core.ops.op_element_scroll_to(String(this._nid | 0), +x || 0, +y || 0);
+      const raw = _core.ops.op_element_scroll_to(String(this._nid | 0), +x || 0, +y || 0);
       return raw ? JSON.parse(raw) : null;
     } catch (_e) {
       return null;
@@ -5035,7 +5150,7 @@ class Document extends Node {
     if (this !== globalThis.document) _throwDocumentDomainSecurityError();
     const current = this.domain;
     if (!current) _throwDocumentDomainSecurityError();
-    const candidate = Deno.core.ops.op_document_domain_candidate(current, input);
+    const candidate = _core.ops.op_document_domain_candidate(current, input);
     if (!candidate) _throwDocumentDomainSecurityError();
     // This runtime currently has one top-level browsing context and no
     // principal-backed same-origin-domain comparison.  Persisting the
@@ -5047,7 +5162,7 @@ class Document extends Node {
   }
   get referrer() { return _domParse("document_referrer") ?? ""; }
   get location() { return globalThis.location; }
-  set location(url) { Deno.core.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); }
+  set location(url) { _core.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); }
   get defaultView() { return globalThis; }
   get nodeType() { return 9; }
   get nodeName() { return "#document"; }
@@ -5532,11 +5647,11 @@ class Document extends Node {
   get links() { return this.querySelectorAll("a[href], area[href]"); }
   get scripts() { return this.querySelectorAll("script"); }
   get cookie() {
-    return Deno.core.ops.op_get_cookies();
+    return _core.ops.op_get_cookies();
   }
   set cookie(v) {
     if (!v) return;
-    Deno.core.ops.op_set_cookie(v);
+    _core.ops.op_set_cookie(v);
   }
   // Inserts into the document's input stream, which the host keeps alive across calls.
   // Parsing each call on its own would lose every construct that spans two of them. This is
@@ -5616,6 +5731,7 @@ class DocumentFragment extends Node {
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
   set innerHTML(v) {
     const html = String(v ?? "");
+    _cancelIframeDocumentsInSubtree(this);
     if (this._fragmentContext) {
       _dom("set_inner_html_context", this._nid, _fragmentContextPayload(this._fragmentContext, html));
     } else {
@@ -5784,7 +5900,7 @@ class HTMLImageElement extends Element {
     this._imageQueued = false;
     this._imageInitialized = false;
     this._imageCompletionDeferred = false;
-    this._imageComplete = typeof Deno.core.ops.op_image_metadata === "function"
+    this._imageComplete = typeof _core.ops.op_image_metadata === "function"
       ? true
       : !this.getAttribute("src");
     this._imageDecoded = false;
@@ -5911,7 +6027,7 @@ class HTMLImageElement extends Element {
     // The lightweight build has no retained render-resource cache. It still
     // preserves the historical non-blocking Image lifecycle so preloaders do
     // not hang while rendering is disabled.
-    const hasMetadataLoader = typeof Deno.core.ops.op_load_image_metadata === "function";
+    const hasMetadataLoader = typeof _core.ops.op_load_image_metadata === "function";
     this._adoptImageCandidate(hasMetadataLoader ? "" : this.src);
     this._imageCompletionDeferred = true;
     this._refreshImageFromCache(true);
@@ -5954,7 +6070,7 @@ class HTMLImageElement extends Element {
       this._applyImageMetadata(metadata, request, true);
     };
     try {
-      const op = Deno.core.ops.op_load_image_metadata;
+      const op = _core.ops.op_load_image_metadata;
       if (typeof op === "function") {
         Promise.resolve(op(_realmFrameId, this._nid >>> 0)).then(
           raw => {
@@ -5978,7 +6094,7 @@ class HTMLImageElement extends Element {
 
   _refreshImageFromCache(deferCompletion) {
     try {
-      const op = Deno.core.ops.op_image_metadata;
+      const op = _core.ops.op_image_metadata;
       if (typeof op !== "function") return;
       const metadata = JSON.parse(op(_realmFrameId, this._nid >>> 0, true));
       if (!metadata) return;
@@ -6031,7 +6147,7 @@ class HTMLImageElement extends Element {
     const width = Number(metadata && metadata.width);
     const height = Number(metadata && metadata.height);
     const loaded = !!(metadata && metadata.ok)
-      && (typeof Deno.core.ops.op_image_metadata !== "function"
+      && (typeof _core.ops.op_image_metadata !== "function"
         || (Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0));
     if (loaded) {
       this._imageDecoded = true;
@@ -6277,7 +6393,7 @@ function _resolveUrl(url) {
   url = String(url);
   if (!url) return url;
   if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('about:')) return url;
-  try { return new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) { return url; }
+  try { return new URL(url, _domParse("document_base_url") || _domParse("document_url") || "about:blank").href; } catch(e) { return url; }
 }
 // `__virtualUrl` is set by `history.pushState`/`replaceState` (and cleared by
 // any real navigation). When set, `location.href` and friends read it instead
@@ -6291,7 +6407,7 @@ function __currentUrl() {
 }
 globalThis.location = {
   get href() { return __currentUrl(); },
-  set href(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
+  set href(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; _core.ops.op_navigate(r, 'GET', ''); },
   get origin() { try { return new URL(this.href).origin; } catch { return ""; } },
   get protocol() { try { return new URL(this.href).protocol; } catch { return ""; } },
   get host() { try { return new URL(this.href).host; } catch { return ""; } },
@@ -6301,14 +6417,14 @@ globalThis.location = {
   get hash() { try { return new URL(this.href).hash; } catch { return ""; } },
   get port() { try { return new URL(this.href).port; } catch { return ""; } },
   toString() { return this.href; },
-  assign(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
-  reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
-  replace(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
+  assign(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; _core.ops.op_navigate(r, 'GET', ''); },
+  reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; _core.ops.op_navigate(r, 'GET', ''); },
+  replace(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; _core.ops.op_navigate(r, 'GET', ''); },
 };
 const _locationObj = globalThis.location;
 Object.defineProperty(globalThis, 'location', {
   get() { return _locationObj; },
-  set(url) { var r = _resolveUrl(String(url)); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
+  set(url) { var r = _resolveUrl(String(url)); globalThis.__virtualUrl = r; _core.ops.op_navigate(r, 'GET', ''); },
   configurable: false,
   enumerable: true,
 });
@@ -6903,7 +7019,7 @@ function _serializeBody(initBody, headers) {
   return typeof initBody === 'string' ? initBody : String(initBody);
 }
 
-globalThis.fetch = async (input, init = {}) => {
+async function _fetchWithResourceOwner(input, init = {}, resourceOwnerFrameId = 0) {
   init = init || {};
   let url = typeof input === "string"
     ? input
@@ -6925,8 +7041,11 @@ globalThis.fetch = async (input, init = {}) => {
   if (fetchCredentials !== "omit" && fetchCredentials !== "same-origin" && fetchCredentials !== "include") {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
-  const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
-  const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials);
+  const pageOrigin = _domParse("document_origin") || "null";
+  const raw = await _core.ops.op_fetch_url(
+    url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials,
+    JSON.stringify([_realmFrameId, resourceOwnerFrameId >>> 0])
+  );
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
     const err = new TypeError('net::ERR_FAILED');
@@ -6954,7 +7073,9 @@ globalThis.fetch = async (input, init = {}) => {
     });
   }
   return response;
-};
+}
+
+globalThis.fetch = (input, init = {}) => _fetchWithResourceOwner(input, init, 0);
 
 if (typeof Headers === "undefined") {
   globalThis.Headers = class Headers {
@@ -7226,14 +7347,14 @@ _markNative(XMLHttpRequest.prototype.getAllResponseHeaders);
 // the input is not a valid URL.
 function _urlParseOp(url, base) {
   try {
-    const s = Deno.core.ops.op_url_parse(String(url), (base === undefined || base === null) ? "" : String(base));
+    const s = _core.ops.op_url_parse(String(url), (base === undefined || base === null) ? "" : String(base));
     const c = JSON.parse(s);
     return (c && c.ok) ? c : null;
   } catch (e) { return null; }
 }
 function _urlSetOp(href, part, value) {
   try {
-    const s = Deno.core.ops.op_url_set(String(href), part, String(value));
+    const s = _core.ops.op_url_set(String(href), part, String(value));
     const c = JSON.parse(s);
     return (c && c.ok) ? c : null;
   } catch (e) { return null; }
@@ -7242,7 +7363,7 @@ function _urlSetOp(href, part, value) {
 // failure. Cheaper than _urlParseOp for callers that only need the href.
 function _urlResolveOp(href, base) {
   try {
-    const r = Deno.core.ops.op_url_resolve(String(href), (base === undefined || base === null) ? "" : String(base));
+    const r = _core.ops.op_url_resolve(String(href), (base === undefined || base === null) ? "" : String(base));
     return r ? r : null;
   } catch (e) { return null; }
 }
@@ -7534,10 +7655,10 @@ function _roNodeDepth(target) {
 }
 function _roMeasurement(target, suppliedGeometry, suppliedByBatch = false) {
   let geometry = suppliedGeometry ?? null;
-  const hasRenderer = typeof Deno.core.ops.op_layout_geometry === "function";
+  const hasRenderer = typeof _core.ops.op_layout_geometry === "function";
   if (!suppliedByBatch && hasRenderer && target?._nid != null) {
     try {
-      const raw = Deno.core.ops.op_layout_geometry(String(target._nid | 0));
+      const raw = _core.ops.op_layout_geometry(String(target._nid | 0));
       geometry = raw ? JSON.parse(raw) : null;
     } catch (_error) {}
   }
@@ -7635,7 +7756,7 @@ function _roMeasurement(target, suppliedGeometry, suppliedByBatch = false) {
 function _roMeasurements(targets) {
   const measurements = new Map();
   if (!targets.length) return measurements;
-  const bulk = Deno.core.ops.op_resize_observer_measurements;
+  const bulk = _core.ops.op_resize_observer_measurements;
   if (typeof bulk === "function"
       && targets.every(target => target?._nid != null)) {
     try {
@@ -7803,7 +7924,7 @@ if (typeof TextDecoder === 'undefined') {
       if (label === undefined) {
         name = 'utf-8';
       } else {
-        name = Deno.core.ops.op_encoding_for_label(String(label));
+        name = _core.ops.op_encoding_for_label(String(label));
         if (!name) throw new RangeError("Failed to construct 'TextDecoder': The encoding label provided ('" + label + "') is invalid.");
       }
       const o = options || {};
@@ -7823,7 +7944,7 @@ if (typeof TextDecoder === 'undefined') {
         return _utf8DecodeBytes(bytes, off);
       }
       // Legacy encodings / fatal mode: encoding_rs via the op.
-      const r = JSON.parse(Deno.core.ops.op_text_decode(this.encoding, bytes, this.fatal, this.ignoreBOM));
+      const r = JSON.parse(_core.ops.op_text_decode(this.encoding, bytes, this.fatal, this.ignoreBOM));
       if (!r.ok) throw new TypeError("Failed to execute 'decode' on 'TextDecoder': The encoded data was not valid.");
       return r.v;
     }
@@ -8053,9 +8174,9 @@ globalThis.getComputedStyle = (el) => {
     if (snapshot.epoch === _domMutationEpoch && !hasRunningAnimation) return;
     snapshot.epoch = _domMutationEpoch;
     snapshot.rendered = null;
-    if (typeof Deno.core.ops.op_computed_style === 'function' && el?._nid != null) {
+    if (typeof _core.ops.op_computed_style === 'function' && el?._nid != null) {
       try {
-        const raw = Deno.core.ops.op_computed_style(String(el._nid | 0));
+        const raw = _core.ops.op_computed_style(String(el._nid | 0));
         snapshot.rendered = raw ? JSON.parse(raw) : null;
       } catch (e) {}
     }
@@ -9104,7 +9225,7 @@ function _ioClipsOverflow(value) {
 function _ioMeasurements(elements) {
   const measurements = new Map();
   if (!elements.length) return measurements;
-  const bulk = Deno.core.ops.op_intersection_observer_measurements;
+  const bulk = _core.ops.op_intersection_observer_measurements;
   const nativeElements = elements.filter(element => element?._nid != null);
   if (typeof bulk !== "function" || !nativeElements.length) return measurements;
   try {
@@ -10230,12 +10351,12 @@ globalThis.Crypto = class Crypto {
     if (arr.byteLength > 65536) {
       throw new DOMException("The requested length exceeds 65536 bytes", "QuotaExceededError");
     }
-    const bytes = Deno.core.ops.op_random_bytes(arr.byteLength);
+    const bytes = _core.ops.op_random_bytes(arr.byteLength);
     new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength).set(bytes);
     return arr;
   }
   randomUUID() {
-    const b = Deno.core.ops.op_random_bytes(16);
+    const b = _core.ops.op_random_bytes(16);
     b[6] = (b[6] & 0x0f) | 0x40; // version 4
     b[8] = (b[8] & 0x3f) | 0x80; // variant 10xx
     let s = "";
@@ -10722,8 +10843,8 @@ function _cssTopLevelComma(text) {
 function _cssSupportsDeclaration(name, value) {
   name = name.trim().toLowerCase();
   value = value.trim();
-  if (typeof Deno.core.ops.op_css_supports === "function") {
-    try { return !!Deno.core.ops.op_css_supports(name, value); }
+  if (typeof _core.ops.op_css_supports === "function") {
+    try { return !!_core.ops.op_css_supports(name, value); }
     catch (_) { return false; }
   }
   if (!value || _cssHasInvalidSupportsValueSyntax(value)) return false;
@@ -11813,8 +11934,9 @@ _markNative(globalThis.Selection);
 ].forEach(fn => { if (typeof fn === 'function') _markNative(fn); });
 
 class _IframeDocument {
-  constructor(html, url, iframeEl) {
+  constructor(html, url, iframeEl, baseUrl) {
     this._url = url;
+    this._baseUrl = baseUrl || url;
     this._iframeEl = iframeEl;
     this.nodeType = 9;
     this.nodeName = '#document';
@@ -11853,6 +11975,7 @@ class _IframeDocument {
   set title(v) { this._title = v; }
   get URL() { return this._url; }
   get documentURI() { return this._url; }
+  get baseURI() { return this._baseUrl; }
   get location() { return this._iframeEl?.contentWindow?.location; }
   get defaultView() { return this._iframeEl?.contentWindow; }
   get ownerDocument() { return null; }
@@ -12070,7 +12193,7 @@ globalThis.__obscura_forgetFrame = function (frameId) {
 };
 
 function _realmOrigin() {
-  try { return new URL(_domParse('document_url')).origin; } catch (_) { return 'null'; }
+  return _domParse('document_origin') || 'null';
 }
 
 function _sendRealmMessage(targetFrameId, data) {
@@ -12084,7 +12207,7 @@ function _sendRealmMessage(targetFrameId, data) {
     throw new DOMException('The object could not be cloned.', 'DataCloneError');
   }
   if (json === undefined) json = '{"v":null}';
-  Deno.core.ops.op_post_frame_message(
+  _core.ops.op_post_frame_message(
     targetFrameId >>> 0, globalThis.__obscura_frameId >>> 0, _realmOrigin(), json);
 }
 
@@ -12404,7 +12527,7 @@ class _Canvas2D {
     this._h = valid ? requestedHeight : 0;
     this._buf = new Uint8ClampedArray(this._w * this._h * 4);
     this._resetDrawingState();
-    const register = Deno.core.ops.op_canvas_register_surface;
+    const register = _core.ops.op_canvas_register_surface;
     if (typeof register === 'function') {
       // op2 accepts Uint8Array, while Canvas exposes Uint8ClampedArray. This
       // second view shares the exact backing store; no pixel copy is made.
@@ -12423,7 +12546,7 @@ class _Canvas2D {
     this._damageQueued = true;
     queueMicrotask(() => {
       this._damageQueued = false;
-      const damage = Deno.core.ops.op_canvas_paint_damage;
+      const damage = _core.ops.op_canvas_paint_damage;
       if (typeof damage === 'function') damage(this.canvas._nid);
     });
   }
@@ -12704,10 +12827,10 @@ Element.prototype.attachShadow = function attachShadow(opts) {
   if (!globalThis.__obscura_shadowHostNames.has(_ln) && _ln.indexOf('-') === -1) {
     throw new DOMException('Failed to execute attachShadow on Element: this element does not support attachShadow', 'NotSupportedError');
   }
-  if (Deno.core.ops.op_shadow_root_info(this._nid)) {
+  if (_core.ops.op_shadow_root_info(this._nid, _realmFrameId)) {
     throw new DOMException('Failed to execute attachShadow on Element: the element already hosts a shadow tree.', 'NotSupportedError');
   }
-  const rootNid = Deno.core.ops.op_shadow_attach(this._nid, _mode);
+  const rootNid = _core.ops.op_shadow_attach(this._nid, _mode, _realmFrameId);
   if (rootNid < 0) {
     throw new DOMException('Failed to execute attachShadow on Element: this element does not support attachShadow', 'NotSupportedError');
   }
@@ -12726,7 +12849,7 @@ _markNative(Element.prototype.attachShadow);
 
 function _shadowRootForHost(host, includeClosed) {
   if (!host) return null;
-  const info = Deno.core.ops.op_shadow_root_info(host._nid);
+  const info = _core.ops.op_shadow_root_info(host._nid, _realmFrameId);
   if (!info) return null;
   const parts = info.split('\0');
   if (!includeClosed && parts[1] !== 'open') return null;
@@ -13640,7 +13763,7 @@ if (!globalThis.crypto.subtle) {
           name !== "SHA-512/224" && name !== "SHA-512/256") {
         throw new DOMException("Unrecognized algorithm name", "NotSupportedError");
       }
-      return bufferOf(Deno.core.ops.op_subtle_digest(name, toBytes(data)));
+      return bufferOf(_core.ops.op_subtle_digest(name, toBytes(data)));
     },
 
     async importKey(format, keyData, algorithm, extractable, keyUsages) {
@@ -13680,14 +13803,14 @@ if (!globalThis.crypto.subtle) {
       if (alg.name === "HMAC") {
         const hash = normalizeHash(alg.hash);
         const len = alg.length ? Math.ceil(alg.length / 8) : hashBlockSize(hash);
-        const bytes = Deno.core.ops.op_random_bytes(len);
+        const bytes = _core.ops.op_random_bytes(len);
         return makeKey("secret", extractable, { name: "HMAC", hash: { name: hash }, length: len * 8 }, keyUsages, bytes);
       }
       if (alg.name === "AES-CTR" || alg.name === "AES-CBC" || alg.name === "AES-GCM" || alg.name === "AES-KW") {
         if (alg.length !== 128 && alg.length !== 192 && alg.length !== 256) {
           throw new DOMException("AES key length must be 128, 192, or 256 bits", "OperationError");
         }
-        const bytes = Deno.core.ops.op_random_bytes(alg.length / 8);
+        const bytes = _core.ops.op_random_bytes(alg.length / 8);
         return makeKey("secret", extractable, { name: alg.name, length: alg.length }, keyUsages, bytes);
       }
       throw new DOMException("generateKey does not support " + alg.name, "NotSupportedError");
@@ -13698,7 +13821,7 @@ if (!globalThis.crypto.subtle) {
       const bytes = keyBytes(key);
       if (alg.name === "HMAC") {
         const hash = key.algorithm && key.algorithm.hash ? key.algorithm.hash.name : normalizeHash(alg.hash);
-        return bufferOf(runOp(() => Deno.core.ops.op_subtle_hmac(hash, bytes, toBytes(data))));
+        return bufferOf(runOp(() => _core.ops.op_subtle_hmac(hash, bytes, toBytes(data))));
       }
       throw new DOMException("sign does not support " + alg.name, "NotSupportedError");
     },
@@ -13708,7 +13831,7 @@ if (!globalThis.crypto.subtle) {
       const bytes = keyBytes(key);
       if (alg.name === "HMAC") {
         const hash = key.algorithm && key.algorithm.hash ? key.algorithm.hash.name : normalizeHash(alg.hash);
-        const mac = runOp(() => Deno.core.ops.op_subtle_hmac(hash, bytes, toBytes(data)));
+        const mac = runOp(() => _core.ops.op_subtle_hmac(hash, bytes, toBytes(data)));
         const sig = toBytes(signature);
         if (sig.length !== mac.length) return false;
         let diff = 0;
@@ -13729,13 +13852,13 @@ if (!globalThis.crypto.subtle) {
         const hash = normalizeHash(alg.hash);
         const salt = toBytes(alg.salt);
         const iterations = alg.iterations >>> 0;
-        return bufferOf(runOp(() => Deno.core.ops.op_subtle_pbkdf2(hash, bytes, salt, iterations, lenBytes)));
+        return bufferOf(runOp(() => _core.ops.op_subtle_pbkdf2(hash, bytes, salt, iterations, lenBytes)));
       }
       if (alg.name === "HKDF") {
         const hash = normalizeHash(alg.hash);
         const salt = alg.salt != null ? toBytes(alg.salt) : new Uint8Array(0);
         const info = alg.info != null ? toBytes(alg.info) : new Uint8Array(0);
-        return bufferOf(runOp(() => Deno.core.ops.op_subtle_hkdf(hash, bytes, salt, info, lenBytes)));
+        return bufferOf(runOp(() => _core.ops.op_subtle_hkdf(hash, bytes, salt, info, lenBytes)));
       }
       throw new DOMException("deriveBits does not support " + alg.name, "NotSupportedError");
     },
@@ -13785,16 +13908,16 @@ if (!globalThis.crypto.subtle) {
       if (tagLength !== 128) {
         throw new DOMException("Only a 128-bit AES-GCM tag length is supported", "NotSupportedError");
       }
-      return bufferOf(runOp(() => Deno.core.ops.op_subtle_aes_gcm(encrypt, bytes, iv, aad, input)));
+      return bufferOf(runOp(() => _core.ops.op_subtle_aes_gcm(encrypt, bytes, iv, aad, input)));
     }
     if (alg.name === "AES-CBC") {
       const iv = toBytes(alg.iv);
-      return bufferOf(runOp(() => Deno.core.ops.op_subtle_aes_cbc(encrypt, bytes, iv, input)));
+      return bufferOf(runOp(() => _core.ops.op_subtle_aes_cbc(encrypt, bytes, iv, input)));
     }
     if (alg.name === "AES-CTR") {
       const counter = toBytes(alg.counter);
       const length = alg.length >>> 0;
-      return bufferOf(runOp(() => Deno.core.ops.op_subtle_aes_ctr(bytes, counter, length, input)));
+      return bufferOf(runOp(() => _core.ops.op_subtle_aes_ctr(bytes, counter, length, input)));
     }
     throw new DOMException((encrypt ? "encrypt" : "decrypt") + " does not support " + alg.name, "NotSupportedError");
   }
@@ -14441,7 +14564,7 @@ if (typeof FontFace === 'undefined') {
       }
     }
     _syncNative() {
-      if (!this._ownerDocument || typeof Deno.core.ops.op_set_dynamic_fonts !== 'function') return;
+      if (!this._ownerDocument || typeof _core.ops.op_set_dynamic_fonts !== 'function') return;
       const registrations = [];
       for (const face of this._faces) registrations.push({
         ...(face._cssConnected ? { skip: true } : {}),
@@ -14451,7 +14574,7 @@ if (typeof FontFace === 'undefined') {
         weight: face.weight,
         unicodeRange: face.unicodeRange
       });
-      Deno.core.ops.op_set_dynamic_fonts(JSON.stringify(registrations.filter(face => !face.skip)));
+      _core.ops.op_set_dynamic_fonts(JSON.stringify(registrations.filter(face => !face.skip)));
       _scheduleResizeRenderCheckpoint();
     }
     _faceChanged(face) {
@@ -14722,12 +14845,16 @@ globalThis.__obscura_init = function() {
   // wrongly changes everything after it.
   _installFramingRelationships();
 
-  // A parser-created <iframe src> never went through the src setter, so
-  // nothing had started its load and the frame stayed empty (issue #600).
-  // This also runs inside a frame realm, so a frame nested in a frame loads
-  // by the same path, with op_frame_document_ready recording the caller as
-  // its parent.
-  for (const frame of globalThis.document.querySelectorAll('iframe')) {
+  // Parser-created iframes never went through an IDL setter. Ask the native
+  // tree for a shadow-including list: querySelectorAll intentionally cannot
+  // pierce declarative shadow roots, but their browsing contexts still load.
+  // `srcdoc` has priority over `src`, including when its value is empty.
+  for (const nid of (_domParse('connected_iframes') || [])) {
+    const frame = _wrapEl(nid);
+    if (frame.hasAttribute('srcdoc')) {
+      frame._loadIframeSrcdoc(frame.getAttribute('srcdoc') || '');
+      continue;
+    }
     const src = frame.getAttribute('src');
     if (src && src !== 'about:blank') frame._loadIframeSrc(src);
   }
