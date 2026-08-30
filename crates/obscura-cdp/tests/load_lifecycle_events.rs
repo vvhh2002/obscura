@@ -630,7 +630,7 @@ globalThis.__detachedParentFrame = parentFrame;
 window.addEventListener('message', event => {
   if (event.data === 'remove-parent') parentFrame.remove();
 });
-parentFrame.srcdoc = `<!doctype html><script>
+parentFrame.srcdoc = `<!doctype html><body><script>
 const nested = document.createElement('iframe');
 nested.srcdoc = '<!doctype html><script>parent.parent.__detachedDescendantRuns++;<\\/script>';
 document.body.appendChild(nested);
@@ -668,10 +668,9 @@ window.addEventListener('load', () => {
 </script></body></html>"#;
 
 const PIXEL_PNG: &[u8] = &[
-    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0,
-    0, 1, 8, 4, 0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99,
-    100, 248, 15, 0, 1, 5, 1, 1, 39, 24, 227, 102, 0, 0, 0, 0, 73, 69, 78, 68, 174,
-    66, 96, 130,
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 4, 0,
+    0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 100, 248, 15, 0, 1, 5, 1, 1,
+    39, 24, 227, 102, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
 ];
 
 async fn serve_fixture() -> String {
@@ -825,6 +824,58 @@ async fn serve_fixture() -> String {
                 );
                 let _ = socket.write_all(response.as_bytes()).await;
                 let _ = socket.write_all(&body).await;
+            });
+        }
+    });
+    format!("http://{address}")
+}
+
+/// `getBoundingClientRect()` may synchronously prepare render geometry and
+/// seed an image through the renderer's blocking resource loader. A fixture
+/// served by this test's current-thread Tokio runtime cannot answer while that
+/// synchronous call owns the thread, so this focused page uses a small
+/// dedicated blocking server so its intentional response delays remain
+/// independent of the current-thread executor. The production runtime also
+/// forbids CSSOM/layout queries from invoking the synchronous render loader.
+fn serve_connected_inner_html_fixture() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        while let Ok((mut socket, _)) = listener.accept() {
+            std::thread::spawn(move || {
+                let mut request = [0u8; 4096];
+                let count = std::io::Read::read(&mut socket, &mut request).unwrap_or(0);
+                let request_text = String::from_utf8_lossy(&request[..count]);
+                let path = request_text
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .and_then(|target| target.split('?').next())
+                    .unwrap_or("/");
+                let (content_type, body, delay_ms) = match path {
+                    "/connected-inner-html.html" => (
+                        "text/html; charset=utf-8",
+                        CONNECTED_INNER_HTML_PAGE.as_bytes(),
+                        0,
+                    ),
+                    "/delayed.css" => (
+                        "text/css; charset=utf-8",
+                        b"body { color: rgb(1, 2, 3); }".as_slice(),
+                        90,
+                    ),
+                    "/pixel.png" => ("image/png", PIXEL_PNG, 125),
+                    "/subtree-pixel.png" => ("image/png", PIXEL_PNG, 140),
+                    _ => ("text/html; charset=utf-8", b"not found".as_slice(), 0),
+                };
+                if delay_ms != 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = std::io::Write::write_all(&mut socket, response.as_bytes());
+                let _ = std::io::Write::write_all(&mut socket, body);
             });
         }
     });
@@ -1150,7 +1201,10 @@ async fn event_target_preserves_order_snapshot_phases_and_body_load_aliasing() {
     .await;
 
     assert_eq!(value["stopped"], json!(["first", "handler"]));
-    assert_eq!(value["afterBody"], 0, "body load must not invoke Window handlers");
+    assert_eq!(
+        value["afterBody"], 0,
+        "body load must not invoke Window handlers"
+    );
     let log = value["log"].as_array().expect("event target log");
     let load_labels = log
         .iter()
@@ -1190,7 +1244,10 @@ async fn element_owner_events_use_the_shared_event_target_algorithm() {
     )
     .await;
 
-    assert_eq!(value["eventCount"], 2, "real plus synthetic dispatch: {value:#?}");
+    assert_eq!(
+        value["eventCount"], 2,
+        "real plus synthetic dispatch: {value:#?}"
+    );
     let log = value["log"].as_array().expect("element EventTarget log");
     let labels = |round: u64| {
         log.iter()
@@ -1226,12 +1283,8 @@ async fn element_owner_events_use_the_shared_event_target_algorithm() {
         "once and duplicate behavior on redispatch: {log:#?}",
     );
     assert!(
-        !log.iter().any(|entry| {
-            matches!(
-                entry["name"].as_str(),
-                Some("aborted" | "handler-old")
-            )
-        }),
+        !log.iter()
+            .any(|entry| { matches!(entry["name"].as_str(), Some("aborted" | "handler-old")) }),
         "aborted listener or replaced handler ran: {log:#?}",
     );
     for entry in log {
@@ -1254,16 +1307,25 @@ async fn element_owner_events_use_the_shared_event_target_algorithm() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn connected_light_and_closed_shadow_inner_html_start_load_delaying_resources() {
-    let base = serve_fixture().await;
+    let base = serve_connected_inner_html_fixture();
     let value = navigate_and_evaluate(
         format!("{base}/connected-inner-html.html"),
         "globalThis.__innerHtmlWindowObserved",
     )
     .await;
 
-    assert_eq!(value["images"], 2, "innerHTML images did not complete: {value:#?}");
-    assert_eq!(value["sheets"], 2, "innerHTML stylesheets did not complete: {value:#?}");
-    assert_eq!(value["frames"], 2, "innerHTML iframes did not complete: {value:#?}");
+    assert_eq!(
+        value["images"], 2,
+        "innerHTML images did not complete: {value:#?}"
+    );
+    assert_eq!(
+        value["sheets"], 2,
+        "innerHTML stylesheets did not complete: {value:#?}"
+    );
+    assert_eq!(
+        value["frames"], 2,
+        "innerHTML iframes did not complete: {value:#?}"
+    );
     assert_eq!(value["readyState"], "complete", "{value:#?}");
     assert_eq!(value["closedRootHidden"], true, "{value:#?}");
 }
@@ -1439,13 +1501,15 @@ async fn iframe_fallback_inner_html_does_not_reload_its_browsing_context() {
     .await;
     assert_eq!(value["childExecutions"], 1, "{value:#?}");
     assert_eq!(value["ownerLoads"], 1, "{value:#?}");
-    assert!(value["frameId"].as_u64().unwrap_or_default() > 0, "{value:#?}");
+    assert!(
+        value["frameId"].as_u64().unwrap_or_default() > 0,
+        "{value:#?}"
+    );
     // HTML's iframe element is a RAWTEXT container. Its fallback text is not
     // parsed into a child <p>; changing it must nevertheless leave the already
     // active nested browsing context alone.
     assert_eq!(
-        value["fallbackText"],
-        "<p>new fallback content</p>",
+        value["fallbackText"], "<p>new fallback content</p>",
         "{value:#?}"
     );
 }

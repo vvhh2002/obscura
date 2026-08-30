@@ -28,6 +28,8 @@ the wreq/BoringSSL transport and browser-identity protections.
 
 - [Build from source](Build-from-source.md)
 - [Archive final-page resources](Archive-final-page-resources.md)
+- [Document loading and capture readiness](Document-loading-and-capture-ready.md)
+- [Optional online Tencent CAPTCHA smoke](Optional-online-Tencent-smoke.md)
 - [Configure stealth and proxies](Configure-stealth-and-proxies.md)
 - [Markdown extraction](Markdown-extraction.md)
 - [Use with Puppeteer](Use-with-Puppeteer.md)

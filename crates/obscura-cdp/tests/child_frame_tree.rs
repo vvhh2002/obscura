@@ -49,7 +49,11 @@ async fn cdp(ctx: &mut CdpContext, id: u64, method: &str, params: Value, session
         ctx,
     )
     .await;
-    assert!(resp.error.is_none(), "CDP {method} failed: {:?}", resp.error);
+    assert!(
+        resp.error.is_none(),
+        "CDP {method} failed: {:?}",
+        resp.error
+    );
     resp.result.unwrap_or_else(|| json!({}))
 }
 
@@ -70,7 +74,10 @@ async fn attached_session(ctx: &mut CdpContext) -> String {
     .await
     .result
     .expect("Target.createTarget produced no result");
-    let target_id = created["targetId"].as_str().expect("no targetId").to_string();
+    let target_id = created["targetId"]
+        .as_str()
+        .expect("no targetId")
+        .to_string();
 
     let attached = dispatch(
         &CdpRequest {
@@ -97,14 +104,18 @@ async fn get_frame_tree_reports_nested_child_frames() {
     let mut ctx = CdpContext::new();
     let session = &attached_session(&mut ctx).await;
 
-    // Deliberately no `waitUntil`: that is what Puppeteer and Playwright send,
-    // and it resolves to DomContentLoaded rather than to load. Passing
-    // "load" here hid the frame build behind a readiness level no real client
-    // asks for, so the tree came back empty for every one of them.
-    cdp(&mut ctx, 1, "Page.navigate", json!({"url": url}), session).await;
-    // Frames are built when the page settles, which is not part of the
-    // navigation itself.
-    cdp(&mut ctx, 2, "Runtime.evaluate", json!({"expression": "1"}), session).await;
+    // This test calls the dispatcher directly, so it has no WebSocket server
+    // autonomous pump to continue a commit-only navigation in the background.
+    // Wait explicitly for load before inspecting the completed nested tree;
+    // raw-CDP commit semantics are covered by the server integration tests.
+    cdp(
+        &mut ctx,
+        1,
+        "Page.navigate",
+        json!({"url": url, "waitUntil": "load"}),
+        session,
+    )
+    .await;
 
     let tree = cdp(&mut ctx, 3, "Page.getFrameTree", json!({}), session).await;
     let root = &tree["frameTree"];

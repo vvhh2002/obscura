@@ -137,8 +137,73 @@ jobs:
             echo "Building candidate tag $tag at $sha without publishing"
           fi
 
-  build:
+      - name: Check vendored dependency licenses and provenance
+        run: python3 scripts/ci/check_vendor_licenses.py
+
+  test:
+    name: Release / Tests
     needs: prepare
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      NO_PROXY: 127.0.0.1,localhost
+      OPENSSL_NO_VENDOR: "1"
+    steps:
+      - name: Checkout resolved release revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - name: Verify resolved release revision
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse 'HEAD^{commit}')"
+          if [[ "$actual_sha" != "$EXPECTED_SHA" ]]; then
+            echo "Checked out $actual_sha, expected resolved release revision $EXPECTED_SHA" >&2
+            exit 1
+          fi
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake libclang-dev libssl-dev llvm-dev pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2
+        with:
+          tool: nextest
+          fallback: none
+
+      - name: Restore Rust dependency cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: false
+
+      - name: Test performance threshold policy
+        run: python3 -m unittest discover -s scripts/ci -p 'test_perf_smoke.py'
+
+      - name: Run focused document-loading regressions
+        run: |
+          cargo nextest run --locked --release --features render \
+            -p obscura-js -p obscura-browser -p obscura-cdp \
+            -E 'test(streaming_frame_blocking_script_cannot_see_parser_tail) | test(streaming_frame_external_defer_runs_at_eof_in_encounter_order) | test(parser_defer_classics_execute_in_encounter_order) | test(replacement_cancels_unfinished_committed_document_exactly_once) | test(capture_ready_reports_transport_failure_but_accepts_complete_http_error) | test(replacing_navigation_aborts_each_old_active_request_once_before_generation_reset) | test(raw_commit_returns_page_for_immediate_runtime_while_body_tail_streams) | test(raw_commit_keeps_blocking_script_and_stylesheet_fetches_alive_while_streaming_events)' \
+            --no-fail-fast
+
+      - name: Run full render release suite
+        # This intentionally follows the small focused gate. Cargo reuses the
+        # release-mode compilation, so only the focused test processes repeat.
+        run: cargo nextest run --locked --release --features render --no-fail-fast
+
+  build:
+    needs: [prepare, test]
     strategy:
       fail-fast: false
       matrix:
@@ -333,7 +398,7 @@ jobs:
           retention-days: 7
 
   publish:
-    needs: [prepare, build]
+    needs: [prepare, test, build]
     if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 15

@@ -47,7 +47,16 @@ pub struct CdpContext {
     /// Child frame ids already reported to the client, per page, so each frame
     /// is announced once and a frame that goes away can be retracted.
     pub announced_frames: HashMap<String, Vec<String>>,
+    /// Pages whose child-frame boundaries are delivered by the persistent
+    /// browser NavigationEvent observer. The snapshot drain remains a fallback
+    /// for direct embedders, but must skip these pages or a command that creates
+    /// a frame would synthesize attach/navigate/stopped before the live channel
+    /// publishes the real lifecycle boundaries.
+    pub live_frame_event_pages: HashSet<String>,
     pub pending_events: Vec<CdpEvent>,
+    /// Sessions which explicitly enabled the optional `Page.lifecycleEvent`
+    /// stream. DOM/load compatibility events are independent of this flag.
+    pub lifecycle_event_sessions: HashSet<String>,
     #[cfg(feature = "render")]
     pub(crate) screencasts: HashMap<String, ScreencastState>,
     #[cfg(feature = "render")]
@@ -169,7 +178,9 @@ impl CdpContext {
             sessions: HashMap::new(),
             current_loader_ids: HashMap::new(),
             announced_frames: HashMap::new(),
+            live_frame_event_pages: HashSet::new(),
             pending_events: Vec::new(),
+            lifecycle_event_sessions: HashSet::new(),
             #[cfg(feature = "render")]
             screencasts: HashMap::new(),
             #[cfg(feature = "render")]
@@ -303,14 +314,17 @@ impl CdpContext {
         self.pages.retain(|p| p.id != id);
         self.current_loader_ids.remove(id);
         self.announced_frames.remove(id);
+        let removed: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, page_id)| page_id.as_str() == id)
+            .map(|(session_id, _)| session_id.clone())
+            .collect();
+        for session_id in &removed {
+            self.lifecycle_event_sessions.remove(session_id);
+        }
         #[cfg(feature = "render")]
         {
-            let removed: Vec<String> = self
-                .sessions
-                .iter()
-                .filter(|(_, page_id)| page_id.as_str() == id)
-                .map(|(session_id, _)| session_id.clone())
-                .collect();
             for session_id in removed {
                 self.screencasts.remove(&session_id);
             }
@@ -660,6 +674,9 @@ pub(crate) fn drain_frame_events(ctx: &mut CdpContext) {
     let mut events: Vec<CdpEvent> = Vec::new();
     let mut announced: HashMap<String, Vec<String>> = HashMap::new();
     for page in &ctx.pages {
+        if ctx.live_frame_event_pages.contains(&page.id) {
+            continue;
+        }
         let Some(session_ids) = page_to_sessions.get(&page.id) else {
             continue;
         };

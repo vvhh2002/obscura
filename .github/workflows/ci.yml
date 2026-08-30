@@ -103,6 +103,9 @@ jobs:
           BASE_SHA: ${{ steps.base.outputs.sha }}
         run: python3 "${{ steps.base.outputs.policy }}" --base "$BASE_SHA" --head "$GITHUB_SHA"
 
+      - name: Test performance threshold policy
+        run: python3 -m unittest discover -s scripts/ci -p 'test_perf_smoke.py'
+
       - name: Check dependency advisories, licenses, bans, and sources
         if: steps.changes.outputs.audit == 'true'
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
@@ -136,6 +139,9 @@ jobs:
         with:
           tool: nextest
           fallback: none
+
+      - name: Check vendored dependency licenses and provenance
+        run: python3 scripts/ci/check_vendor_licenses.py
 
       - name: Restore Rust dependency cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2

@@ -19,6 +19,7 @@ globalThis.__recordParserEvent = function(label, owner, event) {
     type: event.type,
     targetIsOwner: event.target === owner,
     currentTargetIsOwner: event.currentTarget === owner,
+    currentTargetIsDocument: event.currentTarget === document,
     bubbles: event.bubbles,
     cancelable: event.cancelable,
     readyState: document.readyState
@@ -28,22 +29,23 @@ document.addEventListener('DOMContentLoaded', function() {
   globalThis.__parserEvents.push({ label: 'dcl', kind: 'lifecycle' });
 });
 
-// Obscura builds the DOM before driving parser-discovered scripts. Registering
-// here covers the addEventListener path in addition to the elements' parsed
-// onload/onerror content attributes below.
-for (const id of [
+// A streaming parser must not expose the script elements below before it has
+// reached them. Exercise addEventListener through a capturing document
+// listener instead; script load/error do not bubble, but they do traverse the
+// capture path.
+const __parserScriptIds = new Set([
   'classic-ok', 'classic-throws', 'classic-missing',
   'module-ok', 'module-throws', 'module-missing',
   'inline-module-ok', 'inline-module-bad'
-]) {
-  const script = document.getElementById(id);
-  script.addEventListener('load', function(event) {
-    __recordParserEvent(id + ':load:listener', this, event);
-  });
-  script.addEventListener('error', function(event) {
-    __recordParserEvent(id + ':error:listener', this, event);
-  });
+]);
+function __captureParserScriptCompletion(event) {
+  const script = event.target;
+  if (script && script.localName === 'script' && __parserScriptIds.has(script.id)) {
+    __recordParserEvent(script.id + ':' + event.type + ':listener', script, event);
+  }
 }
+document.addEventListener('load', __captureParserScriptCompletion, true);
+document.addEventListener('error', __captureParserScriptCompletion, true);
 </script>
 
 <script id="classic-ok" src="/classic-ok.js"
@@ -219,12 +221,32 @@ async fn parser_classic_and_module_scripts_dispatch_load_or_error_once() {
             2,
             "{id} must dispatch exactly one {event_type} through both handler paths: {events:#?}"
         );
-        assert_eq!(matching[0]["label"], property);
-        assert_eq!(matching[1]["label"], listener);
+        assert_eq!(
+            matching
+                .iter()
+                .filter(|event| event["label"] == property)
+                .count(),
+            1,
+            "{id} property handler must run exactly once"
+        );
+        assert_eq!(
+            matching
+                .iter()
+                .filter(|event| event["label"] == listener)
+                .count(),
+            1,
+            "{id} capture listener must run exactly once"
+        );
         for event in matching {
             assert_eq!(event["type"], event_type);
             assert_eq!(event["targetIsOwner"], true);
-            assert_eq!(event["currentTargetIsOwner"], true);
+            if event["label"] == property {
+                assert_eq!(event["currentTargetIsOwner"], true);
+                assert_eq!(event["currentTargetIsDocument"], false);
+            } else {
+                assert_eq!(event["currentTargetIsOwner"], false);
+                assert_eq!(event["currentTargetIsDocument"], true);
+            }
             assert_eq!(event["bubbles"], false);
             assert_eq!(event["cancelable"], false);
         }

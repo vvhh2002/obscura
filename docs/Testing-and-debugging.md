@@ -23,6 +23,15 @@ Use `cargo nextest`, not `cargo test`. Runtime tests require process isolation
 because the engine owns one V8 isolate per process. Render tests must run in
 release mode; debug builds are not a fidelity or performance gate.
 
+The PR performance smoke uses five interleaved samples and compares medians.
+Median latency and peak RSS are independent hard gates: either ratio strictly
+above `1.10x` the base fails CI, without an additional absolute-delta escape.
+The threshold policy tests can be run with:
+
+```bash
+python3 -m unittest discover -s scripts/ci -p 'test_perf_smoke.py'
+```
+
 ### CDP parity tests
 
 `crates/obscura-cdp/tests/cdp_*.rs` exercise CDP methods end-to-end with a real `dispatch` call and an in-process HTTP server.

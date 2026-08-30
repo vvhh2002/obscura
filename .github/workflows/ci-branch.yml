@@ -51,6 +51,12 @@ jobs:
           tool: nextest
           fallback: none
 
+      - name: Check vendored dependency licenses and provenance
+        run: python3 scripts/ci/check_vendor_licenses.py
+
+      - name: Test performance threshold policy
+        run: python3 -m unittest discover -s scripts/ci -p 'test_perf_smoke.py'
+
       - name: Build render release
         run: cargo build --locked --release -p obscura-cli --bins --features render
 

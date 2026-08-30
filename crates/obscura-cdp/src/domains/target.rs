@@ -230,6 +230,7 @@ pub async fn handle(
         "detachFromTarget" => {
             if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
                 ctx.sessions.remove(session_id);
+                ctx.lifecycle_event_sessions.remove(session_id);
                 #[cfg(feature = "render")]
                 ctx.screencasts.remove(session_id);
             }

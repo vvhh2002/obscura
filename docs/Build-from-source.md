@@ -19,6 +19,12 @@ Binary is at `./target/release/obscura`.
 This produces the release binary with geometry, screenshots, screencasting,
 and PDF export.
 
+Release artifacts are native binaries for their named target, not a promise of
+fully static linkage. Linux packages currently target GNU/glibc, macOS binaries
+use the platform system libraries/frameworks, and Windows packages target MSVC.
+Use the matching supported operating-system/runtime baseline when distributing
+them.
+
 ## Rendering and stealth
 
 ```bash
@@ -38,6 +44,23 @@ cargo build --release -p obscura-cli --bins --no-default-features --features ste
 
 The second command keeps stealth while excluding layout, screenshots,
 screencasting, and PDF export.
+
+## Vendored deno_core
+
+The workspace patches crates.io `deno_core` to the pinned in-tree
+`vendor/deno-core` copy. Obscura keeps version 0.350.0 and adds the smallest
+managed-realm surface needed for independent iframe module maps, dynamic
+imports, and event-loop polling. The upstream source record, archive digest,
+local patch surface, and MIT license location are documented in
+[`vendor/deno-core/OBSCURA-VENDORING.md`](../vendor/deno-core/OBSCURA-VENDORING.md).
+No Git dependency or network checkout is required at runtime.
+Module graphs use deno_core's own `RecursiveModuleLoad`; this workspace does
+not add a `deno_graph` dependency.
+
+CI and release jobs run `python3 scripts/ci/check_vendor_licenses.py`. The
+check requires every in-tree crate to have a package/version/license-matched
+provenance record, source-archive SHA-256, upstream HTTPS URL, license text,
+and matching `[patch.crates-io]` path.
 
 The stealth feature builds BoringSSL and generates Rust bindings. In addition
 to the default requirements, install CMake, Clang, and the libclang/LLVM
@@ -102,7 +125,9 @@ because the engine owns a single V8 isolate per process.
 ## GitHub Actions CI
 
 Pull requests continue to use `.github/workflows/ci.yml`, including the
-base-revision policy and performance comparison. Pushes to `main` or
+base-revision policy and performance comparison. Its five interleaved samples
+are compared by median; either latency or peak RSS strictly above `1.10x` the
+base fails, with no additional absolute-delta exception. Pushes to `main` or
 `VVDevelop` use `.github/workflows/ci-branch.yml`. The branch workflow can also
 be started manually from the Actions tab and runs the release-mode render test
 suite plus the render/stealth/no-render build configurations. It has read-only
@@ -133,10 +158,14 @@ public. A pre-existing tag must already resolve to the selected commit. Tags
 with a prerelease suffix, such as `v0.2.0-rc.1`, are marked as prereleases
 automatically.
 
-The prepare job resolves one immutable commit SHA. Every native matrix build
-checks out that SHA, and the tag without its leading `v` is injected as the CLI
-version. Immediately before publication, the workflow resolves the tag again
-(including annotated tags) and fails if it moved while the matrix was building.
+The prepare job resolves one immutable commit SHA. A release test gate checks
+out and verifies that exact SHA, runs the focused document-loading regressions,
+then runs the full render suite in release mode. The native platform matrix
+does not start, and publication cannot run, unless both test stages pass. Every
+native matrix build checks out the same SHA, and the tag without its leading
+`v` is injected as the CLI version. Immediately before publication, the
+workflow resolves the tag again (including annotated tags) and fails if it
+moved while the matrix was building.
 The matrix builds Linux x86_64/ARM64, macOS Apple Silicon/Intel, and Windows
 x86_64. Each platform produces default, stealth, no-render, and
 no-render-stealth archives, runs an offline V8 startup smoke test, and uploads

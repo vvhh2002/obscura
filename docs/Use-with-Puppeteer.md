@@ -26,7 +26,10 @@ await page.goto('https://example.com', { waitUntil: 'load' });
 await page.goto('https://example.com', { waitUntil: 'networkidle0', timeout: 60000 });
 ```
 
-Default `waitUntil` is `domcontentloaded`. Other values: `load`, `networkidle2`, `networkidle0`.
+Omitting `waitUntil` uses Puppeteer's own navigation default; Obscura does not
+replace it. Raw CDP `Page.navigate` is different: without Obscura's optional
+`waitUntil` extension it returns at commit and continues emitting lifecycle
+events. See [Raw Page.navigate migration](Connect-Puppeteer-or-Playwright.md#raw-pagenavigate-migration).
 
 ## Evaluate
 

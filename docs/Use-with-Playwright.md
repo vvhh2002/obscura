@@ -25,7 +25,10 @@ await page.goto('https://example.com', { waitUntil: 'load' });
 await page.goto('https://example.com', { waitUntil: 'networkidle' });
 ```
 
-Default is `domcontentloaded`. Other values: `load`, `networkidle`.
+Omitting `waitUntil` uses Playwright's own navigation default; Obscura does not
+replace it. Raw CDP `Page.navigate` is different: without Obscura's optional
+`waitUntil` extension it returns at commit and continues emitting lifecycle
+events. See [Raw Page.navigate migration](Connect-Puppeteer-or-Playwright.md#raw-pagenavigate-migration).
 
 ## Evaluate
 

@@ -431,9 +431,9 @@ fn encode_long_full_page_png(
         .write_header()
         .map_err(|error| format!("Page.captureScreenshot striped PNG header failed: {error}"))?;
     {
-        let mut stream = writer
-            .stream_writer_with_size(64 * 1024)
-            .map_err(|error| format!("Page.captureScreenshot striped PNG stream failed: {error}"))?;
+        let mut stream = writer.stream_writer_with_size(64 * 1024).map_err(|error| {
+            format!("Page.captureScreenshot striped PNG stream failed: {error}")
+        })?;
         let mut output_y = 0u32;
         while output_y < output_height {
             let next_output_y = output_y
@@ -476,14 +476,14 @@ fn encode_long_full_page_png(
                     strip.dimensions()
                 ));
             }
-            stream
-                .write_all(strip.as_raw())
-                .map_err(|error| format!("Page.captureScreenshot striped PNG write failed: {error}"))?;
+            stream.write_all(strip.as_raw()).map_err(|error| {
+                format!("Page.captureScreenshot striped PNG write failed: {error}")
+            })?;
             output_y = next_output_y;
         }
-        stream
-            .finish()
-            .map_err(|error| format!("Page.captureScreenshot striped PNG finish failed: {error}"))?;
+        stream.finish().map_err(|error| {
+            format!("Page.captureScreenshot striped PNG finish failed: {error}")
+        })?;
     }
     writer
         .finish()
@@ -498,9 +498,7 @@ fn encode_long_full_page_png(
 /// Retain the old environment variable only as an explicit diagnostic escape
 /// hatch for callers investigating a slow or missing asset.
 #[cfg(feature = "render")]
-pub(crate) async fn prepare_capture_resources_if_requested(
-    page: &mut obscura_browser::Page,
-) {
+pub(crate) async fn prepare_capture_resources_if_requested(page: &mut obscura_browser::Page) {
     let Some(deadline_ms) = std::env::var("OBSCURA_RENDER_RESOURCE_DEADLINE_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -754,7 +752,10 @@ pub(crate) async fn pump_screencast_frames(ctx: &mut CdpContext) {
             continue;
         }
         if let Err(error) = queue_screencast_frame(ctx, &attached_session, false) {
-            tracing::warn!(cdp_session_id, "could not produce autonomous screencast frame: {error}");
+            tracing::warn!(
+                cdp_session_id,
+                "could not produce autonomous screencast frame: {error}"
+            );
         }
     }
 }
@@ -781,6 +782,608 @@ pub(crate) fn command_can_change_screencast_frame(method: &str) -> bool {
     )
 }
 
+fn lifecycle_events_enabled(ctx: &CdpContext, session_id: &Option<String>) -> bool {
+    session_id
+        .as_ref()
+        .is_some_and(|session_id| ctx.lifecycle_event_sessions.contains(session_id))
+}
+
+pub(crate) fn protocol_frame_id(page_frame_id: &str, native_frame_id: u32) -> String {
+    if native_frame_id == 0 {
+        page_frame_id.to_string()
+    } else {
+        child_frame_id(page_frame_id, native_frame_id)
+    }
+}
+
+pub(crate) fn protocol_loader_id(
+    page_frame_id: &str,
+    navigation_loader_id: &str,
+    native_frame_id: u32,
+) -> String {
+    if native_frame_id == 0 {
+        navigation_loader_id.to_string()
+    } else {
+        format!("{}-loader", child_frame_id(page_frame_id, native_frame_id))
+    }
+}
+
+pub(crate) fn emit_live_network_request_started(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    frame_id: &str,
+    loader_id: &str,
+    document_url: &str,
+    request_id: &str,
+    url: &str,
+    method: &str,
+    resource_type: &str,
+    headers: &std::collections::HashMap<String, String>,
+    event_timestamp: f64,
+) {
+    ctx.pending_events.push(CdpEvent {
+        method: "Network.requestWillBeSent".into(),
+        params: json!({
+            "requestId": request_id,
+            "loaderId": loader_id,
+            "documentURL": document_url,
+            "request": {
+                "url": url,
+                "method": method,
+                "headers": headers,
+            },
+            "timestamp": event_timestamp,
+            "wallTime": event_timestamp,
+            "initiator": {"type": "other"},
+            "type": resource_type,
+            "frameId": frame_id,
+        }),
+        session_id: session_id.clone(),
+    });
+}
+
+pub(crate) fn emit_live_network_response_received(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    frame_id: &str,
+    loader_id: &str,
+    request_id: &str,
+    url: &str,
+    status: u16,
+    resource_type: &str,
+    headers: &std::collections::HashMap<String, String>,
+    event_timestamp: f64,
+) {
+    ctx.pending_events.push(CdpEvent {
+        method: "Network.responseReceived".into(),
+        params: json!({
+            "requestId": request_id,
+            "loaderId": loader_id,
+            "timestamp": event_timestamp,
+            "type": resource_type,
+            "response": {
+                "url": url,
+                "status": status,
+                "statusText": "",
+                "headers": headers,
+                "mimeType": headers
+                    .get("content-type")
+                    .cloned()
+                    .unwrap_or_default(),
+            },
+            "frameId": frame_id,
+        }),
+        session_id: session_id.clone(),
+    });
+}
+
+pub(crate) fn emit_live_network_data_received(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    request_id: &str,
+    data_length: usize,
+    encoded_data_length: usize,
+    event_timestamp: f64,
+) {
+    ctx.pending_events.push(CdpEvent {
+        method: "Network.dataReceived".into(),
+        params: json!({
+            "requestId": request_id,
+            "timestamp": event_timestamp,
+            "dataLength": data_length,
+            "encodedDataLength": encoded_data_length,
+        }),
+        session_id: session_id.clone(),
+    });
+}
+
+pub(crate) fn emit_live_network_loading_finished(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    request_id: &str,
+    encoded_data_length: usize,
+    event_timestamp: f64,
+) {
+    ctx.pending_events.push(CdpEvent {
+        method: "Network.loadingFinished".into(),
+        params: json!({
+            "requestId": request_id,
+            "timestamp": event_timestamp,
+            "encodedDataLength": encoded_data_length,
+        }),
+        session_id: session_id.clone(),
+    });
+}
+
+pub(crate) fn emit_live_network_loading_failed(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    request_id: &str,
+    resource_type: &str,
+    error: &str,
+    canceled: bool,
+    event_timestamp: f64,
+) {
+    ctx.pending_events.push(CdpEvent {
+        method: "Network.loadingFailed".into(),
+        params: json!({
+            "requestId": request_id,
+            "timestamp": event_timestamp,
+            "type": resource_type,
+            "errorText": error,
+            "canceled": canceled,
+        }),
+        session_id: session_id.clone(),
+    });
+}
+
+/// Emit the document-commit boundary before author scripts and subframes have
+/// finished. This replaces the old post-navigation synthetic phase.
+pub(crate) fn emit_live_navigation_commit(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    frame_id: &str,
+    loader_id: &str,
+    page_url: &str,
+    page_id: &str,
+    mime_type: &str,
+    event_timestamp: f64,
+) {
+    ctx.current_loader_ids
+        .insert(page_id.to_string(), loader_id.to_string());
+    let lifecycle_enabled = lifecycle_events_enabled(ctx, session_id);
+    if lifecycle_enabled {
+        ctx.pending_events.push(CdpEvent {
+            method: "Page.lifecycleEvent".into(),
+            params: json!({
+                "frameId": frame_id,
+                "loaderId": loader_id,
+                "name": "init",
+                "timestamp": event_timestamp,
+            }),
+            session_id: session_id.clone(),
+        });
+    }
+
+    ctx.valid_context_ids.clear();
+    ctx.pending_events.push(CdpEvent {
+        method: "Runtime.executionContextsCleared".into(),
+        params: json!({}),
+        session_id: session_id.clone(),
+    });
+    ctx.pending_events.push(CdpEvent {
+        method: "Page.frameNavigated".into(),
+        params: json!({
+            "frame": {
+                "id": frame_id,
+                "loaderId": loader_id,
+                "url": page_url,
+                "domainAndRegistry": "",
+                "securityOrigin": page_url,
+                "mimeType": mime_type.split(';').next().unwrap_or(mime_type).trim(),
+                "adFrameStatus": {"adFrameType": "none"},
+            },
+            "type": "Navigation",
+        }),
+        session_id: session_id.clone(),
+    });
+    ctx.valid_context_ids.insert(2);
+    ctx.pending_events.push(CdpEvent {
+        method: "Runtime.executionContextCreated".into(),
+        params: json!({
+            "context": {
+                "id": 2,
+                "origin": page_url,
+                "name": "",
+                "uniqueId": format!("ctx-nav-{page_id}"),
+                "auxData": {
+                    "isDefault": true,
+                    "type": "default",
+                    "frameId": frame_id,
+                },
+            },
+        }),
+        session_id: session_id.clone(),
+    });
+    let world_names = if ctx.isolated_worlds.is_empty() {
+        vec!["__puppeteer_utility_world__24.40.0".to_string()]
+    } else {
+        ctx.isolated_worlds.clone()
+    };
+    for world_name in world_names {
+        let world_context_id = ctx.next_isolated_context();
+        ctx.pending_events.push(CdpEvent {
+            method: "Runtime.executionContextCreated".into(),
+            params: json!({
+                "context": {
+                    "id": world_context_id,
+                    "origin": page_url,
+                    "name": world_name,
+                    "uniqueId": format!("ctx-isolated-nav-{page_id}-{world_context_id}"),
+                    "auxData": {
+                        "isDefault": false,
+                        "type": "isolated",
+                        "frameId": frame_id,
+                    },
+                },
+            }),
+            session_id: session_id.clone(),
+        });
+    }
+    if lifecycle_enabled {
+        ctx.pending_events.push(CdpEvent {
+            method: "Page.lifecycleEvent".into(),
+            params: json!({
+                "frameId": frame_id,
+                "loaderId": loader_id,
+                "name": "commit",
+                "timestamp": event_timestamp,
+            }),
+            session_id: session_id.clone(),
+        });
+    }
+}
+
+pub(crate) fn emit_live_frame_attached(
+    ctx: &mut CdpContext,
+    session_ids: &[String],
+    page_frame_id: &str,
+    native_frame_id: u32,
+    native_parent_frame_id: u32,
+) {
+    let frame_id = protocol_frame_id(page_frame_id, native_frame_id);
+    let parent_frame_id = protocol_frame_id(page_frame_id, native_parent_frame_id);
+    for session_id in session_ids {
+        ctx.pending_events.push(CdpEvent {
+            method: "Page.frameAttached".into(),
+            params: json!({
+                "frameId": frame_id,
+                "parentFrameId": parent_frame_id,
+            }),
+            session_id: Some(session_id.clone()),
+        });
+    }
+}
+
+/// Publish a committed child document and its execution worlds. Context ids
+/// are allocated once and broadcast to every flattened session attached to the
+/// page, matching the renderer-global identity seen by multiple CDP sessions.
+pub(crate) fn emit_live_frame_navigated(
+    ctx: &mut CdpContext,
+    session_ids: &[String],
+    page_id: &str,
+    page_frame_id: &str,
+    navigation_loader_id: &str,
+    native_frame_id: u32,
+    native_parent_frame_id: u32,
+    url: &str,
+    origin: &str,
+    mime_type: &str,
+    event_timestamp: f64,
+) -> Vec<(i64, String)> {
+    let frame_id = protocol_frame_id(page_frame_id, native_frame_id);
+    let parent_frame_id = protocol_frame_id(page_frame_id, native_parent_frame_id);
+    let loader_id = protocol_loader_id(page_frame_id, navigation_loader_id, native_frame_id);
+    let default_context_id = ctx.next_isolated_context();
+    let world_names = if ctx.isolated_worlds.is_empty() {
+        vec!["__puppeteer_utility_world__24.40.0".to_string()]
+    } else {
+        ctx.isolated_worlds.clone()
+    };
+    let world_contexts = world_names
+        .into_iter()
+        .map(|name| (ctx.next_isolated_context(), name))
+        .collect::<Vec<_>>();
+    let default_unique_id = format!("ctx-child-{page_id}-{native_frame_id}-{default_context_id}");
+    let mut contexts = Vec::with_capacity(world_contexts.len() + 1);
+    contexts.push((default_context_id, default_unique_id.clone()));
+    contexts.extend(world_contexts.iter().map(|(id, _)| {
+        (
+            *id,
+            format!("ctx-isolated-child-{page_id}-{native_frame_id}-{id}"),
+        )
+    }));
+
+    for session_id in session_ids {
+        let event_session = Some(session_id.clone());
+        if lifecycle_events_enabled(ctx, &event_session) {
+            ctx.pending_events.push(CdpEvent {
+                method: "Page.lifecycleEvent".into(),
+                params: json!({
+                    "frameId": frame_id,
+                    "loaderId": loader_id,
+                    "name": "init",
+                    "timestamp": event_timestamp,
+                }),
+                session_id: event_session.clone(),
+            });
+        }
+        ctx.pending_events.push(CdpEvent {
+            method: "Page.frameNavigated".into(),
+            params: json!({
+                "frame": {
+                    "id": frame_id,
+                    "parentId": parent_frame_id,
+                    "loaderId": loader_id,
+                    "url": url,
+                    "domainAndRegistry": "",
+                    "securityOrigin": origin,
+                    "mimeType": mime_type.split(';').next().unwrap_or(mime_type).trim(),
+                    "adFrameStatus": {"adFrameType": "none"},
+                },
+                "type": "Navigation",
+            }),
+            session_id: event_session.clone(),
+        });
+        ctx.pending_events.push(CdpEvent {
+            method: "Runtime.executionContextCreated".into(),
+            params: json!({
+                "context": {
+                    "id": default_context_id,
+                    "origin": origin,
+                    "name": "",
+                    "uniqueId": default_unique_id,
+                    "auxData": {
+                        "isDefault": true,
+                        "type": "default",
+                        "frameId": frame_id,
+                    },
+                },
+            }),
+            session_id: event_session.clone(),
+        });
+        for ((context_id, world_name), (_, unique_id)) in
+            world_contexts.iter().zip(contexts.iter().skip(1))
+        {
+            ctx.pending_events.push(CdpEvent {
+                method: "Runtime.executionContextCreated".into(),
+                params: json!({
+                    "context": {
+                        "id": context_id,
+                        "origin": origin,
+                        "name": world_name,
+                        "uniqueId": unique_id,
+                        "auxData": {
+                            "isDefault": false,
+                            "type": "isolated",
+                            "frameId": frame_id,
+                        },
+                    },
+                }),
+                session_id: event_session.clone(),
+            });
+        }
+        if lifecycle_events_enabled(ctx, &event_session) {
+            ctx.pending_events.push(CdpEvent {
+                method: "Page.lifecycleEvent".into(),
+                params: json!({
+                    "frameId": frame_id,
+                    "loaderId": loader_id,
+                    "name": "commit",
+                    "timestamp": event_timestamp,
+                }),
+                session_id: event_session,
+            });
+        }
+    }
+    contexts
+}
+
+pub(crate) fn emit_live_frame_dom_content_loaded(
+    ctx: &mut CdpContext,
+    session_ids: &[String],
+    page_frame_id: &str,
+    navigation_loader_id: &str,
+    native_frame_id: u32,
+    event_timestamp: f64,
+) {
+    let frame_id = protocol_frame_id(page_frame_id, native_frame_id);
+    let loader_id = protocol_loader_id(page_frame_id, navigation_loader_id, native_frame_id);
+    for session_id in session_ids {
+        let event_session = Some(session_id.clone());
+        if lifecycle_events_enabled(ctx, &event_session) {
+            ctx.pending_events.push(CdpEvent {
+                method: "Page.lifecycleEvent".into(),
+                params: json!({
+                    "frameId": frame_id,
+                    "loaderId": loader_id,
+                    "name": "DOMContentLoaded",
+                    "timestamp": event_timestamp,
+                }),
+                session_id: event_session,
+            });
+        }
+    }
+}
+
+pub(crate) fn emit_live_frame_load(
+    ctx: &mut CdpContext,
+    session_ids: &[String],
+    page_frame_id: &str,
+    navigation_loader_id: &str,
+    native_frame_id: u32,
+    event_timestamp: f64,
+) {
+    let frame_id = protocol_frame_id(page_frame_id, native_frame_id);
+    let loader_id = protocol_loader_id(page_frame_id, navigation_loader_id, native_frame_id);
+    for session_id in session_ids {
+        let event_session = Some(session_id.clone());
+        if lifecycle_events_enabled(ctx, &event_session) {
+            ctx.pending_events.push(CdpEvent {
+                method: "Page.lifecycleEvent".into(),
+                params: json!({
+                    "frameId": frame_id,
+                    "loaderId": loader_id,
+                    "name": "load",
+                    "timestamp": event_timestamp,
+                }),
+                session_id: event_session.clone(),
+            });
+        }
+        // This standard Page event is independent of the optional lifecycle
+        // stream, just like the top-frame frameStoppedLoading event.
+        ctx.pending_events.push(CdpEvent {
+            method: "Page.frameStoppedLoading".into(),
+            params: json!({"frameId": frame_id}),
+            session_id: event_session,
+        });
+    }
+}
+
+pub(crate) fn emit_live_frame_detached(
+    ctx: &mut CdpContext,
+    session_ids: &[String],
+    page_frame_id: &str,
+    native_frame_id: u32,
+    contexts: &[(i64, String)],
+) {
+    let frame_id = protocol_frame_id(page_frame_id, native_frame_id);
+    for (context_id, _) in contexts {
+        ctx.valid_context_ids.remove(context_id);
+    }
+    for session_id in session_ids {
+        for (context_id, unique_id) in contexts {
+            ctx.pending_events.push(CdpEvent {
+                method: "Runtime.executionContextDestroyed".into(),
+                params: json!({
+                    "executionContextId": context_id,
+                    "executionContextUniqueId": unique_id,
+                }),
+                session_id: Some(session_id.clone()),
+            });
+        }
+        ctx.pending_events.push(CdpEvent {
+            method: "Page.frameDetached".into(),
+            params: json!({"frameId": frame_id, "reason": "remove"}),
+            session_id: Some(session_id.clone()),
+        });
+    }
+}
+
+pub(crate) fn emit_live_dom_content_loaded(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    frame_id: &str,
+    loader_id: &str,
+    event_timestamp: f64,
+) {
+    if lifecycle_events_enabled(ctx, session_id) {
+        ctx.pending_events.push(CdpEvent {
+            method: "Page.lifecycleEvent".into(),
+            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": event_timestamp}),
+            session_id: session_id.clone(),
+        });
+    }
+    ctx.pending_events.push(CdpEvent {
+        method: "Page.domContentEventFired".into(),
+        params: json!({"timestamp": event_timestamp}),
+        session_id: session_id.clone(),
+    });
+}
+
+pub(crate) fn emit_live_load(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    frame_id: &str,
+    loader_id: &str,
+    event_timestamp: f64,
+) {
+    if lifecycle_events_enabled(ctx, session_id) {
+        ctx.pending_events.push(CdpEvent {
+            method: "Page.lifecycleEvent".into(),
+            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": event_timestamp}),
+            session_id: session_id.clone(),
+        });
+    }
+    ctx.pending_events.push(CdpEvent {
+        method: "Page.loadEventFired".into(),
+        params: json!({"timestamp": event_timestamp}),
+        session_id: session_id.clone(),
+    });
+    ctx.pending_events.push(CdpEvent {
+        method: "Page.frameStoppedLoading".into(),
+        params: json!({"frameId": frame_id}),
+        session_id: session_id.clone(),
+    });
+}
+
+pub(crate) fn emit_live_network_idle(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    frame_id: &str,
+    loader_id: &str,
+    event_timestamp: f64,
+) {
+    if lifecycle_events_enabled(ctx, session_id) {
+        ctx.pending_events.push(CdpEvent {
+            method: "Page.lifecycleEvent".into(),
+            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": event_timestamp}),
+            session_id: session_id.clone(),
+        });
+    }
+}
+
+pub(crate) fn emit_live_network_almost_idle(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    frame_id: &str,
+    loader_id: &str,
+    event_timestamp: f64,
+) {
+    if lifecycle_events_enabled(ctx, session_id) {
+        ctx.pending_events.push(CdpEvent {
+            method: "Page.lifecycleEvent".into(),
+            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkAlmostIdle", "timestamp": event_timestamp}),
+            session_id: session_id.clone(),
+        });
+    }
+}
+
+pub(crate) fn emit_navigation_target_info_changed(
+    ctx: &mut CdpContext,
+    page_id: &str,
+    page_url: &str,
+) {
+    let (title, browser_context_id) = ctx
+        .get_page(page_id)
+        .map(|page| (page.title.clone(), page.context.id.clone()))
+        .unwrap_or_default();
+    ctx.pending_events.push(CdpEvent::new(
+        "Target.targetInfoChanged",
+        json!({
+            "targetInfo": {
+                "targetId": page_id,
+                "type": "page",
+                "title": title,
+                "url": page_url,
+                "attached": true,
+                "canAccessOpener": false,
+                "browserContextId": browser_context_id,
+            }
+        }),
+    ));
+}
+
 /// Emit the post-navigation event stream into `ctx.pending_events`. Shared
 /// by both the in-process `do_navigate` path and the spawned path in
 /// `server::process_navigation`, so the recent goto-returns-Response /
@@ -793,11 +1396,12 @@ pub fn emit_navigation_events(
     page_url: &str,
     page_id: &str,
     network_events: &[obscura_browser::NetworkEvent],
-    wait_until: WaitUntil,
+    _wait_until: WaitUntil,
     reached_network_idle: bool,
 ) {
     ctx.current_loader_ids
         .insert(page_id.to_string(), loader_id.to_string());
+    let lifecycle_enabled = lifecycle_events_enabled(ctx, session_id);
     let es = session_id.clone();
     let ts = timestamp();
 
@@ -901,6 +1505,9 @@ pub fn emit_navigation_events(
         });
     }
     phase1.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() });
+    if !lifecycle_enabled {
+        phase1.retain(|event| event.method != "Page.lifecycleEvent");
+    }
     ctx.pending_events.extend(phase1);
 
     if ctx.fetch_intercept.enabled {
@@ -967,7 +1574,7 @@ pub fn emit_navigation_events(
             session_id: es.clone(),
         },
     ];
-    if reached_network_idle || matches!(wait_until, WaitUntil::Load | WaitUntil::DomContentLoaded) {
+    if reached_network_idle {
         let idle_ts = timestamp();
         phase3.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": idle_ts}), session_id: es.clone() });
     }
@@ -976,6 +1583,9 @@ pub fn emit_navigation_events(
         params: json!({"frameId": frame_id}),
         session_id: es,
     });
+    if !lifecycle_enabled {
+        phase3.retain(|event| event.method != "Page.lifecycleEvent");
+    }
     ctx.pending_events.extend(phase3);
 
     // Target.targetInfoChanged: strict CDP clients (browser-use, and
@@ -1089,27 +1699,21 @@ pub fn parse_wait_until(params: &Value) -> WaitUntil {
                     .filter_map(|item| item.as_str())
                     .map(WaitUntil::from_str)
                     .max_by_key(|w| match w {
-                        WaitUntil::DomContentLoaded => 0,
-                        WaitUntil::Load => 1,
-                        WaitUntil::NetworkIdle2 => 2,
-                        WaitUntil::NetworkIdle0 => 3,
+                        WaitUntil::Commit => 0,
+                        WaitUntil::DomContentLoaded => 1,
+                        WaitUntil::Load => 2,
+                        WaitUntil::NetworkIdle2 => 3,
+                        WaitUntil::NetworkIdle0 => 4,
+                        WaitUntil::CaptureReady => 5,
                     })
             } else {
                 None
             }
         })
-        // Puppeteer and Playwright drive navigation via `Page.navigate`
-        // without a server-side waitUntil — they wait for `Page.lifecycleEvent`
-        // on the client side. Defaulting the server to `Load` means we run
-        // every parser/deferred/async script on JS-heavy pages before
-        // emitting `load`, which on sites like github.com / reddit.com
-        // pushes nav past 25s and clients time out at 15s. Real Chrome
-        // streams `DOMContentLoaded` as soon as the parser is done; we
-        // batch our event emission at the end of navigation, so the
-        // closest we can get is to default to `DomContentLoaded` and skip
-        // the full-load wait. CLI callers that pass `--wait-until load`
-        // (or `networkidle*`) are unaffected; they get the old behaviour.
-        .unwrap_or(WaitUntil::DomContentLoaded)
+        // Raw CDP navigation resolves at document commit. Clients subscribe
+        // to the independently streamed lifecycle events when they need DCL,
+        // load, or network-idle semantics. `waitUntil` is an Obscura extension.
+        .unwrap_or(WaitUntil::Commit)
 }
 
 async fn do_navigate(
@@ -1289,7 +1893,20 @@ pub async fn handle(
 
             Ok(json!({ "executionContextId": context_id }))
         }
-        "setLifecycleEventsEnabled" => Ok(json!({})),
+        "setLifecycleEventsEnabled" => {
+            if let Some(session_id) = session_id {
+                if params
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    ctx.lifecycle_event_sessions.insert(session_id.clone());
+                } else {
+                    ctx.lifecycle_event_sessions.remove(session_id);
+                }
+            }
+            Ok(json!({}))
+        }
         "addScriptToEvaluateOnNewDocument" => {
             let source = params.get("source").and_then(|v| v.as_str()).unwrap_or("");
             ctx.preload_counter += 1;
@@ -1586,48 +2203,49 @@ pub async fn handle(
                     None
                 };
 
-                let (png, png_is_final_encoding) = match region {
-                    Some(region) => match page
-                        .screenshot_region_with_animation_sample(region, animation_sample)
-                    {
-                        Ok(png) => (png, false),
-                        Err(obscura_browser::CaptureError::AllocationLimitExceeded)
-                            if options.format == ScreenshotFormat::Png
-                                && options.clip.is_none()
-                                && options.capture_beyond_viewport =>
+                let (png, png_is_final_encoding) =
+                    match region {
+                        Some(region) => match page
+                            .screenshot_region_with_animation_sample(region, animation_sample)
                         {
-                            (
-                                encode_long_full_page_png(
-                                    page,
-                                    full_page_size
-                                        .expect("full-page route has retained dimensions"),
-                                    page.device_scale_factor,
-                                    animation_sample,
-                                    options.optimize_for_speed,
-                                )?,
-                                true,
+                            Ok(png) => (png, false),
+                            Err(obscura_browser::CaptureError::AllocationLimitExceeded)
+                                if options.format == ScreenshotFormat::Png
+                                    && options.clip.is_none()
+                                    && options.capture_beyond_viewport =>
+                            {
+                                (
+                                    encode_long_full_page_png(
+                                        page,
+                                        full_page_size
+                                            .expect("full-page route has retained dimensions"),
+                                        page.device_scale_factor,
+                                        animation_sample,
+                                        options.optimize_for_speed,
+                                    )?,
+                                    true,
+                                )
+                            }
+                            Err(error) => return Err(capture_error_message(error)),
+                        },
+                        None => {
+                            obscura_browser::validate_capture_region(
+                                obscura_browser::CaptureRegion::new(
+                                    scroll.0 as f32,
+                                    scroll.1 as f32,
+                                    viewport.0,
+                                    viewport.1,
+                                    1.0,
+                                ),
                             )
-                        }
-                        Err(error) => return Err(capture_error_message(error)),
-                    },
-                    None => {
-                        obscura_browser::validate_capture_region(
-                            obscura_browser::CaptureRegion::new(
-                                scroll.0 as f32,
-                                scroll.1 as f32,
-                                viewport.0,
-                                viewport.1,
-                                1.0,
-                            ),
-                        )
-                        .map_err(capture_error_message)?;
-                        (page.screenshot_with_animation_sample(viewport, animation_sample)
+                            .map_err(capture_error_message)?;
+                            (page.screenshot_with_animation_sample(viewport, animation_sample)
                             .ok_or_else(|| {
                                 "Page.captureScreenshot failed: the page has no DOM to render"
                                     .to_string()
                             })?, false)
-                    }
-                };
+                        }
+                    };
 
                 // Keep the common path allocation-free and byte-for-byte
                 // compatible with the renderer's native PNG encoder.
@@ -1675,6 +2293,245 @@ fn timestamp() -> f64 {
 mod tests {
     use super::*;
     use crate::dispatch::CdpContext;
+
+    #[test]
+    fn raw_navigation_defaults_to_commit_and_explicit_waits_rank_by_lateness() {
+        assert_eq!(parse_wait_until(&json!({})), WaitUntil::Commit);
+        assert_eq!(
+            parse_wait_until(&json!({"waitUntil": "capture-ready"})),
+            WaitUntil::CaptureReady,
+        );
+        assert_eq!(
+            parse_wait_until(&json!({"waitUntil": ["commit", "load"]})),
+            WaitUntil::Load,
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_event_subscription_is_session_scoped_and_reversible() {
+        let mut ctx = CdpContext::new();
+        let session = Some("page-1-session".to_string());
+        handle(
+            "setLifecycleEventsEnabled",
+            &json!({"enabled": true}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        assert!(ctx
+            .lifecycle_event_sessions
+            .contains(session.as_deref().unwrap()));
+        handle(
+            "setLifecycleEventsEnabled",
+            &json!({"enabled": false}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        assert!(!ctx
+            .lifecycle_event_sessions
+            .contains(session.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn live_navigation_events_preserve_actual_milestone_order() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions
+            .insert(session.clone().unwrap(), page_id.clone());
+        ctx.lifecycle_event_sessions
+            .insert(session.clone().unwrap());
+        let frame_id = ctx.get_page(&page_id).unwrap().frame_id.clone();
+        let loader_id = "loader-live";
+        let url = "https://example.test/live";
+        let request_headers = std::collections::HashMap::new();
+        let response_headers = std::collections::HashMap::from([(
+            "content-type".into(),
+            "text/html; charset=utf-8".into(),
+        )]);
+
+        emit_live_network_request_started(
+            &mut ctx,
+            &session,
+            &frame_id,
+            loader_id,
+            url,
+            loader_id,
+            url,
+            "GET",
+            "Document",
+            &request_headers,
+            1.0,
+        );
+        emit_live_network_response_received(
+            &mut ctx,
+            &session,
+            &frame_id,
+            loader_id,
+            loader_id,
+            url,
+            200,
+            "Document",
+            &response_headers,
+            1.1,
+        );
+        emit_live_network_data_received(&mut ctx, &session, loader_id, 21, 21, 1.2);
+        emit_live_navigation_commit(
+            &mut ctx,
+            &session,
+            &frame_id,
+            loader_id,
+            url,
+            &page_id,
+            "text/html; charset=utf-8",
+            2.0,
+        );
+        emit_live_network_loading_finished(&mut ctx, &session, loader_id, 42, 2.5);
+        emit_live_dom_content_loaded(&mut ctx, &session, &frame_id, loader_id, 3.0);
+        emit_live_load(&mut ctx, &session, &frame_id, loader_id, 4.0);
+        emit_live_network_almost_idle(&mut ctx, &session, &frame_id, loader_id, 5.0);
+        emit_live_network_idle(&mut ctx, &session, &frame_id, loader_id, 6.0);
+
+        let methods: Vec<_> = ctx
+            .pending_events
+            .iter()
+            .map(|event| event.method.as_str())
+            .collect();
+        let request = methods
+            .iter()
+            .position(|method| *method == "Network.requestWillBeSent")
+            .unwrap();
+        let response = methods
+            .iter()
+            .position(|method| *method == "Network.responseReceived")
+            .unwrap();
+        let data = methods
+            .iter()
+            .position(|method| *method == "Network.dataReceived")
+            .unwrap();
+        let finished = methods
+            .iter()
+            .position(|method| *method == "Network.loadingFinished")
+            .unwrap();
+        let commit = ctx
+            .pending_events
+            .iter()
+            .position(|event| {
+                event.method == "Page.lifecycleEvent" && event.params["name"] == "commit"
+            })
+            .unwrap();
+        let dcl = ctx
+            .pending_events
+            .iter()
+            .position(|event| event.method == "Page.domContentEventFired")
+            .unwrap();
+        let load = ctx
+            .pending_events
+            .iter()
+            .position(|event| event.method == "Page.loadEventFired")
+            .unwrap();
+        let idle = ctx
+            .pending_events
+            .iter()
+            .position(|event| {
+                event.method == "Page.lifecycleEvent" && event.params["name"] == "networkIdle"
+            })
+            .unwrap();
+        let almost_idle = ctx
+            .pending_events
+            .iter()
+            .position(|event| {
+                event.method == "Page.lifecycleEvent" && event.params["name"] == "networkAlmostIdle"
+            })
+            .unwrap();
+        assert!(
+            request < response
+                && response < data
+                && data < commit
+                && commit < finished
+                && finished < dcl
+                && dcl < load
+                && load < almost_idle
+                && almost_idle < idle
+        );
+        assert_eq!(ctx.pending_events[request].params["requestId"], loader_id);
+        assert_eq!(
+            ctx.pending_events
+                .iter()
+                .find(|event| event.method == "Page.frameNavigated")
+                .unwrap()
+                .params["frame"]["mimeType"],
+            "text/html",
+        );
+    }
+
+    #[test]
+    fn load_does_not_imply_network_idle_and_stops_the_frame_once() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions
+            .insert(session.clone().unwrap(), page_id.clone());
+        ctx.lifecycle_event_sessions
+            .insert(session.clone().unwrap());
+        let frame_id = ctx.get_page(&page_id).unwrap().frame_id.clone();
+
+        emit_live_load(&mut ctx, &session, &frame_id, "loader-live", 4.0);
+
+        assert_eq!(
+            ctx.pending_events
+                .iter()
+                .filter(|event| event.method == "Page.frameStoppedLoading")
+                .count(),
+            1,
+        );
+        assert!(ctx.pending_events.iter().all(|event| {
+            event.method != "Page.lifecycleEvent" || event.params["name"] != "networkIdle"
+        }));
+    }
+
+    #[test]
+    fn disabling_lifecycle_events_keeps_compatibility_load_events() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions
+            .insert(session.clone().unwrap(), page_id.clone());
+        let frame_id = ctx.get_page(&page_id).unwrap().frame_id.clone();
+
+        emit_live_navigation_commit(
+            &mut ctx,
+            &session,
+            &frame_id,
+            "loader-live",
+            "https://example.test/",
+            &page_id,
+            "text/html",
+            1.0,
+        );
+        emit_live_dom_content_loaded(&mut ctx, &session, &frame_id, "loader-live", 2.0);
+        emit_live_load(&mut ctx, &session, &frame_id, "loader-live", 3.0);
+
+        assert!(ctx
+            .pending_events
+            .iter()
+            .all(|event| event.method != "Page.lifecycleEvent"));
+        assert!(ctx
+            .pending_events
+            .iter()
+            .any(|event| event.method == "Page.domContentEventFired"));
+        assert!(ctx
+            .pending_events
+            .iter()
+            .any(|event| event.method == "Page.loadEventFired"));
+        assert!(ctx
+            .pending_events
+            .iter()
+            .any(|event| event.method == "Page.frameStoppedLoading"));
+    }
 
     #[test]
     fn runtime_network_events_reuse_the_document_loader_without_lifecycle_replay() {
@@ -1853,9 +2710,7 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    async fn transparent_surface_fixture(
-        height: u32,
-    ) -> (CdpContext, Option<String>) {
+    async fn transparent_surface_fixture(height: u32) -> (CdpContext, Option<String>) {
         let mut ctx = CdpContext::new();
         let page_id = ctx.create_page();
         let session_id = format!("{page_id}-session");
@@ -2052,9 +2907,7 @@ mod tests {
                 .expect("off-viewport clip with default false"),
             );
             assert_eq!(raster.dimensions(), (20, 20));
-            assert!(raster
-                .pixels()
-                .all(|pixel| pixel.0 == [7, 19, 31, 255]));
+            assert!(raster.pixels().all(|pixel| pixel.0 == [7, 19, 31, 255]));
         }
 
         ctx.get_session_page_mut(&session)
@@ -2372,7 +3225,8 @@ mod tests {
                         let mut request = [0u8; 2048];
                         let _ = stream.read(&mut request);
                         observed.fetch_add(1, Ordering::SeqCst);
-                        let body = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>"#;
+                        let body =
+                            br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>"#;
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                             body.len()
@@ -2388,16 +3242,15 @@ mod tests {
             }
         });
 
-        let context = std::sync::Arc::new(
-            obscura_browser::BrowserContext::with_storage_and_network(
+        let context =
+            std::sync::Arc::new(obscura_browser::BrowserContext::with_storage_and_network(
                 "capture-without-warmup".to_string(),
                 None,
                 false,
                 None,
                 None,
                 true,
-            ),
-        );
+            ));
         let mut ctx = CdpContext::new_with_shared_context(context);
         let page_id = ctx.create_page();
         let session_id = format!("{page_id}-session");

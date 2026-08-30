@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -64,6 +64,714 @@ enum ServerMessage {
     },
 }
 
+/// Connection-owned receiver for a page's live browser events.
+///
+/// The sender stays installed on `Page` for the lifetime of the target.  In
+/// particular it is not scoped to one `Page.navigate` command: a timer may
+/// start fetch/XHR or a committed streaming document may receive another body
+/// chunk after the command response has already been sent.  Keeping the
+/// protocol id maps beside the receiver also lets those later phases retain
+/// the navigation loader/frame routing selected at commit.
+struct LivePageObserver {
+    sender: mpsc::UnboundedSender<obscura_browser::NavigationEvent>,
+    receiver: mpsc::UnboundedReceiver<obscura_browser::NavigationEvent>,
+    page_id: String,
+    session_id: Option<String>,
+    frame_id: String,
+    loader_id: String,
+    page_url: String,
+    protocol_request_ids: HashMap<String, String>,
+    request_resource_types: HashMap<String, String>,
+    terminal_request_ids: HashSet<String>,
+    /// Internal ids currently lacking a terminal transport phase. This is the
+    /// authority for persistent post-load networkAlmostIdle/networkIdle; a
+    /// completed response snapshot is deliberately not replayed here.
+    active_request_ids: HashSet<String>,
+    load_observed: bool,
+    almost_idle_since: Option<tokio::time::Instant>,
+    idle_since: Option<tokio::time::Instant>,
+    emitted_network_almost_idle: bool,
+    emitted_network_idle: bool,
+    /// Top-document generation accepted by this observer. A new navigation
+    /// installs its next generation before moving Page into the async task, so
+    /// a child event left in the channel by the outgoing document is harmless.
+    document_generation: u64,
+    child_execution_contexts: HashMap<u32, Vec<(i64, String)>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObservedNavigationBoundary {
+    None,
+    Commit,
+    DomContentLoaded,
+    Load,
+    NetworkAlmostIdle,
+    NetworkIdle,
+    Failed,
+}
+
+impl LivePageObserver {
+    fn new(page_id: String, frame_id: String) -> Self {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        Self {
+            sender,
+            receiver,
+            page_id,
+            session_id: None,
+            frame_id,
+            loader_id: String::new(),
+            page_url: "about:blank".to_string(),
+            protocol_request_ids: HashMap::new(),
+            request_resource_types: HashMap::new(),
+            terminal_request_ids: HashSet::new(),
+            active_request_ids: HashSet::new(),
+            load_observed: false,
+            almost_idle_since: None,
+            idle_since: None,
+            emitted_network_almost_idle: false,
+            emitted_network_idle: false,
+            document_generation: 0,
+            child_execution_contexts: HashMap::new(),
+        }
+    }
+
+    fn begin_navigation(
+        &mut self,
+        session_id: Option<String>,
+        frame_id: String,
+        loader_id: String,
+        page_url: String,
+        document_generation: u64,
+    ) {
+        self.session_id = session_id;
+        self.frame_id = frame_id;
+        self.loader_id = loader_id;
+        self.page_url = page_url;
+        self.document_generation = document_generation;
+        self.protocol_request_ids.clear();
+        self.request_resource_types.clear();
+        self.terminal_request_ids.clear();
+        self.reset_idle_monitor();
+    }
+
+    fn reset_idle_monitor(&mut self) {
+        self.active_request_ids.clear();
+        self.load_observed = false;
+        self.almost_idle_since = None;
+        self.idle_since = None;
+        self.emitted_network_almost_idle = false;
+        self.emitted_network_idle = false;
+    }
+
+    fn restart_idle_quiet_windows(&mut self) {
+        if !self.load_observed {
+            self.almost_idle_since = None;
+            self.idle_since = None;
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        self.almost_idle_since = (self.active_request_ids.len() <= 2).then_some(now);
+        self.idle_since = self.active_request_ids.is_empty().then_some(now);
+    }
+
+    fn needs_idle_tick(&self) -> bool {
+        self.load_observed && (!self.emitted_network_almost_idle || !self.emitted_network_idle)
+    }
+
+    fn poll_idle_milestones(&mut self, ctx: &mut CdpContext) {
+        if !self.needs_idle_tick() {
+            return;
+        }
+        const QUIET_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+        let now = tokio::time::Instant::now();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
+        if !self.emitted_network_almost_idle
+            && self
+                .almost_idle_since
+                .is_some_and(|since| now.duration_since(since) >= QUIET_WINDOW)
+        {
+            self.emitted_network_almost_idle = true;
+            crate::domains::page::emit_live_network_almost_idle(
+                ctx,
+                &self.session_id,
+                &self.frame_id,
+                &self.loader_id,
+                timestamp,
+            );
+        }
+        if !self.emitted_network_idle
+            && self
+                .idle_since
+                .is_some_and(|since| now.duration_since(since) >= QUIET_WINDOW)
+        {
+            // Zero active requests matures both thresholds together. Preserve
+            // lifecycle ordering if the 25ms tick reaches them in one poll.
+            if !self.emitted_network_almost_idle {
+                self.emitted_network_almost_idle = true;
+                crate::domains::page::emit_live_network_almost_idle(
+                    ctx,
+                    &self.session_id,
+                    &self.frame_id,
+                    &self.loader_id,
+                    timestamp,
+                );
+            }
+            self.emitted_network_idle = true;
+            crate::domains::page::emit_live_network_idle(
+                ctx,
+                &self.session_id,
+                &self.frame_id,
+                &self.loader_id,
+                timestamp,
+            );
+        }
+    }
+
+    fn page_session_ids(&self, ctx: &CdpContext) -> Vec<String> {
+        let mut session_ids = ctx
+            .sessions
+            .iter()
+            .filter(|(_, page_id)| *page_id == &self.page_id)
+            .map(|(session_id, _)| session_id.clone())
+            .collect::<Vec<_>>();
+        // Unit embedders may install a live observer without populating the
+        // full target/session map. Preserve that explicit route as a fallback.
+        if session_ids.is_empty() {
+            if let Some(session_id) = &self.session_id {
+                session_ids.push(session_id.clone());
+            }
+        }
+        session_ids.sort();
+        session_ids.dedup();
+        session_ids
+    }
+
+    fn accept_frame_event_generation(&mut self, document_generation: u64) -> bool {
+        // Redirect/replacement handling may start another document generation
+        // inside one Page.navigate. The Page sender is FIFO, so a generation
+        // larger than the one predicted at command start is the new current
+        // document; after advancing, delayed events from either earlier
+        // generation are rejected.
+        if document_generation < self.document_generation {
+            return false;
+        }
+        if document_generation > self.document_generation {
+            self.document_generation = document_generation;
+            self.protocol_request_ids.clear();
+            self.request_resource_types.clear();
+            self.terminal_request_ids.clear();
+            self.reset_idle_monitor();
+        }
+        true
+    }
+
+    fn accept_network_event_generation(&mut self, document_generation: u64) -> bool {
+        // Network phases are queued independently of CDP commands.  A new
+        // Page.navigate resets loader/request-id state, so accepting a phase
+        // from the replaced document here would attach it to the new loader
+        // (and could consume that request id's only terminal event).
+        if document_generation < self.document_generation {
+            return false;
+        }
+        if document_generation > self.document_generation {
+            // A redirect or script replacement may begin another top document
+            // inside the same Page.navigate command. The sender is FIFO, so
+            // the first phase from the higher generation advances the live
+            // boundary; any delayed terminal from the old document is then
+            // rejected instead of consuming the reused request-id slot.
+            self.document_generation = document_generation;
+            self.protocol_request_ids.clear();
+            self.request_resource_types.clear();
+            self.terminal_request_ids.clear();
+            self.reset_idle_monitor();
+        }
+        true
+    }
+
+    fn protocol_request_id(
+        &mut self,
+        internal_request_id: &str,
+        resource_type: &str,
+        native_frame_id: u32,
+    ) -> String {
+        if let Some(request_id) = self.protocol_request_ids.get(internal_request_id) {
+            return request_id.clone();
+        }
+        let request_id = if resource_type == "Document" {
+            crate::domains::page::protocol_loader_id(
+                &self.frame_id,
+                &self.loader_id,
+                native_frame_id,
+            )
+        } else {
+            internal_request_id.to_string()
+        };
+        self.protocol_request_ids
+            .insert(internal_request_id.to_string(), request_id.clone());
+        request_id
+    }
+
+    /// Translate one browser event immediately. Completed `Network` snapshots
+    /// remain the response-body/archive authority, but are never a CDP event
+    /// source: transport phases use a different internal id on some JS paths,
+    /// so replaying snapshots would create a second apparent request.
+    fn observe(
+        &mut self,
+        ctx: &mut CdpContext,
+        event: obscura_browser::NavigationEvent,
+    ) -> ObservedNavigationBoundary {
+        use obscura_browser::NavigationEvent;
+
+        match event {
+            NavigationEvent::NetworkRequestStarted {
+                request_id,
+                document_generation,
+                url,
+                method,
+                resource_type,
+                headers,
+                frame_id: native_frame_id,
+                timestamp,
+            } => {
+                if !self.accept_network_event_generation(document_generation) {
+                    return ObservedNavigationBoundary::None;
+                }
+                let event_frame_id =
+                    crate::domains::page::protocol_frame_id(&self.frame_id, native_frame_id);
+                let event_loader_id = crate::domains::page::protocol_loader_id(
+                    &self.frame_id,
+                    &self.loader_id,
+                    native_frame_id,
+                );
+                let protocol_request_id =
+                    self.protocol_request_id(&request_id, &resource_type, native_frame_id);
+                self.request_resource_types
+                    .insert(request_id.clone(), resource_type.clone());
+                if self.active_request_ids.insert(request_id) {
+                    self.restart_idle_quiet_windows();
+                }
+                crate::domains::page::emit_live_network_request_started(
+                    ctx,
+                    &self.session_id,
+                    &event_frame_id,
+                    &event_loader_id,
+                    &self.page_url,
+                    &protocol_request_id,
+                    &url,
+                    &method,
+                    &resource_type,
+                    &headers,
+                    timestamp,
+                );
+            }
+            NavigationEvent::NetworkResponseReceived {
+                request_id,
+                document_generation,
+                url,
+                status,
+                resource_type,
+                headers,
+                frame_id: native_frame_id,
+                timestamp,
+            } => {
+                if !self.accept_network_event_generation(document_generation) {
+                    return ObservedNavigationBoundary::None;
+                }
+                let event_frame_id =
+                    crate::domains::page::protocol_frame_id(&self.frame_id, native_frame_id);
+                let event_loader_id = crate::domains::page::protocol_loader_id(
+                    &self.frame_id,
+                    &self.loader_id,
+                    native_frame_id,
+                );
+                let protocol_request_id =
+                    self.protocol_request_id(&request_id, &resource_type, native_frame_id);
+                self.request_resource_types
+                    .entry(request_id)
+                    .or_insert_with(|| resource_type.clone());
+                crate::domains::page::emit_live_network_response_received(
+                    ctx,
+                    &self.session_id,
+                    &event_frame_id,
+                    &event_loader_id,
+                    &protocol_request_id,
+                    &url,
+                    status,
+                    &resource_type,
+                    &headers,
+                    timestamp,
+                );
+            }
+            NavigationEvent::NetworkDataReceived {
+                request_id,
+                document_generation,
+                data_length,
+                encoded_data_length,
+                timestamp,
+            } => {
+                if !self.accept_network_event_generation(document_generation) {
+                    return ObservedNavigationBoundary::None;
+                }
+                let protocol_request_id = self
+                    .protocol_request_ids
+                    .get(&request_id)
+                    .map(String::as_str)
+                    .unwrap_or(&request_id);
+                crate::domains::page::emit_live_network_data_received(
+                    ctx,
+                    &self.session_id,
+                    protocol_request_id,
+                    data_length,
+                    encoded_data_length,
+                    timestamp,
+                );
+            }
+            NavigationEvent::NetworkLoadingFinished {
+                request_id,
+                document_generation,
+                encoded_data_length,
+                timestamp,
+            } => {
+                if !self.accept_network_event_generation(document_generation) {
+                    return ObservedNavigationBoundary::None;
+                }
+                if self.terminal_request_ids.insert(request_id.clone()) {
+                    self.active_request_ids.remove(&request_id);
+                    self.restart_idle_quiet_windows();
+                    let protocol_request_id = self
+                        .protocol_request_ids
+                        .get(&request_id)
+                        .map(String::as_str)
+                        .unwrap_or(&request_id);
+                    crate::domains::page::emit_live_network_loading_finished(
+                        ctx,
+                        &self.session_id,
+                        protocol_request_id,
+                        encoded_data_length,
+                        timestamp,
+                    );
+                }
+            }
+            NavigationEvent::NetworkLoadingFailed {
+                request_id,
+                document_generation,
+                error,
+                canceled,
+                timestamp,
+            } => {
+                if !self.accept_network_event_generation(document_generation) {
+                    return ObservedNavigationBoundary::None;
+                }
+                if self.terminal_request_ids.insert(request_id.clone()) {
+                    self.active_request_ids.remove(&request_id);
+                    self.restart_idle_quiet_windows();
+                    let protocol_request_id = self
+                        .protocol_request_ids
+                        .get(&request_id)
+                        .map(String::as_str)
+                        .unwrap_or(&request_id);
+                    let resource_type = self
+                        .request_resource_types
+                        .get(&request_id)
+                        .map(String::as_str)
+                        .unwrap_or("Other");
+                    crate::domains::page::emit_live_network_loading_failed(
+                        ctx,
+                        &self.session_id,
+                        protocol_request_id,
+                        resource_type,
+                        &error,
+                        canceled,
+                        timestamp,
+                    );
+                }
+            }
+            NavigationEvent::Network(_) => {}
+            NavigationEvent::Commit {
+                url,
+                mime_type,
+                timestamp,
+            } => {
+                self.page_url = url;
+                // A replacement commit owns a fresh lifecycle even when a
+                // script redirect advanced generation inside one command.
+                self.load_observed = false;
+                self.almost_idle_since = None;
+                self.idle_since = None;
+                self.emitted_network_almost_idle = false;
+                self.emitted_network_idle = false;
+                crate::domains::page::emit_live_navigation_commit(
+                    ctx,
+                    &self.session_id,
+                    &self.frame_id,
+                    &self.loader_id,
+                    &self.page_url,
+                    &self.page_id,
+                    &mime_type,
+                    timestamp,
+                );
+                self.child_execution_contexts.clear();
+                ctx.announced_frames.remove(&self.page_id);
+                return ObservedNavigationBoundary::Commit;
+            }
+            NavigationEvent::FrameAttached {
+                frame_id: native_frame_id,
+                parent_frame_id: native_parent_frame_id,
+                document_generation,
+                ..
+            } => {
+                if !self.accept_frame_event_generation(document_generation) {
+                    return ObservedNavigationBoundary::None;
+                }
+                let frame_id =
+                    crate::domains::page::protocol_frame_id(&self.frame_id, native_frame_id);
+                let announced = ctx
+                    .announced_frames
+                    .entry(self.page_id.clone())
+                    .or_default();
+                if announced.iter().any(|known| known == &frame_id) {
+                    return ObservedNavigationBoundary::None;
+                }
+                announced.push(frame_id);
+                let session_ids = self.page_session_ids(ctx);
+                crate::domains::page::emit_live_frame_attached(
+                    ctx,
+                    &session_ids,
+                    &self.frame_id,
+                    native_frame_id,
+                    native_parent_frame_id,
+                );
+            }
+            NavigationEvent::FrameNavigated {
+                frame_id: native_frame_id,
+                parent_frame_id: native_parent_frame_id,
+                url,
+                origin,
+                mime_type,
+                document_generation,
+                timestamp,
+            } => {
+                if !self.accept_frame_event_generation(document_generation)
+                    || self.child_execution_contexts.contains_key(&native_frame_id)
+                {
+                    return ObservedNavigationBoundary::None;
+                }
+                let frame_id =
+                    crate::domains::page::protocol_frame_id(&self.frame_id, native_frame_id);
+                let was_announced = ctx
+                    .announced_frames
+                    .get(&self.page_id)
+                    .is_some_and(|known| known.iter().any(|known| known == &frame_id));
+                let session_ids = self.page_session_ids(ctx);
+                if !was_announced {
+                    ctx.announced_frames
+                        .entry(self.page_id.clone())
+                        .or_default()
+                        .push(frame_id);
+                    crate::domains::page::emit_live_frame_attached(
+                        ctx,
+                        &session_ids,
+                        &self.frame_id,
+                        native_frame_id,
+                        native_parent_frame_id,
+                    );
+                }
+                let contexts = crate::domains::page::emit_live_frame_navigated(
+                    ctx,
+                    &session_ids,
+                    &self.page_id,
+                    &self.frame_id,
+                    &self.loader_id,
+                    native_frame_id,
+                    native_parent_frame_id,
+                    &url,
+                    &origin,
+                    &mime_type,
+                    timestamp,
+                );
+                self.child_execution_contexts
+                    .insert(native_frame_id, contexts);
+            }
+            NavigationEvent::FrameDomContentLoaded {
+                frame_id: native_frame_id,
+                document_generation,
+                timestamp,
+            } => {
+                if !self.accept_frame_event_generation(document_generation)
+                    || !self.child_execution_contexts.contains_key(&native_frame_id)
+                {
+                    return ObservedNavigationBoundary::None;
+                }
+                let session_ids = self.page_session_ids(ctx);
+                crate::domains::page::emit_live_frame_dom_content_loaded(
+                    ctx,
+                    &session_ids,
+                    &self.frame_id,
+                    &self.loader_id,
+                    native_frame_id,
+                    timestamp,
+                );
+            }
+            NavigationEvent::FrameLoad {
+                frame_id: native_frame_id,
+                document_generation,
+                timestamp,
+            } => {
+                if !self.accept_frame_event_generation(document_generation)
+                    || !self.child_execution_contexts.contains_key(&native_frame_id)
+                {
+                    return ObservedNavigationBoundary::None;
+                }
+                let session_ids = self.page_session_ids(ctx);
+                crate::domains::page::emit_live_frame_load(
+                    ctx,
+                    &session_ids,
+                    &self.frame_id,
+                    &self.loader_id,
+                    native_frame_id,
+                    timestamp,
+                );
+            }
+            NavigationEvent::FrameDetached {
+                frame_id: native_frame_id,
+                document_generation,
+                ..
+            } => {
+                if !self.accept_frame_event_generation(document_generation) {
+                    return ObservedNavigationBoundary::None;
+                }
+                let frame_id =
+                    crate::domains::page::protocol_frame_id(&self.frame_id, native_frame_id);
+                let was_announced =
+                    ctx.announced_frames
+                        .get_mut(&self.page_id)
+                        .is_some_and(|known| {
+                            let before = known.len();
+                            known.retain(|candidate| candidate != &frame_id);
+                            known.len() != before
+                        });
+                if !was_announced {
+                    return ObservedNavigationBoundary::None;
+                }
+                let session_ids = self.page_session_ids(ctx);
+                let contexts = self
+                    .child_execution_contexts
+                    .remove(&native_frame_id)
+                    .unwrap_or_default();
+                crate::domains::page::emit_live_frame_detached(
+                    ctx,
+                    &session_ids,
+                    &self.frame_id,
+                    native_frame_id,
+                    &contexts,
+                );
+            }
+            NavigationEvent::DomContentLoaded { timestamp } => {
+                crate::domains::page::emit_live_dom_content_loaded(
+                    ctx,
+                    &self.session_id,
+                    &self.frame_id,
+                    &self.loader_id,
+                    timestamp,
+                );
+                return ObservedNavigationBoundary::DomContentLoaded;
+            }
+            NavigationEvent::Load { timestamp } => {
+                self.load_observed = true;
+                self.restart_idle_quiet_windows();
+                crate::domains::page::emit_live_load(
+                    ctx,
+                    &self.session_id,
+                    &self.frame_id,
+                    &self.loader_id,
+                    timestamp,
+                );
+                return ObservedNavigationBoundary::Load;
+            }
+            NavigationEvent::NetworkIdle { timestamp } => {
+                self.emitted_network_almost_idle = true;
+                self.emitted_network_idle = true;
+                crate::domains::page::emit_live_network_idle(
+                    ctx,
+                    &self.session_id,
+                    &self.frame_id,
+                    &self.loader_id,
+                    timestamp,
+                );
+                return ObservedNavigationBoundary::NetworkIdle;
+            }
+            NavigationEvent::NetworkAlmostIdle { timestamp } => {
+                self.emitted_network_almost_idle = true;
+                crate::domains::page::emit_live_network_almost_idle(
+                    ctx,
+                    &self.session_id,
+                    &self.frame_id,
+                    &self.loader_id,
+                    timestamp,
+                );
+                return ObservedNavigationBoundary::NetworkAlmostIdle;
+            }
+            NavigationEvent::Failed { .. } => {
+                self.load_observed = false;
+                self.almost_idle_since = None;
+                self.idle_since = None;
+                return ObservedNavigationBoundary::Failed;
+            }
+        }
+        ObservedNavigationBoundary::None
+    }
+
+    fn drain(&mut self, ctx: &mut CdpContext) {
+        while let Ok(event) = self.receiver.try_recv() {
+            self.observe(ctx, event);
+        }
+    }
+
+    /// Close every request still owned by the outgoing loader before a new
+    /// navigation replaces its generation and request-id maps. Page will also
+    /// publish a canceled terminal for an unfinished primary body; that later
+    /// old-generation event is intentionally filtered after begin_navigation.
+    fn abort_active_requests_for_navigation(&mut self, ctx: &mut CdpContext) {
+        let mut request_ids = self.active_request_ids.iter().cloned().collect::<Vec<_>>();
+        request_ids.sort();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        for request_id in request_ids {
+            if !self.terminal_request_ids.insert(request_id.clone()) {
+                continue;
+            }
+            let protocol_request_id = self
+                .protocol_request_ids
+                .get(&request_id)
+                .map(String::as_str)
+                .unwrap_or(&request_id);
+            let resource_type = self
+                .request_resource_types
+                .get(&request_id)
+                .map(String::as_str)
+                .unwrap_or("Other");
+            crate::domains::page::emit_live_network_loading_failed(
+                ctx,
+                &self.session_id,
+                protocol_request_id,
+                resource_type,
+                "net::ERR_ABORTED: navigation replaced the document",
+                true,
+                timestamp,
+            );
+        }
+        self.active_request_ids.clear();
+        self.almost_idle_since = None;
+        self.idle_since = None;
+    }
+}
+
 pub async fn start(port: u16) -> anyhow::Result<()> {
     start_with_options(port, None, false).await
 }
@@ -107,7 +815,14 @@ pub async fn start_with_host_and_security(
     storage_dir: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     start_with_full_serve_options(
-        port, host, proxy, stealth, user_agent, allow_file_access, storage_dir, false,
+        port,
+        host,
+        proxy,
+        stealth,
+        user_agent,
+        allow_file_access,
+        storage_dir,
+        false,
     )
     .await
 }
@@ -122,7 +837,14 @@ pub async fn start_with_host_security_and_storage(
     storage_dir: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     start_with_full_serve_options(
-        port, host, proxy, stealth, user_agent, allow_file_access, storage_dir, false,
+        port,
+        host,
+        proxy,
+        stealth,
+        user_agent,
+        allow_file_access,
+        storage_dir,
+        false,
     )
     .await
 }
@@ -190,10 +912,7 @@ pub async fn start_with_serve_options_and_limit(
         .map_err(|e| anyhow::anyhow!("set_nonblocking: {}", e))?;
 
     info!("Obscura CDP server listening on ws://{}:{}", host, port);
-    info!(
-        "DevTools endpoint: ws://{}:{}/devtools/browser",
-        host, port
-    );
+    info!("DevTools endpoint: ws://{}:{}/devtools/browser", host, port);
     if allow_file_access {
         info!("file:// navigation enabled (--allow-file-access). Do not expose this port to untrusted networks.");
     }
@@ -526,9 +1245,8 @@ fn run_connection(
         .name("obscura-cdp-conn".into())
         .spawn(move || {
             let _slot = SlotGuard(slot);
-            let default_context = Arc::new(
-                context_template.isolated_copy("default".to_string(), true),
-            );
+            let default_context =
+                Arc::new(context_template.isolated_copy("default".to_string(), true));
             let initial_cookies = default_context.cookie_jar.get_all_cookies();
             let persisted_context = default_context.clone();
             let rt = match tokio::runtime::Builder::new_current_thread()
@@ -595,10 +1313,7 @@ fn cookie_key(cookie: &obscura_net::CookieInfo) -> (String, String, String) {
     )
 }
 
-fn cookie_values_match(
-    left: &obscura_net::CookieInfo,
-    right: &obscura_net::CookieInfo,
-) -> bool {
+fn cookie_values_match(left: &obscura_net::CookieInfo, right: &obscura_net::CookieInfo) -> bool {
     left.value == right.value
         && left.secure == right.secure
         && left.http_only == right.http_only
@@ -611,16 +1326,18 @@ fn merge_cookie_delta(
     initial: &[obscura_net::CookieInfo],
     current: &[obscura_net::CookieInfo],
 ) {
-    let initial: HashMap<_, _> = initial.iter().map(|cookie| (cookie_key(cookie), cookie)).collect();
-    let current: HashMap<_, _> = current.iter().map(|cookie| (cookie_key(cookie), cookie)).collect();
+    let initial: HashMap<_, _> = initial
+        .iter()
+        .map(|cookie| (cookie_key(cookie), cookie))
+        .collect();
+    let current: HashMap<_, _> = current
+        .iter()
+        .map(|cookie| (cookie_key(cookie), cookie))
+        .collect();
 
     for (key, cookie) in &initial {
         if !current.contains_key(key) {
-            destination.delete_cookies_filtered(
-                &cookie.name,
-                &cookie.domain,
-                Some(&cookie.path),
-            );
+            destination.delete_cookies_filtered(&cookie.name, &cookie.domain, Some(&cookie.path));
         }
     }
 
@@ -735,7 +1452,10 @@ fn accept_dispatch(
 ) -> anyhow::Result<()> {
     let endpoint = if head.contains("/json/version") {
         Some("version")
-    } else if head.contains("/json/list") || head.contains("/json\r\n") || head.contains("/json HTTP") {
+    } else if head.contains("/json/list")
+        || head.contains("/json\r\n")
+        || head.contains("/json HTTP")
+    {
         Some("list")
     } else if head.contains("/json/protocol") {
         Some("protocol")
@@ -759,15 +1479,16 @@ fn accept_dispatch(
     // control plane that this whole rework exists to keep alive). The
     // dropped `stream` closes itself; the client will see ECONNRESET and
     // can retry.
-    ws_tx
-        .try_send(stream)
-        .map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => {
-                warn!("WS handoff channel full ({}); dropping new WebSocket connection", MAX_PENDING_WS_HANDOFFS);
-                anyhow::anyhow!("ws handoff channel full")
-            }
-            mpsc::error::TrySendError::Closed(_) => anyhow::anyhow!("accept channel closed"),
-        })
+    ws_tx.try_send(stream).map_err(|e| match e {
+        mpsc::error::TrySendError::Full(_) => {
+            warn!(
+                "WS handoff channel full ({}); dropping new WebSocket connection",
+                MAX_PENDING_WS_HANDOFFS
+            );
+            anyhow::anyhow!("ws handoff channel full")
+        }
+        mpsc::error::TrySendError::Closed(_) => anyhow::anyhow!("accept channel closed"),
+    })
 }
 
 /// Serve an HTTP `/json/*` endpoint with blocking I/O on the accept thread.
@@ -829,8 +1550,12 @@ async fn cdp_processor(
     let mut ctx = CdpContext::new_with_shared_context(default_context);
     let (itx, irx) = mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
     ctx.intercept_tx = Some(itx);
-    let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> = Some(irx);
-    let mut intercepted_paused: HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>> = HashMap::new();
+    let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> =
+        Some(irx);
+    let mut intercepted_paused: HashMap<
+        String,
+        tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>,
+    > = HashMap::new();
 
     // Issue #19 follow-up: messages deferred from inside
     // `process_with_interception` because routing them through
@@ -838,8 +1563,7 @@ async fn cdp_processor(
     // tripped V8's TryGetCurrent invariant. Drained at the top of each
     // outer iteration so they get processed sequentially with no other nav
     // in flight.
-    let mut deferred: std::collections::VecDeque<ServerMessage> =
-        std::collections::VecDeque::new();
+    let mut deferred: std::collections::VecDeque<ServerMessage> = std::collections::VecDeque::new();
 
     // Graceful shutdown: one signal watcher on the accept side flips the flag
     // and calls `notify_waiters()`. Polled once here (via the select! below) it
@@ -851,6 +1575,11 @@ async fn cdp_processor(
     // a bounded 30 Hz opportunity on this connection's owning LocalSet.
     let mut screencast_tick = tokio::time::interval(tokio::time::Duration::from_millis(33));
     screencast_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Network quiet is a duration boundary, not a synthetic consequence of
+    // DCL/load. Tick only while a live observer still owes one of the two
+    // post-load milestones; static/finished pages incur no periodic work.
+    let mut network_idle_tick = tokio::time::interval(tokio::time::Duration::from_millis(25));
+    network_idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut connection_reply_tx: Option<mpsc::UnboundedSender<String>> = None;
     // A real browser renderer continues servicing timers, networking, posted
     // tasks, and animation callbacks while its DevTools client is silent. Keep
@@ -860,13 +1589,224 @@ async fn cdp_processor(
     // next command/navigation, so static pages consume no polling budget.
     let mut runtime_pump_armed = false;
     let mut runtime_pump_error_streak = 0_u8;
+    // Receivers live at connection scope rather than at Page.navigate scope.
+    // This is what keeps post-load timer/fetch and streaming continuation
+    // phases observable after the owned Page has been returned to `ctx.pages`.
+    let mut live_page_observers: HashMap<String, LivePageObserver> = HashMap::new();
 
-    loop {
+    'processor: loop {
+        // Keep an autonomous browser turn alive while forwarding the live
+        // network phases it produces.  Polling the Page future and its event
+        // receiver as sibling branches in the outer select used to drop the
+        // Page future whenever requestWillBeSent/responseReceived arrived.
+        // That is not merely an observation detail: parser-blocking scripts,
+        // stylesheet graphs, and frame preparation own cancellable HTTP
+        // futures, so observing their request-start could cancel the very
+        // request being reported.  Temporarily remove the active Page from the
+        // context, retain one pinned turn across observer events, and put it
+        // back before servicing any command which needs page ownership.
+        let mut immediate_message = None;
+        if deferred.is_empty() {
+            match rx.try_recv() {
+                Ok(message) => immediate_message = Some(message),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        if runtime_pump_armed && deferred.is_empty() && immediate_message.is_none() {
+            if let Some(page_index) = ctx.pages.iter().position(|page| page.has_js()) {
+                let mut page = ctx.pages.remove(page_index);
+                let page_id = page.id.clone();
+                let page_frame_id = page.frame_id.clone();
+                let non_cancelable_resource_awaits = page.non_cancelable_resource_awaits();
+                let page_session_id = ctx
+                    .sessions
+                    .iter()
+                    .find(|(_, candidate)| *candidate == &page_id)
+                    .map(|(session_id, _)| session_id.clone());
+
+                enum AutonomousTurnExit {
+                    Completed(Result<bool, String>),
+                    Message(ServerMessage),
+                    ReceiverClosed,
+                    Shutdown,
+                }
+
+                let exit = {
+                    let mut turn = Box::pin(page.run_autonomous_event_loop_turn());
+                    loop {
+                        let has_intercept_rx = intercept_rx.is_some();
+                        let has_live_observers = !live_page_observers.is_empty();
+                        let has_pending_idle_milestone = live_page_observers
+                            .values()
+                            .any(LivePageObserver::needs_idle_tick);
+                        tokio::select! {
+                            biased;
+                            result = &mut turn => {
+                                break AutonomousTurnExit::Completed(result);
+                            }
+                            msg = rx.recv() => {
+                                let Some(message) = msg else {
+                                    break AutonomousTurnExit::ReceiverClosed;
+                                };
+                                // Fetch resolution only completes a oneshot
+                                // awaited by this same retained turn.  It does
+                                // not enter V8 or need the Page in CdpContext,
+                                // so handle it without cancelling the turn.
+                                let resolved = match &message {
+                                    ServerMessage::Cdp(message)
+                                        if message.text.contains("Fetch.") =>
+                                    {
+                                        handle_fetch_resolution(
+                                            &message.text,
+                                            &mut ctx,
+                                            &message.reply_tx,
+                                            &mut intercepted_paused,
+                                        )
+                                    }
+                                    _ => false,
+                                };
+                                if !resolved {
+                                    if non_cancelable_resource_awaits
+                                        .load(std::sync::atomic::Ordering::Acquire)
+                                        > 0
+                                        && matches!(&message, ServerMessage::Cdp(_))
+                                    {
+                                        // Do not drop the pinned Page future:
+                                        // it owns this parser/frame scheduler
+                                        // fetch. The command is processed as
+                                        // soon as the turn returns, while the
+                                        // observer branches below continue to
+                                        // stream request/response/data/end.
+                                        deferred.push_back(message);
+                                        continue;
+                                    }
+                                    break AutonomousTurnExit::Message(message);
+                                }
+                            }
+                            _ = &mut shutdown => {
+                                break AutonomousTurnExit::Shutdown;
+                            }
+                            (event_page_id, event) = receive_live_page_event(&mut live_page_observers),
+                                if has_live_observers =>
+                            {
+                                if let Some(observer) = live_page_observers.get_mut(&event_page_id) {
+                                    observer.observe(&mut ctx, event);
+                                }
+                                forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
+                            }
+                            _ = network_idle_tick.tick(), if has_pending_idle_milestone => {
+                                for observer in live_page_observers.values_mut() {
+                                    observer.poll_idle_milestones(&mut ctx);
+                                }
+                                forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
+                            }
+                            Some(intercepted) = async {
+                                if let Some(ref mut receiver) = intercept_rx {
+                                    receiver.recv().await
+                                } else {
+                                    std::future::pending().await
+                                }
+                            }, if has_intercept_rx => {
+                                if let (Some(session_id), Some(reply_tx)) =
+                                    (page_session_id.as_ref(), connection_reply_tx.as_ref())
+                                {
+                                    // The request-start event is queued before
+                                    // requestPaused.  The biased observer branch
+                                    // above drains it first when both are ready.
+                                    emit_intercepted_request(
+                                        intercepted,
+                                        &page_frame_id,
+                                        Some(session_id.clone()),
+                                        reply_tx,
+                                        &mut intercepted_paused,
+                                    );
+                                } else {
+                                    let _ = intercepted.resolver.send(
+                                        obscura_js::ops::InterceptResolution::Fail {
+                                            reason: "Aborted".into(),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                };
+
+                // The turn future no longer borrows Page here, so restore the
+                // exact target position before dispatching a deferred command.
+                ctx.pages.insert(page_index, page);
+
+                match exit {
+                    AutonomousTurnExit::Completed(result) => {
+                        match result {
+                            Ok(reached_idle) => {
+                                runtime_pump_error_streak = 0;
+                                runtime_pump_armed = !reached_idle;
+                            }
+                            Err(error) => {
+                                runtime_pump_error_streak =
+                                    runtime_pump_error_streak.saturating_add(1);
+                                runtime_pump_armed = runtime_pump_error_streak <= 3
+                                    && ctx.pages.iter().any(|page| page.has_js());
+                                tracing::warn!("autonomous page task failed: {error}");
+                                tokio::task::yield_now().await;
+                            }
+                        }
+                        sync_live_page_network_events(&mut ctx, &mut live_page_observers);
+                        dispatch::drain_binding_calls(&mut ctx);
+                        dispatch::drain_frame_events(&mut ctx);
+                        forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
+                        if let (Some(reply_tx), Some((session_id, url, method, body))) = (
+                            connection_reply_tx.as_ref(),
+                            take_live_pending_navigation(&ctx),
+                        ) {
+                            let navigation = json!({
+                                "id": 0,
+                                "method": "Page.navigate",
+                                "params": {"url": url, "__method": method, "__body": body},
+                                "sessionId": session_id,
+                            })
+                            .to_string();
+                            process_with_interception(
+                                &navigation,
+                                &mut ctx,
+                                reply_tx,
+                                &mut rx,
+                                &mut intercept_rx,
+                                &mut intercepted_paused,
+                                &mut deferred,
+                                &mut live_page_observers,
+                                false,
+                            )
+                            .await;
+                            runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
+                        }
+                        if runtime_pump_armed {
+                            continue 'processor;
+                        }
+                    }
+                    AutonomousTurnExit::Message(message) => {
+                        immediate_message = Some(message);
+                    }
+                    AutonomousTurnExit::ReceiverClosed => break 'processor,
+                    AutonomousTurnExit::Shutdown => {
+                        tracing::info!("Shutdown signal received (connection processor)");
+                        break 'processor;
+                    }
+                }
+            } else {
+                runtime_pump_armed = false;
+            }
+        }
+
         // Drain any deferred messages from the previous interception window
         // before pulling new ones off the wire. Each is processed with no
         // nav-task spawn_local in flight, so this connection's only entered
         // Isolate is the one dispatch is about to touch.
-        let msg = if let Some(d) = deferred.pop_front() {
+        let msg = if immediate_message.is_some() {
+            immediate_message
+        } else if let Some(d) = deferred.pop_front() {
             Some(d)
         } else {
             let screencast_active = has_active_screencast(&ctx);
@@ -881,6 +1821,10 @@ async fn cdp_processor(
                         .map(|(session_id, _)| (session_id.clone(), page.frame_id.clone()))
                 });
             let has_intercept_rx = intercept_rx.is_some();
+            let has_live_observers = !live_page_observers.is_empty();
+            let has_pending_idle_milestone = live_page_observers
+                .values()
+                .any(LivePageObserver::needs_idle_tick);
             tokio::select! {
                 biased;
                 msg = rx.recv() => match msg {
@@ -891,48 +1835,23 @@ async fn cdp_processor(
                     tracing::info!("Shutdown signal received (connection processor)");
                     break;
                 },
-                pump_result = pump_live_page_event_loop(&mut ctx), if runtime_pump_armed => {
-                    match pump_result {
-                        Ok(reached_idle) => {
-                            runtime_pump_error_streak = 0;
-                            runtime_pump_armed = !reached_idle;
-                        }
-                        Err(error) => {
-                            runtime_pump_error_streak = runtime_pump_error_streak.saturating_add(1);
-                            runtime_pump_armed = runtime_pump_error_streak <= 3
-                                && ctx.pages.iter().any(|page| page.has_js());
-                            tracing::warn!("autonomous page task failed: {error}");
-                            tokio::task::yield_now().await;
-                        }
+                (page_id, event) = receive_live_page_event(&mut live_page_observers),
+                    if has_live_observers =>
+                {
+                    // When no runtime turn is active, keep forwarding late
+                    // callback phases without polling or batching them.
+                    if let Some(observer) = live_page_observers.get_mut(&page_id) {
+                        observer.observe(&mut ctx, event);
                     }
-                    sync_live_page_network_events(&mut ctx);
-                    dispatch::drain_binding_calls(&mut ctx);
-                    dispatch::drain_frame_events(&mut ctx);
                     forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
-                    if let (Some(reply_tx), Some((session_id, url, method, body))) = (
-                        connection_reply_tx.as_ref(),
-                        take_live_pending_navigation(&ctx),
-                    ) {
-                        let navigation = json!({
-                            "id": 0,
-                            "method": "Page.navigate",
-                            "params": {"url": url, "__method": method, "__body": body},
-                            "sessionId": session_id,
-                        })
-                        .to_string();
-                        process_with_interception(
-                            &navigation,
-                            &mut ctx,
-                            reply_tx,
-                            &mut rx,
-                            &mut intercept_rx,
-                            &mut intercepted_paused,
-                            &mut deferred,
-                            false,
-                        )
-                        .await;
-                        runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
+                    runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
+                    None
+                },
+                _ = network_idle_tick.tick(), if has_pending_idle_milestone => {
+                    for observer in live_page_observers.values_mut() {
+                        observer.poll_idle_milestones(&mut ctx);
                     }
+                    forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
                     None
                 },
                 Some(intercepted) = async {
@@ -945,6 +1864,12 @@ async fn cdp_processor(
                     if let (Some((session_id, frame_id)), Some(reply_tx)) =
                         (live_page_route.as_ref(), connection_reply_tx.as_ref())
                     {
+                        // op_fetch_url queues the Network request-start before
+                        // it queues this Fetch pause. Drain that channel first
+                        // so requestWillBeSent precedes requestPaused without
+                        // synthesizing a second, unterminated request here.
+                        sync_live_page_network_events(&mut ctx, &mut live_page_observers);
+                        forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
                         emit_intercepted_request(
                             intercepted,
                             frame_id,
@@ -978,10 +1903,7 @@ async fn cdp_processor(
         match msg {
             ServerMessage::NewConnection { reply_tx } => {
                 connection_reply_tx = Some(reply_tx.clone());
-                let _ = reply_tx.send(
-                    json!({"__init": true})
-                        .to_string(),
-                );
+                let _ = reply_tx.send(json!({"__init": true}).to_string());
             }
             ServerMessage::Cdp(cdp_msg) => {
                 // Route every Page.navigate through the spawn-and-defer path,
@@ -996,10 +1918,17 @@ async fn cdp_processor(
 
                 if is_navigation {
                     process_with_interception(
-                        &cdp_msg.text, &mut ctx, &cdp_msg.reply_tx, &mut rx,
-                        &mut intercept_rx, &mut intercepted_paused,
-                        &mut deferred, true,
-                    ).await;
+                        &cdp_msg.text,
+                        &mut ctx,
+                        &cdp_msg.reply_tx,
+                        &mut rx,
+                        &mut intercept_rx,
+                        &mut intercepted_paused,
+                        &mut deferred,
+                        &mut live_page_observers,
+                        true,
+                    )
+                    .await;
                 } else {
                     let fetch_was_resolved = cdp_msg.text.contains("Fetch.")
                         && handle_fetch_resolution(
@@ -1009,18 +1938,30 @@ async fn cdp_processor(
                             &mut intercepted_paused,
                         );
                     if !fetch_was_resolved {
-                        process_cdp_message(&cdp_msg.text, &mut ctx, &cdp_msg.reply_tx).await;
+                        process_cdp_message(
+                            &cdp_msg.text,
+                            &mut ctx,
+                            &cdp_msg.reply_tx,
+                            &mut live_page_observers,
+                        )
+                        .await;
                     }
                 }
             }
         }
+
+        // Runtime.evaluate/callFunctionOn may synchronously complete a
+        // fetch/XHR without taking the autonomous pump branch. Drain the same
+        // persistent observer after every command as well, before sleeping for
+        // the next client message.
+        sync_live_page_network_events(&mut ctx, &mut live_page_observers);
+        forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
 
         // Dispatch may have created a page or scheduled new asynchronous work.
         // A single live isolate is the connection's current active target; the
         // pump will park cheaply if its next task is a distant timer.
         runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
         runtime_pump_error_streak = 0;
-
     }
 
     // The connection thread merges this context's cookie delta into the
@@ -1043,10 +1984,6 @@ fn emit_intercepted_request(
         intercepted.method,
         intercepted.url
     );
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
     let request = json!({
         "url": intercepted.url,
         "method": intercepted.method,
@@ -1054,23 +1991,6 @@ fn emit_intercepted_request(
         "initialPriority": "High",
         "referrerPolicy": "strict-origin-when-cross-origin",
     });
-    let request_will_be_sent = json!({
-        "method": "Network.requestWillBeSent",
-        "params": {
-            "requestId": intercepted.request_id,
-            "loaderId": "",
-            "documentURL": "",
-            "request": request,
-            "timestamp": now,
-            "wallTime": now,
-            "initiator": {"type": "script"},
-            "type": intercepted.resource_type,
-            "frameId": frame_id,
-        },
-        "sessionId": session_id,
-    });
-    let _ = reply_tx.send(request_will_be_sent.to_string());
-
     let request_paused = json!({
         "method": "Fetch.requestPaused",
         "params": {
@@ -1078,7 +1998,7 @@ fn emit_intercepted_request(
             "request": request,
             "frameId": frame_id,
             "resourceType": intercepted.resource_type,
-            "networkId": intercepted.request_id,
+            "networkId": intercepted.network_id,
             "responseErrorReason": null,
             "responseStatusCode": null,
             "responseHeaders": null,
@@ -1096,43 +2016,101 @@ async fn pump_live_page_event_loop(ctx: &mut CdpContext) -> Result<bool, String>
     page.run_autonomous_event_loop_turn().await
 }
 
-fn sync_live_page_network_events(ctx: &mut CdpContext) {
-    let page_route = ctx.pages.iter().find(|page| page.has_js()).and_then(|page| {
-        ctx.sessions
-            .iter()
-            .find(|(_, page_id)| *page_id == &page.id)
-            .map(|(session_id, _)| {
-                (
-                    Some(session_id.clone()),
-                    page.id.clone(),
-                    page.frame_id.clone(),
-                    page.url_string(),
-                )
-            })
-    });
-    let Some((session_id, page_id, frame_id, page_url)) = page_route else {
-        return;
-    };
-    let network_events = {
-        let Some(page) = ctx.get_page_mut(&page_id) else {
-            return;
-        };
-        page.sync_js_network_events();
-        page.network_events.drain(..).collect::<Vec<_>>()
-    };
-    crate::domains::page::emit_runtime_network_events(
-        ctx,
-        &session_id,
-        &frame_id,
-        &page_url,
-        &page_id,
-        &network_events,
-    );
+/// Wait for the first browser event from any live page without a polling
+/// interval. Every receiver registers the processor task's waker, so a network
+/// phase produced while V8 is awaiting I/O interrupts the parked autonomous
+/// turn and can be forwarded immediately.
+async fn receive_live_page_event(
+    observers: &mut HashMap<String, LivePageObserver>,
+) -> (String, obscura_browser::NavigationEvent) {
+    std::future::poll_fn(|cx| {
+        for (page_id, observer) in observers.iter_mut() {
+            match observer.receiver.poll_recv(cx) {
+                std::task::Poll::Ready(Some(event)) => {
+                    return std::task::Poll::Ready((page_id.clone(), event));
+                }
+                std::task::Poll::Ready(None) | std::task::Poll::Pending => {}
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await
 }
 
-fn take_live_pending_navigation(
-    ctx: &CdpContext,
-) -> Option<(String, String, String, String)> {
+fn sync_live_page_network_events(
+    ctx: &mut CdpContext,
+    observers: &mut HashMap<String, LivePageObserver>,
+) {
+    let existing_pages = ctx
+        .pages
+        .iter()
+        .map(|page| page.id.clone())
+        .collect::<HashSet<_>>();
+    observers.retain(|page_id, _| existing_pages.contains(page_id));
+    ctx.live_frame_event_pages
+        .retain(|page_id| existing_pages.contains(page_id));
+    let routes = ctx
+        .pages
+        .iter()
+        .filter(|page| page.has_js())
+        .map(|page| {
+            let session_id = ctx
+                .sessions
+                .iter()
+                .find(|(_, page_id)| *page_id == &page.id)
+                .map(|(session_id, _)| session_id.clone());
+            (
+                session_id,
+                page.id.clone(),
+                page.frame_id.clone(),
+                page.url_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    for (session_id, page_id, frame_id, page_url) in routes {
+        let network_events = {
+            let Some(page) = ctx.get_page_mut(&page_id) else {
+                continue;
+            };
+            page.sync_js_network_events();
+            page.network_events.drain(..).collect::<Vec<_>>()
+        };
+
+        if let Some(observer) = observers.get_mut(&page_id) {
+            // A target can be detached and reattached under another flattened
+            // session. Keep the initiating session while it is still valid;
+            // otherwise route subsequent phases to the currently attached one.
+            let observer_session_is_live = observer
+                .session_id
+                .as_ref()
+                .is_some_and(|session_id| ctx.sessions.get(session_id) == Some(&page_id));
+            if !observer_session_is_live {
+                observer.session_id = session_id.clone();
+            }
+            observer.frame_id = frame_id;
+            observer.page_url = page_url;
+            observer.drain(ctx);
+            // The Page snapshot queue remains the body/archive authority. Its
+            // requests have already been emitted by the persistent phase
+            // observer, often under a deliberately different transport id.
+            drop(network_events);
+        } else {
+            // Pages which have never navigated through the live server path do
+            // not yet own an observer. Preserve the old compatibility route.
+            crate::domains::page::emit_runtime_network_events(
+                ctx,
+                &session_id,
+                &frame_id,
+                &page_url,
+                &page_id,
+                &network_events,
+            );
+        }
+    }
+}
+
+fn take_live_pending_navigation(ctx: &CdpContext) -> Option<(String, String, String, String)> {
     let page = ctx.pages.iter().find(|page| page.has_js())?;
     let session_id = ctx
         .sessions
@@ -1143,10 +2121,7 @@ fn take_live_pending_navigation(
     Some((session_id, url, method, body))
 }
 
-fn forward_pending_events(
-    ctx: &mut CdpContext,
-    reply_tx: Option<&mpsc::UnboundedSender<String>>,
-) {
+fn forward_pending_events(ctx: &mut CdpContext, reply_tx: Option<&mpsc::UnboundedSender<String>>) {
     let Some(reply_tx) = reply_tx else {
         return;
     };
@@ -1215,12 +2190,24 @@ fn handle_fetch_resolution(
     text: &str,
     _ctx: &mut CdpContext,
     reply_tx: &mpsc::UnboundedSender<String>,
-    intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
+    intercepted_paused: &mut HashMap<
+        String,
+        tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>,
+    >,
 ) -> bool {
     if let Ok(req) = serde_json::from_str::<CdpRequest>(text) {
         let method = req.method.as_str();
-        let request_id = req.params.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
-        tracing::info!("INTERCEPTION resolution: {} for {}, paused_count={}", method, request_id, intercepted_paused.len());
+        let request_id = req
+            .params
+            .get("requestId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        tracing::info!(
+            "INTERCEPTION resolution: {} for {}, paused_count={}",
+            method,
+            request_id,
+            intercepted_paused.len()
+        );
 
         if let Some(resolver) = intercepted_paused.remove(request_id) {
             tracing::info!("INTERCEPTION resolved: {}", request_id);
@@ -1230,25 +2217,63 @@ fn handle_fetch_resolution(
                     // Puppeteer request.continue). op_fetch_url applies each and
                     // re-validates a rewritten URL through the SSRF gate. Leaving
                     // these None silently sent the request unmodified (issue #365).
-                    url: req.params.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    method: req.params.get("method").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    url: req
+                        .params
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    method: req
+                        .params
+                        .get("method")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
                     headers: parse_cdp_headers(&req.params),
-                    body: req.params.get("postData").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    body: req
+                        .params
+                        .get("postData")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
                 },
                 "Fetch.fulfillRequest" => {
-                    let status = req.params.get("responseCode").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
-                    let raw_body = req.params.get("body").and_then(|v| v.as_str()).unwrap_or("");
+                    let status = req
+                        .params
+                        .get("responseCode")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(200) as u16;
+                    let raw_body = req
+                        .params
+                        .get("body")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     let body = decode_base64(raw_body);
-                    let headers = req.params.get("responseHeaders")
+                    let headers = req
+                        .params
+                        .get("responseHeaders")
                         .and_then(|v| v.as_array())
-                        .map(|arr| arr.iter().filter_map(|h| {
-                            Some((h.get("name")?.as_str()?.to_string(), h.get("value")?.as_str()?.to_string()))
-                        }).collect())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|h| {
+                                    Some((
+                                        h.get("name")?.as_str()?.to_string(),
+                                        h.get("value")?.as_str()?.to_string(),
+                                    ))
+                                })
+                                .collect()
+                        })
                         .unwrap_or_default();
-                    obscura_js::ops::InterceptResolution::Fulfill { status, headers, body }
+                    obscura_js::ops::InterceptResolution::Fulfill {
+                        status,
+                        headers,
+                        body,
+                    }
                 }
                 "Fetch.failRequest" => {
-                    let reason = req.params.get("errorReason").and_then(|v| v.as_str()).unwrap_or("Failed").to_string();
+                    let reason = req
+                        .params
+                        .get("errorReason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Failed")
+                        .to_string();
                     obscura_js::ops::InterceptResolution::Fail { reason }
                 }
                 _ => return false,
@@ -1264,14 +2289,51 @@ fn handle_fetch_resolution(
     false
 }
 
+fn send_navigation_command_response(
+    reply_tx: &mpsc::UnboundedSender<String>,
+    req: &CdpRequest,
+    frame_id: &str,
+    loader_id: &str,
+    error: Option<&str>,
+) {
+    let response = match error {
+        Some(error) => crate::types::CdpResponse::error(
+            req.id,
+            -32000,
+            error.to_string(),
+            req.session_id.clone(),
+        ),
+        None => crate::types::CdpResponse::success(
+            req.id,
+            json!({"frameId": frame_id, "loaderId": loader_id}),
+            req.session_id.clone(),
+        ),
+    };
+    if let Ok(json) = serde_json::to_string(&response) {
+        let _ = reply_tx.send(json);
+    }
+}
+
+fn forward_navigation_events(ctx: &mut CdpContext, reply_tx: &mpsc::UnboundedSender<String>) {
+    for event in ctx.pending_events.drain(..) {
+        if let Ok(json) = serde_json::to_string(&event) {
+            let _ = reply_tx.send(json);
+        }
+    }
+}
+
 async fn process_with_interception(
     text: &str,
     ctx: &mut CdpContext,
     reply_tx: &mpsc::UnboundedSender<String>,
     rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
     intercept_rx: &mut Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>>,
-    intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
+    intercepted_paused: &mut HashMap<
+        String,
+        tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>,
+    >,
     deferred: &mut std::collections::VecDeque<ServerMessage>,
+    observers: &mut HashMap<String, LivePageObserver>,
     send_command_response: bool,
 ) {
     let req: CdpRequest = match serde_json::from_str(text) {
@@ -1293,7 +2355,7 @@ async fn process_with_interception(
     let page_id = match page_id {
         Some(id) => id,
         None => {
-            process_cdp_message(text, ctx, reply_tx).await;
+            process_cdp_message(text, ctx, reply_tx, observers).await;
             return;
         }
     };
@@ -1302,7 +2364,7 @@ async fn process_with_interception(
     let mut page = match page_index {
         Some(idx) => ctx.pages.remove(idx),
         None => {
-            process_cdp_message(text, ctx, reply_tx).await;
+            process_cdp_message(text, ctx, reply_tx, observers).await;
             return;
         }
     };
@@ -1323,9 +2385,25 @@ async fn process_with_interception(
     }
 
     let url = req.params.get("url").and_then(|v| v.as_str()).unwrap_or("");
-    let wait_until = crate::domains::page::parse_wait_until(&req.params);
-    let nav_method = req.params.get("__method").and_then(|v| v.as_str()).unwrap_or("GET").to_string();
-    let nav_body = req.params.get("__body").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let requested_wait_until = crate::domains::page::parse_wait_until(&req.params);
+    // Page already has resumable boundaries for every supported waitUntil.
+    // Return its ownership at the requested boundary—not at a later load or
+    // idle milestone—so subsequent Runtime/DOM commands can run immediately.
+    // For raw CDP this is Commit; the connection-owned autonomous pump resumes
+    // PendingDocumentLoad and the persistent observer tracks post-load quiet.
+    let navigation_wait_until = requested_wait_until;
+    let nav_method = req
+        .params
+        .get("__method")
+        .and_then(|v| v.as_str())
+        .unwrap_or("GET")
+        .to_string();
+    let nav_body = req
+        .params
+        .get("__body")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     let preload_scripts: Vec<String> = ctx.preload_scripts.iter().map(|(_, s)| s.clone()).collect();
     let mut preload_bindings: Vec<String> = ctx.binding_names.iter().cloned().collect();
@@ -1334,12 +2412,33 @@ async fn process_with_interception(
     if let Some(tx) = &ctx.intercept_tx {
         page.set_intercept_tx(tx.clone());
     }
-
     let session_for_events = req.session_id.clone();
     let frame_id = page.frame_id.clone();
     let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
+    let navigation_document_generation = page.document_generation().wrapping_add(1);
+    let mut observer = observers
+        .remove(&page_id)
+        .unwrap_or_else(|| LivePageObserver::new(page_id.clone(), frame_id.clone()));
+    ctx.live_frame_event_pages.insert(page_id.clone());
+    // Drain phases already queued by the outgoing page, then terminate every
+    // still-active request under its old loader before resetting generation
+    // state. Otherwise the Page's later canceled terminal is correctly old but
+    // gets filtered, leaving CDP clients with a request that never terminates.
+    observer.drain(ctx);
+    observer.abort_active_requests_for_navigation(ctx);
+    observer.begin_navigation(
+        session_for_events.clone(),
+        frame_id.clone(),
+        loader_id.clone(),
+        url.to_string(),
+        navigation_document_generation,
+    );
+    // Reinstalling the clone is harmless and also repairs a Page moved here
+    // from an older caller which explicitly cleared its observer.
+    page.set_navigation_event_sender(observer.sender.clone());
 
-    let (nav_done_tx, mut nav_done_rx) = mpsc::channel::<(obscura_browser::Page, Result<(), String>)>(1);
+    let (nav_done_tx, mut nav_done_rx) =
+        mpsc::channel::<(obscura_browser::Page, Result<(), String>)>(1);
     let url_owned = url.to_string();
     let nav_v8_lock = ctx.v8_lock.clone();
 
@@ -1356,17 +2455,21 @@ async fn process_with_interception(
         page.set_preload_scripts(preload_scripts);
         page.set_preload_bindings(preload_bindings);
         let result = if nav_method == "POST" && !nav_body.is_empty() {
-            page.navigate_with_wait_post(&url_owned, wait_until, &nav_method, &nav_body).await
+            page.navigate_with_wait_post(&url_owned, navigation_wait_until, &nav_method, &nav_body)
+                .await
         } else {
-            page.navigate_with_wait(&url_owned, wait_until).await
-        }
-        .map_err(|e| e.to_string());
+            page.navigate_with_wait(&url_owned, navigation_wait_until)
+                .await
+        };
+        let result = result.map_err(|e| e.to_string());
         drop(_v8_guard);
         let _ = nav_done_tx.send((page, result)).await;
     });
 
     let navigate_result: Result<(), String>;
     let page_back: Option<obscura_browser::Page>;
+    let mut completed_navigation: Option<(obscura_browser::Page, Result<(), String>)> = None;
+    let mut command_response_sent = !send_command_response;
 
     // Issue #19 follow-up (PR #36 maintainer's fetch-intercept repro):
     // While the spawned nav task is executing V8 (potentially parked on
@@ -1389,13 +2492,75 @@ async fn process_with_interception(
     // completes (and its JsRuntime is no longer in flight on the
     // LocalSet).
     loop {
+        // The navigation task sends every browser event before it sends its
+        // completion value. Keep the completed Page parked until that already-
+        // sent event queue is empty. A select guard on `is_empty()` is not
+        // enough: completion and the final load event can both become ready
+        // between guard evaluation and branch selection, which used to make
+        // load/frameStoppedLoading disappear nondeterministically.
+        if completed_navigation.is_some() && observer.receiver.is_empty() {
+            let (returned_page, result) = completed_navigation
+                .take()
+                .expect("checked completed navigation");
+            page_back = Some(returned_page);
+            navigate_result = result;
+            break;
+        }
         let has_irx = intercept_rx.is_some();
 
         tokio::select! {
-            Some((returned_page, result)) = nav_done_rx.recv() => {
-                page_back = Some(returned_page);
-                navigate_result = result;
-                break;
+            Some(completion) = nav_done_rx.recv(), if completed_navigation.is_none() => {
+                completed_navigation = Some(completion);
+            }
+            Some(event) = observer.receiver.recv() => {
+                let failure = match &event {
+                    obscura_browser::NavigationEvent::Failed { error, .. } => Some(error.clone()),
+                    _ => None,
+                };
+                let boundary = observer.observe(ctx, event);
+                let reached_requested_boundary = matches!(
+                    (boundary, requested_wait_until),
+                    (
+                        ObservedNavigationBoundary::Commit,
+                        obscura_browser::WaitUntil::Commit
+                    ) | (
+                        ObservedNavigationBoundary::DomContentLoaded,
+                        obscura_browser::WaitUntil::DomContentLoaded
+                    ) | (
+                        ObservedNavigationBoundary::Load,
+                        obscura_browser::WaitUntil::Load
+                    ) | (
+                        ObservedNavigationBoundary::NetworkAlmostIdle,
+                        obscura_browser::WaitUntil::NetworkIdle2
+                    ) | (
+                        ObservedNavigationBoundary::NetworkIdle,
+                        obscura_browser::WaitUntil::NetworkIdle0
+                    )
+                );
+                if let Some(error) = failure {
+                    if !command_response_sent {
+                        forward_navigation_events(ctx, reply_tx);
+                        send_navigation_command_response(
+                            reply_tx,
+                            &req,
+                            &frame_id,
+                            &loader_id,
+                            Some(&error),
+                        );
+                        command_response_sent = true;
+                    }
+                }
+                forward_navigation_events(ctx, reply_tx);
+                if reached_requested_boundary && !command_response_sent {
+                    send_navigation_command_response(
+                        reply_tx,
+                        &req,
+                        &frame_id,
+                        &loader_id,
+                        None,
+                    );
+                    command_response_sent = true;
+                }
             }
             Some(intercepted) = async {
                 if let Some(ref mut irx) = intercept_rx {
@@ -1404,6 +2569,8 @@ async fn process_with_interception(
                     std::future::pending().await
                 }
             }, if has_irx => {
+                observer.drain(ctx);
+                forward_navigation_events(ctx, reply_tx);
                 emit_intercepted_request(
                     intercepted,
                     &frame_id,
@@ -1469,81 +2636,80 @@ async fn process_with_interception(
 
     let mut page = page_back.expect("navigation task should return the page");
 
-    // Fold in network events for script-initiated requests (fetch/XHR/dynamic
-    // resource) so they emit as Network.requestWillBeSent / responseReceived
-    // alongside the static navigation subresources (#406).
+    // Fold JS-side response bodies into Page's lookup table, then alias every
+    // Document request to the loader-shaped request id exposed to CDP. Network
+    // messages themselves were already sent from their real phase callbacks;
+    // completed snapshots must never synthesize a second event triplet here.
     page.sync_js_network_events();
-    let network_events: Vec<_> = page.network_events.drain(..).collect();
+    observer.drain(ctx);
+    page.network_events.clear();
+    for (internal_request_id, protocol_request_id) in &observer.protocol_request_ids {
+        if internal_request_id != protocol_request_id {
+            page.alias_response_body(internal_request_id, protocol_request_id);
+        }
+    }
     let page_url = page.url_string();
     let page_id_for_events = page.id.clone();
-    let reached_network_idle = page.lifecycle.is_network_idle();
 
     ctx.pages.push(page);
+    observers.insert(page_id_for_events.clone(), observer);
 
     #[cfg(feature = "render")]
     let navigation_succeeded = navigate_result.is_ok();
-    let response = match navigate_result {
-        Ok(()) => crate::types::CdpResponse::success(
-            req.id,
-            json!({"frameId": frame_id, "loaderId": loader_id}),
-            req.session_id.clone(),
-        ),
-        Err(e) => crate::types::CdpResponse::error(req.id, -32000, e, req.session_id.clone()),
-    };
+    crate::domains::page::emit_navigation_target_info_changed(ctx, &page_id_for_events, &page_url);
+    dispatch::drain_frame_events(ctx);
+    forward_navigation_events(ctx, reply_tx);
 
-    if send_command_response {
-        if let Ok(json) = serde_json::to_string(&response) {
-            let _ = reply_tx.send(json);
-        }
+    if !command_response_sent {
+        send_navigation_command_response(
+            reply_tx,
+            &req,
+            &frame_id,
+            &loader_id,
+            navigate_result.as_ref().err().map(String::as_str),
+        );
     }
-
-    // Shared event emission: includes the post-#190 Network.requestWillBeSent
-    // -before-frameNavigated ordering, the #189 requestId=loaderId trick that
-    // makes `page.goto()` resolve to a Response, and the #192 per-isolated-
-    // world fresh context ids. Pushes to `ctx.pending_events`; we then drain
-    // to the WS reply channel.
-    crate::domains::page::emit_navigation_events(
-        ctx,
-        &session_for_events,
-        &frame_id,
-        &loader_id,
-        &page_url,
-        &page_id_for_events,
-        &network_events,
-        wait_until,
-        reached_network_idle,
-    );
     #[cfg(feature = "render")]
     if navigation_succeeded {
-        if let Err(error) = crate::domains::page::queue_screencast_frame(
-            ctx, &session_for_events, false,
-        ) {
+        if let Err(error) =
+            crate::domains::page::queue_screencast_frame(ctx, &session_for_events, false)
+        {
             tracing::warn!("could not produce post-navigation screencast frame: {error}");
         }
     }
-    for event in ctx.pending_events.drain(..) {
-        if let Ok(json) = serde_json::to_string(&event) {
-            let _ = reply_tx.send(json);
-        }
-    }
+    forward_navigation_events(ctx, reply_tx);
 }
 
 async fn process_cdp_message(
     text: &str,
     ctx: &mut CdpContext,
     reply_tx: &mpsc::UnboundedSender<String>,
+    observers: &mut HashMap<String, LivePageObserver>,
 ) {
     let req: CdpRequest = match serde_json::from_str(text) {
         Ok(r) => r,
         Err(e) => {
-            warn!("Invalid CDP: {}: {}", e, crate::util::truncate_on_char_boundary(text, 200));
+            warn!(
+                "Invalid CDP: {}: {}",
+                e,
+                crate::util::truncate_on_char_boundary(text, 200)
+            );
             return;
         }
     };
 
-    tracing::debug!("CDP: {} (id={}, s={:?})", req.method, req.id, req.session_id);
+    tracing::debug!(
+        "CDP: {} (id={}, s={:?})",
+        req.method,
+        req.id,
+        req.session_id
+    );
 
     let response = dispatch::dispatch(&req, ctx).await;
+    // A command such as `Runtime.evaluate("fetch(...)")` may complete browser
+    // network work during dispatch. Surface those phases before the command
+    // response, matching Chrome's causal event ordering.
+    sync_live_page_network_events(ctx, observers);
 
     // Chromium CDP semantics: events emitted as a side-effect of a command
     // (e.g. Target.targetCreated + Target.attachedToTarget from
@@ -1562,7 +2728,12 @@ async fn process_cdp_message(
     }
 
     if let Some((nav_url, nav_method, nav_body)) = check_pending_navigation(ctx, &req.session_id) {
-        tracing::info!("JS-triggered nav: {} {} (body: {} bytes)", nav_method, nav_url, nav_body.len());
+        tracing::info!(
+            "JS-triggered nav: {} {} (body: {} bytes)",
+            nav_method,
+            nav_url,
+            nav_body.len()
+        );
         let nav_req = CdpRequest {
             id: 0,
             method: "Page.navigate".to_string(),
@@ -1599,8 +2770,12 @@ fn decode_base64(input: &str) -> String {
             chunk.get(3).copied().unwrap_or(0),
         ];
         out.push((b[0] << 2) | (b[1] >> 4));
-        if chunk.len() > 2 { out.push((b[1] << 4) | (b[2] >> 2)); }
-        if chunk.len() > 3 { out.push((b[2] << 6) | b[3]); }
+        if chunk.len() > 2 {
+            out.push((b[1] << 4) | (b[2] >> 2));
+        }
+        if chunk.len() > 3 {
+            out.push((b[2] << 6) | b[3]);
+        }
     }
     String::from_utf8_lossy(&out).to_string()
 }
@@ -1609,29 +2784,36 @@ fn fast_path_response(text: &str) -> Option<String> {
     let req: CdpRequest = serde_json::from_str(text).ok()?;
 
     let result = match req.method.as_str() {
-        "Network.enable" | "Network.setCacheDisabled" | "Network.setRequestInterception" |
-        "Page.enable" | "Page.setLifecycleEventsEnabled" | "Page.setInterceptFileChooserDialog" |
-        "Runtime.runIfWaitingForDebugger" | "Runtime.discardConsoleEntries" |
-        "Performance.enable" | "Log.enable" | "Security.enable" |
-        "Emulation.setTouchEmulationEnabled" |
-        "CSS.enable" | "Accessibility.enable" | "ServiceWorker.enable" |
-        "Inspector.enable" | "Debugger.enable" | "Profiler.enable" |
-        "HeapProfiler.enable" | "Overlay.enable" | "Storage.enable" |
-        "Target.setAutoAttach" => {
-            Some(json!({}))
-        }
-        "Browser.getVersion" => {
-            Some(json!({
-                "protocolVersion": "1.3",
-                "product": "Chrome/145.0.0.0",
-                "revision": "@0000000000000000000000000000000000000000",
-                "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-                "jsVersion": "14.5.0.0",
-            }))
-        }
-        "Browser.setDownloadBehavior" | "Browser.getWindowBounds" => {
-            Some(json!({}))
-        }
+        "Network.enable"
+        | "Network.setCacheDisabled"
+        | "Network.setRequestInterception"
+        | "Page.enable"
+        | "Page.setLifecycleEventsEnabled"
+        | "Page.setInterceptFileChooserDialog"
+        | "Runtime.runIfWaitingForDebugger"
+        | "Runtime.discardConsoleEntries"
+        | "Performance.enable"
+        | "Log.enable"
+        | "Security.enable"
+        | "Emulation.setTouchEmulationEnabled"
+        | "CSS.enable"
+        | "Accessibility.enable"
+        | "ServiceWorker.enable"
+        | "Inspector.enable"
+        | "Debugger.enable"
+        | "Profiler.enable"
+        | "HeapProfiler.enable"
+        | "Overlay.enable"
+        | "Storage.enable"
+        | "Target.setAutoAttach" => Some(json!({})),
+        "Browser.getVersion" => Some(json!({
+            "protocolVersion": "1.3",
+            "product": "Chrome/145.0.0.0",
+            "revision": "@0000000000000000000000000000000000000000",
+            "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+            "jsVersion": "14.5.0.0",
+        })),
+        "Browser.setDownloadBehavior" | "Browser.getWindowBounds" => Some(json!({})),
         _ => None,
     };
 
@@ -1643,10 +2825,11 @@ fn fast_path_response(text: &str) -> Option<String> {
     }
 }
 
-fn check_pending_navigation(ctx: &CdpContext, session_id: &Option<String>) -> Option<(String, String, String)> {
-    let page_id = session_id
-        .as_ref()
-        .and_then(|sid| ctx.sessions.get(sid))?;
+fn check_pending_navigation(
+    ctx: &CdpContext,
+    session_id: &Option<String>,
+) -> Option<(String, String, String)> {
+    let page_id = session_id.as_ref().and_then(|sid| ctx.sessions.get(sid))?;
     let page = ctx.pages.iter().find(|p| &p.id == page_id)?;
     page.take_pending_navigation()
 }
@@ -1733,13 +2916,843 @@ async fn handle_connection_ws(
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_fetch_resolution, is_navigate_method, merge_cookie_delta, parse_cdp_headers,
+        emit_intercepted_request, handle_fetch_resolution, is_navigate_method, merge_cookie_delta,
+        parse_cdp_headers, receive_live_page_event, LivePageObserver,
     };
     #[cfg(feature = "render")]
     use super::{pump_and_forward_screencast_frames, pump_live_page_event_loop};
     use obscura_net::{CookieInfo, CookieJar};
     use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn any_page_receiver_wakes_for_a_post_navigation_phase() {
+        use obscura_browser::NavigationEvent;
+
+        let observer = LivePageObserver::new("page-1".into(), "frame-1".into());
+        let sender = observer.sender.clone();
+        let mut observers = HashMap::from([("page-1".to_string(), observer)]);
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            sender
+                .send(NavigationEvent::NetworkDataReceived {
+                    request_id: "fetch-1".into(),
+                    document_generation: 0,
+                    data_length: 3,
+                    encoded_data_length: 3,
+                    timestamp: 1.0,
+                })
+                .unwrap();
+        });
+
+        let (page_id, event) = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            receive_live_page_event(&mut observers),
+        )
+        .await
+        .expect("persistent receiver was not woken");
+        assert_eq!(page_id, "page-1");
+        assert!(matches!(
+            event,
+            NavigationEvent::NetworkDataReceived {
+                request_id,
+                data_length: 3,
+                ..
+            } if request_id == "fetch-1"
+        ));
+    }
+
+    #[test]
+    fn fetch_pause_links_existing_network_request_without_synthesizing_another() {
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resolver, _resolution) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::new();
+        emit_intercepted_request(
+            obscura_js::ops::InterceptedRequest {
+                request_id: "intercept-1".into(),
+                network_id: Some("net-7".into()),
+                url: "https://example.test/data.json".into(),
+                method: "GET".into(),
+                headers: HashMap::new(),
+                resource_type: "Fetch".into(),
+                resolver,
+            },
+            "frame-1",
+            Some("session-1".into()),
+            &reply_tx,
+            &mut paused,
+        );
+
+        let event: serde_json::Value =
+            serde_json::from_str(&reply_rx.try_recv().expect("Fetch.requestPaused")).unwrap();
+        assert_eq!(event["method"], "Fetch.requestPaused");
+        assert_eq!(event["params"]["requestId"], "intercept-1");
+        assert_eq!(event["params"]["networkId"], "net-7");
+        assert!(
+            reply_rx.try_recv().is_err(),
+            "must not synthesize Network.requestWillBeSent"
+        );
+        assert!(paused.contains_key("intercept-1"));
+    }
+
+    #[test]
+    fn live_page_observer_survives_command_boundary_and_deduplicates_snapshot() {
+        use obscura_browser::{NavigationEvent, NetworkEvent};
+
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let mut observer = LivePageObserver::new("page-1".into(), "frame-1".into());
+        observer.begin_navigation(
+            Some("session-1".into()),
+            "frame-1".into(),
+            "loader-1".into(),
+            "https://example.test/".into(),
+            1,
+        );
+        let request_headers = Arc::new(HashMap::from([(
+            "accept".to_string(),
+            "text/html".to_string(),
+        )]));
+        let response_headers = Arc::new(HashMap::from([(
+            "content-type".to_string(),
+            "text/html".to_string(),
+        )]));
+
+        // The sender remains usable after the command which installed it has
+        // conceptually returned. This is the exact post-navigation path used
+        // by timer-started requests and document body continuation.
+        observer
+            .sender
+            .send(NavigationEvent::NetworkRequestStarted {
+                request_id: "internal-document".into(),
+                document_generation: 1,
+                url: "https://example.test/".into(),
+                method: "GET".into(),
+                resource_type: "Document".into(),
+                headers: request_headers,
+                frame_id: 0,
+                timestamp: 1.0,
+            })
+            .unwrap();
+        observer.drain(&mut ctx);
+        assert_eq!(ctx.pending_events.len(), 1);
+        assert_eq!(ctx.pending_events[0].method, "Network.requestWillBeSent");
+        assert_eq!(ctx.pending_events[0].params["requestId"], "loader-1");
+
+        observer
+            .sender
+            .send(NavigationEvent::NetworkResponseReceived {
+                request_id: "internal-document".into(),
+                document_generation: 1,
+                url: "https://example.test/".into(),
+                status: 200,
+                resource_type: "Document".into(),
+                headers: response_headers.clone(),
+                frame_id: 0,
+                timestamp: 2.0,
+            })
+            .unwrap();
+        observer
+            .sender
+            .send(NavigationEvent::NetworkDataReceived {
+                request_id: "internal-document".into(),
+                document_generation: 1,
+                data_length: 4,
+                encoded_data_length: 4,
+                timestamp: 3.0,
+            })
+            .unwrap();
+        // Page retains this snapshot for response-body/archive consumers. It
+        // must not cause a second CDP request/response/finish triplet.
+        observer
+            .sender
+            .send(NavigationEvent::Network(NetworkEvent {
+                request_id: "internal-document".into(),
+                url: "https://example.test/".into(),
+                method: "GET".into(),
+                resource_type: "Document".into(),
+                status: 200,
+                headers: HashMap::new(),
+                response_headers,
+                body_size: 4,
+                timestamp: 3.5,
+            }))
+            .unwrap();
+        observer
+            .sender
+            .send(NavigationEvent::NetworkLoadingFinished {
+                request_id: "internal-document".into(),
+                document_generation: 1,
+                encoded_data_length: 4,
+                timestamp: 4.0,
+            })
+            .unwrap();
+        observer.drain(&mut ctx);
+
+        let methods = ctx
+            .pending_events
+            .iter()
+            .map(|event| event.method.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            vec![
+                "Network.requestWillBeSent",
+                "Network.responseReceived",
+                "Network.dataReceived",
+                "Network.loadingFinished",
+            ]
+        );
+        assert!(ctx
+            .pending_events
+            .iter()
+            .all(|event| event.params["requestId"] == "loader-1"));
+    }
+
+    #[test]
+    fn queued_network_phases_from_replaced_document_are_rejected_by_generation() {
+        use obscura_browser::NavigationEvent;
+
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let mut observer = LivePageObserver::new("page-1".into(), "frame-1".into());
+        observer.begin_navigation(
+            Some("session-1".into()),
+            "frame-1".into(),
+            "loader-1".into(),
+            "https://example.test/old".into(),
+            1,
+        );
+        observer
+            .sender
+            .send(NavigationEvent::NetworkRequestStarted {
+                request_id: "reused-request".into(),
+                document_generation: 1,
+                url: "https://example.test/old.json".into(),
+                method: "GET".into(),
+                resource_type: "Fetch".into(),
+                headers: Arc::new(HashMap::new()),
+                frame_id: 0,
+                timestamp: 1.0,
+            })
+            .unwrap();
+        observer
+            .sender
+            .send(NavigationEvent::NetworkLoadingFinished {
+                request_id: "reused-request".into(),
+                document_generation: 1,
+                encoded_data_length: 3,
+                timestamp: 2.0,
+            })
+            .unwrap();
+
+        // The old events are deliberately still queued when the next command
+        // installs a new loader. They must not be translated using loader-2's
+        // request-id maps or consume its exactly-once terminal slot.
+        observer.begin_navigation(
+            Some("session-1".into()),
+            "frame-1".into(),
+            "loader-2".into(),
+            "https://example.test/new".into(),
+            2,
+        );
+        observer.drain(&mut ctx);
+        assert!(ctx.pending_events.is_empty());
+
+        observer.observe(
+            &mut ctx,
+            NavigationEvent::NetworkRequestStarted {
+                request_id: "reused-request".into(),
+                document_generation: 2,
+                url: "https://example.test/new.json".into(),
+                method: "GET".into(),
+                resource_type: "Fetch".into(),
+                headers: Arc::new(HashMap::new()),
+                frame_id: 0,
+                timestamp: 3.0,
+            },
+        );
+        observer.observe(
+            &mut ctx,
+            NavigationEvent::NetworkLoadingFinished {
+                request_id: "reused-request".into(),
+                document_generation: 2,
+                encoded_data_length: 4,
+                timestamp: 4.0,
+            },
+        );
+        assert_eq!(
+            ctx.pending_events
+                .iter()
+                .map(|event| event.method.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Network.requestWillBeSent", "Network.loadingFinished"]
+        );
+    }
+
+    #[test]
+    fn replacing_navigation_aborts_each_old_active_request_once_before_generation_reset() {
+        use obscura_browser::NavigationEvent;
+
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let mut observer = LivePageObserver::new("page-1".into(), "frame-1".into());
+        observer.begin_navigation(
+            Some("session-1".into()),
+            "frame-1".into(),
+            "loader-1".into(),
+            "https://example.test/old".into(),
+            1,
+        );
+        observer.observe(
+            &mut ctx,
+            NavigationEvent::NetworkRequestStarted {
+                request_id: "old-document".into(),
+                document_generation: 1,
+                url: "https://example.test/old".into(),
+                method: "GET".into(),
+                resource_type: "Document".into(),
+                headers: Arc::new(HashMap::new()),
+                frame_id: 0,
+                timestamp: 1.0,
+            },
+        );
+        ctx.pending_events.clear();
+
+        observer.abort_active_requests_for_navigation(&mut ctx);
+        assert_eq!(
+            ctx.pending_events
+                .iter()
+                .map(|event| event.method.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Network.loadingFailed"],
+        );
+        assert_eq!(ctx.pending_events[0].params["requestId"], "loader-1");
+        assert_eq!(ctx.pending_events[0].params["canceled"], true);
+
+        observer.begin_navigation(
+            Some("session-1".into()),
+            "frame-1".into(),
+            "loader-2".into(),
+            "https://example.test/new".into(),
+            2,
+        );
+        observer.observe(
+            &mut ctx,
+            NavigationEvent::NetworkLoadingFailed {
+                request_id: "old-document".into(),
+                document_generation: 1,
+                error: "navigation replaced committed document".into(),
+                canceled: true,
+                timestamp: 2.0,
+            },
+        );
+        assert_eq!(
+            ctx.pending_events
+                .iter()
+                .filter(|event| event.method == "Network.loadingFailed")
+                .count(),
+            1,
+        );
+    }
+
+    #[test]
+    fn higher_network_generation_advances_and_rejects_delayed_old_terminal() {
+        use obscura_browser::NavigationEvent;
+
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let mut observer = LivePageObserver::new("page-1".into(), "frame-1".into());
+        observer.begin_navigation(
+            Some("session-1".into()),
+            "frame-1".into(),
+            "loader-1".into(),
+            "https://example.test/redirecting".into(),
+            1,
+        );
+        observer.observe(
+            &mut ctx,
+            NavigationEvent::NetworkRequestStarted {
+                request_id: "document-2".into(),
+                document_generation: 2,
+                url: "https://example.test/final".into(),
+                method: "GET".into(),
+                resource_type: "Document".into(),
+                headers: Arc::new(HashMap::new()),
+                frame_id: 0,
+                timestamp: 2.0,
+            },
+        );
+        observer.observe(
+            &mut ctx,
+            NavigationEvent::NetworkLoadingFinished {
+                request_id: "document-1".into(),
+                document_generation: 1,
+                encoded_data_length: 1,
+                timestamp: 3.0,
+            },
+        );
+        observer.observe(
+            &mut ctx,
+            NavigationEvent::NetworkLoadingFinished {
+                request_id: "document-2".into(),
+                document_generation: 2,
+                encoded_data_length: 2,
+                timestamp: 4.0,
+            },
+        );
+        assert_eq!(observer.document_generation, 2);
+        assert_eq!(
+            ctx.pending_events
+                .iter()
+                .map(|event| event.method.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Network.requestWillBeSent", "Network.loadingFinished"]
+        );
+        assert!(ctx
+            .pending_events
+            .iter()
+            .all(|event| event.params["requestId"] == "loader-1"));
+    }
+
+    #[test]
+    fn completed_network_snapshot_is_not_replayed_as_cdp_phases() {
+        use obscura_browser::{NavigationEvent, NetworkEvent};
+
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let mut observer = LivePageObserver::new("page-1".into(), "frame-1".into());
+        observer.begin_navigation(
+            Some("session-1".into()),
+            "frame-1".into(),
+            "loader-1".into(),
+            "https://example.test/".into(),
+            1,
+        );
+        let snapshot = NetworkEvent {
+            request_id: "fetch-1".into(),
+            url: "https://example.test/late.json".into(),
+            method: "GET".into(),
+            resource_type: "Fetch".into(),
+            status: 200,
+            headers: HashMap::new(),
+            response_headers: Arc::new(HashMap::from([(
+                "content-type".to_string(),
+                "application/json".to_string(),
+            )])),
+            body_size: 2,
+            timestamp: 5.0,
+        };
+
+        observer.observe(&mut ctx, NavigationEvent::Network(snapshot.clone()));
+        observer.observe(&mut ctx, NavigationEvent::Network(snapshot));
+
+        assert!(ctx.pending_events.is_empty());
+    }
+
+    #[test]
+    fn persistent_observer_reads_lifecycle_enable_state_at_delivery_time() {
+        use obscura_browser::NavigationEvent;
+
+        let mut ctx = crate::dispatch::CdpContext::new();
+        ctx.sessions.insert("session-1".into(), "page-1".into());
+        ctx.lifecycle_event_sessions.insert("session-1".into());
+        let mut observer = LivePageObserver::new("page-1".into(), "frame-1".into());
+        observer.begin_navigation(
+            Some("session-1".into()),
+            "frame-1".into(),
+            "loader-1".into(),
+            "https://example.test/".into(),
+            1,
+        );
+
+        observer.observe(
+            &mut ctx,
+            NavigationEvent::Commit {
+                url: "https://example.test/".into(),
+                mime_type: "text/html".into(),
+                timestamp: 1.0,
+            },
+        );
+        assert!(
+            ctx.pending_events
+                .iter()
+                .any(|event| event.method == "Page.lifecycleEvent"
+                    && event.params["name"] == "commit")
+        );
+
+        ctx.pending_events.clear();
+        ctx.lifecycle_event_sessions.remove("session-1");
+        observer.observe(&mut ctx, NavigationEvent::Load { timestamp: 2.0 });
+        assert!(ctx
+            .pending_events
+            .iter()
+            .all(|event| event.method != "Page.lifecycleEvent"));
+        assert!(ctx
+            .pending_events
+            .iter()
+            .any(|event| event.method == "Page.loadEventFired"));
+    }
+
+    #[test]
+    fn child_frame_boundaries_are_live_generation_safe_and_session_scoped() {
+        use obscura_browser::NavigationEvent;
+
+        let mut ctx = crate::dispatch::CdpContext::new();
+        ctx.sessions.insert("session-a".into(), "page-1".into());
+        ctx.sessions.insert("session-b".into(), "page-1".into());
+        ctx.lifecycle_event_sessions.insert("session-a".into());
+        let mut observer = LivePageObserver::new("page-1".into(), "root".into());
+        observer.begin_navigation(
+            Some("session-a".into()),
+            "root".into(),
+            "loader-root".into(),
+            "https://example.test/".into(),
+            7,
+        );
+
+        observer.observe(
+            &mut ctx,
+            NavigationEvent::FrameAttached {
+                frame_id: 4,
+                parent_frame_id: 0,
+                document_generation: 7,
+                timestamp: 1.0,
+            },
+        );
+        observer.observe(
+            &mut ctx,
+            NavigationEvent::FrameNavigated {
+                frame_id: 4,
+                parent_frame_id: 0,
+                url: "https://example.test/child".into(),
+                origin: "https://example.test".into(),
+                mime_type: "text/html".into(),
+                document_generation: 7,
+                timestamp: 2.0,
+            },
+        );
+        observer.observe(
+            &mut ctx,
+            NavigationEvent::FrameDomContentLoaded {
+                frame_id: 4,
+                document_generation: 7,
+                timestamp: 3.0,
+            },
+        );
+        observer.observe(
+            &mut ctx,
+            NavigationEvent::FrameLoad {
+                frame_id: 4,
+                document_generation: 7,
+                timestamp: 4.0,
+            },
+        );
+
+        for session_id in ["session-a", "session-b"] {
+            let mine = ctx
+                .pending_events
+                .iter()
+                .filter(|event| event.session_id.as_deref() == Some(session_id))
+                .collect::<Vec<_>>();
+            let attach = mine
+                .iter()
+                .position(|event| event.method == "Page.frameAttached")
+                .expect("live attach");
+            let navigate = mine
+                .iter()
+                .position(|event| event.method == "Page.frameNavigated")
+                .expect("live navigate");
+            let context = mine
+                .iter()
+                .position(|event| event.method == "Runtime.executionContextCreated")
+                .expect("child execution context");
+            let stopped = mine
+                .iter()
+                .position(|event| event.method == "Page.frameStoppedLoading")
+                .expect("child stopped loading");
+            assert!(attach < navigate && navigate < context && context < stopped);
+        }
+        assert!(ctx.pending_events.iter().any(|event| {
+            event.session_id.as_deref() == Some("session-a")
+                && event.method == "Page.lifecycleEvent"
+                && event.params["name"] == "DOMContentLoaded"
+        }));
+        assert!(ctx.pending_events.iter().all(|event| {
+            event.session_id.as_deref() != Some("session-b")
+                || event.method != "Page.lifecycleEvent"
+        }));
+
+        let before_stale = ctx.pending_events.len();
+        observer.observe(
+            &mut ctx,
+            NavigationEvent::FrameDetached {
+                frame_id: 4,
+                parent_frame_id: 0,
+                document_generation: 6,
+                timestamp: 5.0,
+            },
+        );
+        assert_eq!(ctx.pending_events.len(), before_stale);
+
+        let context_ids = observer.child_execution_contexts[&4]
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        assert!(context_ids
+            .iter()
+            .all(|context_id| ctx.valid_context_ids.contains(context_id)));
+        observer.observe(
+            &mut ctx,
+            NavigationEvent::FrameDetached {
+                frame_id: 4,
+                parent_frame_id: 0,
+                document_generation: 7,
+                timestamp: 6.0,
+            },
+        );
+        assert!(context_ids
+            .iter()
+            .all(|context_id| !ctx.valid_context_ids.contains(context_id)));
+        for session_id in ["session-a", "session-b"] {
+            assert!(ctx.pending_events.iter().any(|event| {
+                event.session_id.as_deref() == Some(session_id)
+                    && event.method == "Page.frameDetached"
+                    && event.params["frameId"] == "root-frame-4"
+            }));
+        }
+
+        // A redirect/replacement inside one navigation may advance past the
+        // generation predicted at command start. FIFO delivery lets the
+        // observer adopt that newer generation and reject anything older from
+        // then on.
+        observer.observe(
+            &mut ctx,
+            NavigationEvent::FrameAttached {
+                frame_id: 5,
+                parent_frame_id: 0,
+                document_generation: 9,
+                timestamp: 7.0,
+            },
+        );
+        assert_eq!(observer.document_generation, 9);
+        let after_forward_generation = ctx.pending_events.len();
+        observer.observe(
+            &mut ctx,
+            NavigationEvent::FrameDetached {
+                frame_id: 5,
+                parent_frame_id: 0,
+                document_generation: 8,
+                timestamp: 8.0,
+            },
+        );
+        assert_eq!(ctx.pending_events.len(), after_forward_generation);
+    }
+
+    struct DelayedLifecycleFixture {
+        base_url: String,
+        body_tail_started: Arc<tokio::sync::Semaphore>,
+        body_tail_release: Arc<tokio::sync::Semaphore>,
+        load_started: Arc<tokio::sync::Semaphore>,
+        load_release: Arc<tokio::sync::Semaphore>,
+        fetch_started: Arc<tokio::sync::Semaphore>,
+        fetch_release: Arc<tokio::sync::Semaphore>,
+        blocking_style_started: Arc<tokio::sync::Semaphore>,
+        blocking_style_release: Arc<tokio::sync::Semaphore>,
+        blocking_script_started: Arc<tokio::sync::Semaphore>,
+        blocking_script_release: Arc<tokio::sync::Semaphore>,
+        blocking_style_requests: Arc<std::sync::atomic::AtomicUsize>,
+        blocking_script_requests: Arc<std::sync::atomic::AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    async fn delayed_lifecycle_fixture() -> DelayedLifecycleFixture {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind lifecycle fixture");
+        let address = listener.local_addr().expect("lifecycle fixture address");
+        let body_tail_started = Arc::new(tokio::sync::Semaphore::new(0));
+        let body_tail_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let load_started = Arc::new(tokio::sync::Semaphore::new(0));
+        let load_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let fetch_started = Arc::new(tokio::sync::Semaphore::new(0));
+        let fetch_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let blocking_style_started = Arc::new(tokio::sync::Semaphore::new(0));
+        let blocking_style_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let blocking_script_started = Arc::new(tokio::sync::Semaphore::new(0));
+        let blocking_script_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let blocking_style_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let blocking_script_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_body_tail_started = body_tail_started.clone();
+        let server_body_tail_release = body_tail_release.clone();
+        let server_load_started = load_started.clone();
+        let server_load_release = load_release.clone();
+        let server_fetch_started = fetch_started.clone();
+        let server_fetch_release = fetch_release.clone();
+        let server_blocking_style_started = blocking_style_started.clone();
+        let server_blocking_style_release = blocking_style_release.clone();
+        let server_blocking_script_started = blocking_script_started.clone();
+        let server_blocking_script_release = blocking_script_release.clone();
+        let server_blocking_style_requests = blocking_style_requests.clone();
+        let server_blocking_script_requests = blocking_script_requests.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let body_tail_started = server_body_tail_started.clone();
+                let body_tail_release = server_body_tail_release.clone();
+                let load_started = server_load_started.clone();
+                let load_release = server_load_release.clone();
+                let fetch_started = server_fetch_started.clone();
+                let fetch_release = server_fetch_release.clone();
+                let blocking_style_started = server_blocking_style_started.clone();
+                let blocking_style_release = server_blocking_style_release.clone();
+                let blocking_script_started = server_blocking_script_started.clone();
+                let blocking_script_release = server_blocking_script_release.clone();
+                let blocking_style_requests = server_blocking_style_requests.clone();
+                let blocking_script_requests = server_blocking_script_requests.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    loop {
+                        let Ok(read) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&request);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    if path == "/streaming-tail" {
+                        let prefix = "<!doctype html><script>globalThis.__parserOnce=(globalThis.__parserOnce||0)+1</script><p id='prefix'>prefix</p>";
+                        let tail = "<p id='tail'>tail</p>";
+                        let response_head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{prefix}",
+                            prefix.len() + tail.len(),
+                        );
+                        if stream.write_all(response_head.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        body_tail_started.add_permits(1);
+                        let permit = body_tail_release
+                            .acquire()
+                            .await
+                            .expect("body tail release");
+                        permit.forget();
+                        let _ = stream.write_all(tail.as_bytes()).await;
+                        return;
+                    }
+                    let (content_type, body) = match path {
+                        "/first" => (
+                            "text/html; charset=utf-8",
+                            "<!doctype html><img src='/slow-1.png'><p>first</p>",
+                        ),
+                        "/second" => (
+                            "text/html; charset=utf-8",
+                            "<!doctype html><img src='/slow-2.png'><p>second</p>",
+                        ),
+                        "/network-almost-idle" => (
+                            "text/html; charset=utf-8",
+                            "<!doctype html><script>fetch('/almost').catch(()=>{});</script><p>almost idle</p>",
+                        ),
+                        "/network-idle-timeout" => (
+                            "text/html; charset=utf-8",
+                            "<!doctype html><script>fetch('/never').catch(()=>{});</script><p>idle timeout</p>",
+                        ),
+                        "/parser-blockers" => (
+                            "text/html; charset=utf-8",
+                            "<!doctype html><html><head><link rel='stylesheet' href='/blocking.css'><script src='/blocking.js'></script></head><body><p id='tail'>tail</p></body></html>",
+                        ),
+                        "/blocking.css" => {
+                            blocking_style_requests.fetch_add(
+                                1,
+                                std::sync::atomic::Ordering::SeqCst,
+                            );
+                            blocking_style_started.add_permits(1);
+                            let permit = blocking_style_release
+                                .acquire()
+                                .await
+                                .expect("blocking stylesheet release");
+                            permit.forget();
+                            ("text/css; charset=utf-8", "html { --sheet-ready: yes; }")
+                        }
+                        "/blocking.js" => {
+                            blocking_script_requests.fetch_add(
+                                1,
+                                std::sync::atomic::Ordering::SeqCst,
+                            );
+                            blocking_script_started.add_permits(1);
+                            let permit = blocking_script_release
+                                .acquire()
+                                .await
+                                .expect("blocking script release");
+                            permit.forget();
+                            (
+                                "application/javascript; charset=utf-8",
+                                "globalThis.__blockingScriptRuns=(globalThis.__blockingScriptRuns||0)+1;globalThis.__sheetCountAtBlockingScript=document.styleSheets.length;globalThis.__tailHiddenAtBlockingScript=document.querySelector('#tail')===null;",
+                            )
+                        }
+                        "/slow-1.png" | "/slow-2.png" => {
+                            load_started.add_permits(1);
+                            let permit = load_release.acquire().await.expect("load release");
+                            permit.forget();
+                            ("image/png", "not-a-decoded-image")
+                        }
+                        "/almost" | "/never" => {
+                            fetch_started.add_permits(1);
+                            let permit = fetch_release.acquire().await.expect("fetch release");
+                            permit.forget();
+                            ("application/json", "{}")
+                        }
+                        _ => ("text/plain; charset=utf-8", "not found"),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        DelayedLifecycleFixture {
+            base_url: format!("http://{address}"),
+            body_tail_started,
+            body_tail_release,
+            load_started,
+            load_release,
+            fetch_started,
+            fetch_release,
+            blocking_style_started,
+            blocking_style_release,
+            blocking_script_started,
+            blocking_script_release,
+            blocking_style_requests,
+            blocking_script_requests,
+            task,
+        }
+    }
+
+    async fn recv_cdp(
+        reply_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+        timeout: std::time::Duration,
+    ) -> serde_json::Value {
+        let raw = tokio::time::timeout(timeout, reply_rx.recv())
+            .await
+            .expect("CDP response timeout")
+            .expect("CDP response channel closed");
+        serde_json::from_str(&raw).expect("valid CDP JSON")
+    }
+
+    fn is_lifecycle(value: &serde_json::Value, name: &str) -> bool {
+        value["method"] == "Page.lifecycleEvent" && value["params"]["name"] == name
+    }
 
     fn cookie(name: &str, value: &str) -> CookieInfo {
         CookieInfo {
@@ -1878,6 +3891,761 @@ mod tests {
             .await;
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_commit_returns_page_for_immediate_runtime_while_body_tail_streams() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let fixture = delayed_lifecycle_fixture().await;
+                let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+                let shutdown = Arc::new(tokio::sync::Notify::new());
+                let default_context = Arc::new(
+                    obscura_browser::BrowserContext::with_storage_and_network(
+                        "cdp-commit-command-test".into(),
+                        None,
+                        false,
+                        None,
+                        None,
+                        true,
+                    ),
+                );
+                let processor = tokio::task::spawn_local(super::cdp_processor(
+                    server_rx,
+                    default_context,
+                    shutdown,
+                ));
+
+                server_tx
+                    .send(super::ServerMessage::NewConnection {
+                        reply_tx: reply_tx.clone(),
+                    })
+                    .unwrap();
+                assert!(recv_cdp(&mut reply_rx, std::time::Duration::from_secs(2)).await["__init"]
+                    .as_bool()
+                    .unwrap_or(false));
+
+                let send = |value: serde_json::Value| {
+                    server_tx
+                        .send(super::ServerMessage::Cdp(super::CdpMessage {
+                            text: value.to_string(),
+                            reply_tx: reply_tx.clone(),
+                        }))
+                        .unwrap();
+                };
+                send(json!({
+                    "id": 1,
+                    "method": "Target.createTarget",
+                    "params": {"url": "about:blank"},
+                }));
+                let mut session_id = None;
+                loop {
+                    let value = recv_cdp(&mut reply_rx, std::time::Duration::from_secs(2)).await;
+                    if session_id.is_none() {
+                        session_id = value["params"]["sessionId"]
+                            .as_str()
+                            .map(str::to_string);
+                    }
+                    if value["id"] == 1 {
+                        break;
+                    }
+                }
+                let session_id = session_id.expect("attached page session");
+
+                send(json!({
+                    "id": 2,
+                    "method": "Page.setLifecycleEventsEnabled",
+                    "sessionId": session_id,
+                    "params": {"enabled": true},
+                }));
+                loop {
+                    if recv_cdp(&mut reply_rx, std::time::Duration::from_secs(2)).await["id"] == 2 {
+                        break;
+                    }
+                }
+
+                send(json!({
+                    "id": 3,
+                    "method": "Page.navigate",
+                    "sessionId": session_id,
+                    "params": {"url": format!("{}/streaming-tail", fixture.base_url)},
+                }));
+                let mut commit_messages = Vec::new();
+                loop {
+                    // First-page V8 initialization can exceed the ordinary
+                    // event timeout on cold release CI; the command latency
+                    // assertion below begins only after commit.
+                    let value = recv_cdp(&mut reply_rx, std::time::Duration::from_secs(10)).await;
+                    let is_response = value["id"] == 3;
+                    commit_messages.push(value);
+                    if is_response {
+                        break;
+                    }
+                }
+                assert!(commit_messages.iter().any(|value| is_lifecycle(value, "commit")));
+                assert!(commit_messages
+                    .iter()
+                    .all(|value| value["method"] != "Page.domContentEventFired"));
+                let permit = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    fixture.body_tail_started.acquire(),
+                )
+                .await
+                .expect("streaming response prefix was not sent")
+                .expect("body-tail start semaphore");
+                permit.forget();
+
+                // Wait until the autonomous continuation has consumed the
+                // prefix and yielded its real Network.dataReceived phase. Live
+                // event forwarding retains that turn; the Runtime command
+                // below then exercises cancellation at the explicitly safe
+                // body-stream continuation boundary.
+                loop {
+                    let value = recv_cdp(&mut reply_rx, std::time::Duration::from_secs(2)).await;
+                    if value["method"] == "Network.dataReceived" {
+                        break;
+                    }
+                }
+
+                // This command is deliberately issued after the raw navigate
+                // response but while the primary response body is incomplete.
+                // It must not sit in process_with_interception's deferred queue
+                // until DCL/load, and the not-yet-received tail must remain
+                // absent from the live prefix DOM.
+                send(json!({
+                    "id": 4,
+                    "method": "Runtime.evaluate",
+                    "sessionId": session_id,
+                    "params": {
+                        "expression": "document.querySelector('#tail') === null",
+                        "returnByValue": true,
+                    },
+                }));
+                loop {
+                    let value = recv_cdp(
+                        &mut reply_rx,
+                        std::time::Duration::from_millis(300),
+                    )
+                    .await;
+                    if value["id"] == 4 {
+                        assert_eq!(value["result"]["result"]["value"], true);
+                        break;
+                    }
+                }
+
+                fixture.body_tail_release.add_permits(1);
+                let mut saw_dcl = false;
+                let mut saw_load = false;
+                let mut saw_stopped = false;
+                let mut saw_almost_idle = false;
+                let mut saw_idle = false;
+                let mut loading_finished = 0;
+                let mut loading_failed = 0;
+                while !(saw_dcl
+                    && saw_load
+                    && saw_stopped
+                    && saw_almost_idle
+                    && saw_idle)
+                {
+                    let value = recv_cdp(&mut reply_rx, std::time::Duration::from_secs(2)).await;
+                    saw_dcl |= value["method"] == "Page.domContentEventFired";
+                    saw_load |= value["method"] == "Page.loadEventFired";
+                    saw_stopped |= value["method"] == "Page.frameStoppedLoading";
+                    saw_almost_idle |= is_lifecycle(&value, "networkAlmostIdle");
+                    saw_idle |= is_lifecycle(&value, "networkIdle");
+                    loading_finished += usize::from(value["method"] == "Network.loadingFinished");
+                    loading_failed += usize::from(value["method"] == "Network.loadingFailed");
+                }
+                assert_eq!(loading_finished, 1, "primary request terminates once");
+                assert_eq!(loading_failed, 0, "pump cancellation is not transport failure");
+
+                send(json!({
+                    "id": 5,
+                    "method": "Runtime.evaluate",
+                    "sessionId": session_id,
+                    "params": {
+                        "expression": "globalThis.__parserOnce === 1 ? (document.querySelector('#tail')?.textContent || '') : 'duplicate'",
+                        "returnByValue": true,
+                    },
+                }));
+                loop {
+                    let value = recv_cdp(&mut reply_rx, std::time::Duration::from_secs(2)).await;
+                    if value["id"] == 5 {
+                        assert_eq!(value["result"]["result"]["value"], "tail");
+                        break;
+                    }
+                }
+
+                fixture.task.abort();
+                drop(server_tx);
+                tokio::time::timeout(std::time::Duration::from_secs(2), processor)
+                    .await
+                    .expect("processor shutdown timeout")
+                    .expect("processor task");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_commit_keeps_blocking_script_and_stylesheet_fetches_alive_while_streaming_events()
+    {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let fixture = delayed_lifecycle_fixture().await;
+                let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+                let shutdown = Arc::new(tokio::sync::Notify::new());
+                let default_context = Arc::new(
+                    obscura_browser::BrowserContext::with_storage_and_network(
+                        "cdp-commit-parser-resource-test".into(),
+                        None,
+                        false,
+                        None,
+                        None,
+                        true,
+                    ),
+                );
+                let processor = tokio::task::spawn_local(super::cdp_processor(
+                    server_rx,
+                    default_context,
+                    shutdown,
+                ));
+
+                server_tx
+                    .send(super::ServerMessage::NewConnection {
+                        reply_tx: reply_tx.clone(),
+                    })
+                    .unwrap();
+                assert!(recv_cdp(&mut reply_rx, std::time::Duration::from_secs(2)).await
+                    ["__init"]
+                    .as_bool()
+                    .unwrap_or(false));
+
+                let send = |value: serde_json::Value| {
+                    server_tx
+                        .send(super::ServerMessage::Cdp(super::CdpMessage {
+                            text: value.to_string(),
+                            reply_tx: reply_tx.clone(),
+                        }))
+                        .unwrap();
+                };
+                send(json!({
+                    "id": 1,
+                    "method": "Target.createTarget",
+                    "params": {"url": "about:blank"},
+                }));
+                let mut session_id = None;
+                loop {
+                    let value = recv_cdp(&mut reply_rx, std::time::Duration::from_secs(2)).await;
+                    if session_id.is_none() {
+                        session_id = value["params"]["sessionId"]
+                            .as_str()
+                            .map(str::to_string);
+                    }
+                    if value["id"] == 1 {
+                        break;
+                    }
+                }
+                let session_id = session_id.expect("attached page session");
+
+                send(json!({
+                    "id": 2,
+                    "method": "Page.setLifecycleEventsEnabled",
+                    "sessionId": session_id,
+                    "params": {"enabled": true},
+                }));
+                loop {
+                    if recv_cdp(&mut reply_rx, std::time::Duration::from_secs(2)).await["id"] == 2 {
+                        break;
+                    }
+                }
+
+                send(json!({
+                    "id": 3,
+                    "method": "Page.navigate",
+                    "sessionId": session_id,
+                    "params": {"url": format!("{}/parser-blockers", fixture.base_url)},
+                }));
+                loop {
+                    let value = recv_cdp(&mut reply_rx, std::time::Duration::from_secs(10)).await;
+                    if value["id"] == 3 {
+                        assert!(value.get("error").is_none(), "raw navigation failed: {value}");
+                        break;
+                    }
+                }
+
+                let permit = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    fixture.blocking_style_started.acquire(),
+                )
+                .await
+                .expect("blocking stylesheet request did not start")
+                .expect("stylesheet start semaphore");
+                permit.forget();
+                let style_request_id = loop {
+                    let value = recv_cdp(&mut reply_rx, std::time::Duration::from_secs(2)).await;
+                    assert_ne!(value["method"], "Page.domContentEventFired");
+                    assert_ne!(value["method"], "Page.loadEventFired");
+                    if value["method"] == "Network.requestWillBeSent"
+                        && value["params"]["request"]["url"]
+                            .as_str()
+                            .is_some_and(|url| url.ends_with("/blocking.css"))
+                    {
+                        break value["params"]["requestId"]
+                            .as_str()
+                            .expect("stylesheet request id")
+                            .to_string();
+                    }
+                };
+                // A real client is free to inspect the committed prefix while
+                // the stylesheet blocks the parser. The command may be queued
+                // behind this host-owned fetch, but receiving it must not drop
+                // and retry that fetch.
+                send(json!({
+                    "id": 4,
+                    "method": "Runtime.evaluate",
+                    "sessionId": session_id,
+                    "params": {
+                        "expression": "document.readyState",
+                        "returnByValue": true,
+                    },
+                }));
+                tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+                assert_eq!(
+                    fixture
+                        .blocking_style_requests
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "forwarding requestWillBeSent must not cancel and retry the stylesheet",
+                );
+
+                fixture.blocking_style_release.add_permits(1);
+                let permit = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    fixture.blocking_script_started.acquire(),
+                )
+                .await
+                .expect("parser-blocking script request did not start after stylesheet")
+                .expect("script start semaphore");
+                permit.forget();
+                let script_request_id = loop {
+                    let value = recv_cdp(&mut reply_rx, std::time::Duration::from_secs(2)).await;
+                    assert_ne!(value["method"], "Page.domContentEventFired");
+                    assert_ne!(value["method"], "Page.loadEventFired");
+                    assert!(
+                        value["method"] != "Network.loadingFailed"
+                            || value["params"]["requestId"] != style_request_id,
+                        "stylesheet fetch was spuriously cancelled: {value}",
+                    );
+                    if value["method"] == "Network.requestWillBeSent"
+                        && value["params"]["request"]["url"]
+                            .as_str()
+                            .is_some_and(|url| url.ends_with("/blocking.js"))
+                    {
+                        break value["params"]["requestId"]
+                            .as_str()
+                            .expect("script request id")
+                            .to_string();
+                    }
+                };
+                send(json!({
+                    "id": 5,
+                    "method": "Runtime.evaluate",
+                    "sessionId": session_id,
+                    "params": {
+                        "expression": "document.readyState",
+                        "returnByValue": true,
+                    },
+                }));
+                tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+                assert_eq!(
+                    fixture
+                        .blocking_script_requests
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "forwarding requestWillBeSent must not cancel and retry the blocking script",
+                );
+
+                fixture.blocking_script_release.add_permits(1);
+                let mut saw_style_command = false;
+                let mut saw_script_command = false;
+                loop {
+                    let value = recv_cdp(&mut reply_rx, std::time::Duration::from_secs(3)).await;
+                    saw_style_command |= value["id"] == 4;
+                    saw_script_command |= value["id"] == 5;
+                    assert!(
+                        value["method"] != "Network.loadingFailed"
+                            || (value["params"]["requestId"] != style_request_id
+                                && value["params"]["requestId"] != script_request_id),
+                        "parser resource fetch was spuriously cancelled: {value}",
+                    );
+                    if value["method"] == "Page.loadEventFired" {
+                        break;
+                    }
+                }
+
+                send(json!({
+                    "id": 6,
+                    "method": "Runtime.evaluate",
+                    "sessionId": session_id,
+                    "params": {
+                        "expression": "[globalThis.__blockingScriptRuns,globalThis.__sheetCountAtBlockingScript,globalThis.__tailHiddenAtBlockingScript,document.querySelector('#tail')?.textContent,document.readyState]",
+                        "returnByValue": true,
+                    },
+                }));
+                loop {
+                    let value = recv_cdp(&mut reply_rx, std::time::Duration::from_secs(2)).await;
+                    saw_style_command |= value["id"] == 4;
+                    saw_script_command |= value["id"] == 5;
+                    if value["id"] == 6 {
+                        assert_eq!(
+                            value["result"]["result"]["value"],
+                            json!([1, 1, true, "tail", "complete"]),
+                        );
+                        break;
+                    }
+                }
+                assert!(saw_style_command, "stylesheet-time Runtime.evaluate was lost");
+                assert!(saw_script_command, "script-time Runtime.evaluate was lost");
+
+                fixture.task.abort();
+                drop(server_tx);
+                tokio::time::timeout(std::time::Duration::from_secs(2), processor)
+                    .await
+                    .expect("processor shutdown timeout")
+                    .expect("processor task");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigate_response_and_lifecycle_events_follow_requested_boundary() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let fixture = delayed_lifecycle_fixture().await;
+                let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+                let shutdown = Arc::new(tokio::sync::Notify::new());
+                let default_context =
+                    Arc::new(obscura_browser::BrowserContext::with_storage_and_network(
+                        "cdp-lifecycle-test".into(),
+                        None,
+                        false,
+                        None,
+                        None,
+                        true,
+                    ));
+                let processor = tokio::task::spawn_local(super::cdp_processor(
+                    server_rx,
+                    default_context,
+                    shutdown,
+                ));
+
+                server_tx
+                    .send(super::ServerMessage::NewConnection {
+                        reply_tx: reply_tx.clone(),
+                    })
+                    .unwrap();
+                assert!(
+                    recv_cdp(&mut reply_rx, std::time::Duration::from_secs(2)).await["__init"]
+                        .as_bool()
+                        .unwrap_or(false)
+                );
+
+                let send = |value: serde_json::Value| {
+                    server_tx
+                        .send(super::ServerMessage::Cdp(super::CdpMessage {
+                            text: value.to_string(),
+                            reply_tx: reply_tx.clone(),
+                        }))
+                        .unwrap();
+                };
+                send(json!({
+                    "id": 1,
+                    "method": "Target.createTarget",
+                    "params": {"url": "about:blank"},
+                }));
+                let mut session_id = None;
+                loop {
+                    let value = recv_cdp(&mut reply_rx, std::time::Duration::from_secs(2)).await;
+                    if session_id.is_none() {
+                        session_id = value["params"]["sessionId"].as_str().map(str::to_string);
+                    }
+                    if value["id"] == 1 {
+                        break;
+                    }
+                }
+                let session_id = session_id.expect("attached page session");
+
+                send(json!({
+                    "id": 2,
+                    "method": "Page.setLifecycleEventsEnabled",
+                    "sessionId": session_id,
+                    "params": {"enabled": true},
+                }));
+                loop {
+                    if recv_cdp(&mut reply_rx, std::time::Duration::from_secs(2)).await["id"] == 2 {
+                        break;
+                    }
+                }
+
+                // Raw CDP Page.navigate has no waitUntil. Its response belongs
+                // to the commit boundary and must not wait for this eager image.
+                send(json!({
+                    "id": 3,
+                    "method": "Page.navigate",
+                    "sessionId": session_id,
+                    "params": {"url": format!("{}/first", fixture.base_url)},
+                }));
+                let mut before_commit_response = Vec::new();
+                let raw_loader = loop {
+                    let value = recv_cdp(&mut reply_rx, std::time::Duration::from_secs(2)).await;
+                    if value["id"] == 3 {
+                        assert!(value.get("error").is_none(), "raw navigate failed: {value}");
+                        break value["result"]["loaderId"]
+                            .as_str()
+                            .expect("raw navigate loader id")
+                            .to_string();
+                    }
+                    before_commit_response.push(value);
+                };
+                assert!(before_commit_response
+                    .iter()
+                    .any(|value| value["method"] == "Page.frameNavigated"));
+                assert!(before_commit_response
+                    .iter()
+                    .any(|value| is_lifecycle(value, "commit")));
+                assert!(before_commit_response.iter().all(|value| {
+                    value["method"] != "Page.domContentEventFired"
+                        && value["method"] != "Page.loadEventFired"
+                        && value["method"] != "Page.frameStoppedLoading"
+                }));
+
+                let permit = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    fixture.load_started.acquire(),
+                )
+                .await
+                .expect("first delayed image was not requested")
+                .expect("load-start semaphore");
+                permit.forget();
+                let mut while_blocked = Vec::new();
+                while let Ok(raw) = reply_rx.try_recv() {
+                    while_blocked.push(serde_json::from_str::<serde_json::Value>(&raw).unwrap());
+                }
+                assert!(while_blocked
+                    .iter()
+                    .all(|value| value["method"] != "Page.loadEventFired"));
+
+                fixture.load_release.add_permits(1);
+                let mut after_commit_response = Vec::new();
+                loop {
+                    let value = recv_cdp(&mut reply_rx, std::time::Duration::from_secs(2)).await;
+                    let navigation_finished = is_lifecycle(&value, "networkIdle")
+                        && value["params"]["loaderId"] == raw_loader;
+                    after_commit_response.push(value);
+                    if navigation_finished {
+                        break;
+                    }
+                }
+                let load_index = after_commit_response
+                    .iter()
+                    .position(|value| value["method"] == "Page.loadEventFired")
+                    .expect("load after raw navigate response");
+                let stopped_index = after_commit_response
+                    .iter()
+                    .position(|value| value["method"] == "Page.frameStoppedLoading")
+                    .expect("frameStoppedLoading after load");
+                let almost_idle_index = after_commit_response
+                    .iter()
+                    .position(|value| is_lifecycle(value, "networkAlmostIdle"))
+                    .expect("networkAlmostIdle after real quiet window");
+                let idle_index = after_commit_response
+                    .iter()
+                    .position(|value| is_lifecycle(value, "networkIdle"))
+                    .expect("networkIdle after real quiet window");
+                assert!(
+                    load_index < stopped_index
+                        && stopped_index < almost_idle_index
+                        && almost_idle_index < idle_index
+                );
+
+                // An explicit load wait keeps the command unresolved while the
+                // second image is blocked, then responds after load/stopped.
+                send(json!({
+                    "id": 4,
+                    "method": "Page.navigate",
+                    "sessionId": session_id,
+                    "params": {
+                        "url": format!("{}/second", fixture.base_url),
+                        "waitUntil": "load",
+                    },
+                }));
+                let permit = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    fixture.load_started.acquire(),
+                )
+                .await
+                .expect("second delayed image was not requested")
+                .expect("load-start semaphore");
+                permit.forget();
+                let mut before_release = Vec::new();
+                let early_response =
+                    tokio::time::timeout(std::time::Duration::from_millis(150), async {
+                        loop {
+                            let value =
+                                recv_cdp(&mut reply_rx, std::time::Duration::from_secs(2)).await;
+                            let is_response = value["id"] == 4;
+                            before_release.push(value);
+                            if is_response {
+                                return;
+                            }
+                        }
+                    })
+                    .await;
+                assert!(
+                    early_response.is_err(),
+                    "waitUntil=load responded while its load blocker was pending"
+                );
+                assert!(before_release
+                    .iter()
+                    .any(|value| is_lifecycle(value, "commit")));
+                assert!(before_release
+                    .iter()
+                    .all(|value| value["method"] != "Page.loadEventFired"));
+
+                fixture.load_release.add_permits(1);
+                let mut through_load_response = before_release;
+                loop {
+                    let value = recv_cdp(&mut reply_rx, std::time::Duration::from_secs(2)).await;
+                    let is_response = value["id"] == 4;
+                    through_load_response.push(value);
+                    if is_response {
+                        break;
+                    }
+                }
+                let load_index = through_load_response
+                    .iter()
+                    .position(|value| value["method"] == "Page.loadEventFired")
+                    .expect("load event before explicit-load response");
+                let stopped_index = through_load_response
+                    .iter()
+                    .position(|value| value["method"] == "Page.frameStoppedLoading")
+                    .expect("frameStoppedLoading before explicit-load response");
+                let response_index = through_load_response
+                    .iter()
+                    .position(|value| value["id"] == 4)
+                    .unwrap();
+                assert!(load_index < stopped_index && stopped_index < response_index);
+
+                // networkidle2 maps to CDP networkAlmostIdle. One stalled fetch
+                // satisfies that threshold, so the response arrives before the
+                // fetch is released and before this loader's networkIdle.
+                send(json!({
+                    "id": 5,
+                    "method": "Page.navigate",
+                    "sessionId": session_id,
+                    "params": {
+                        "url": format!("{}/network-almost-idle", fixture.base_url),
+                        "waitUntil": "networkidle2",
+                    },
+                }));
+                let permit = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    fixture.fetch_started.acquire(),
+                )
+                .await
+                .expect("stalled fetch was not requested")
+                .expect("fetch-start semaphore");
+                permit.forget();
+                let mut almost_idle_wait_messages = Vec::new();
+                loop {
+                    let value = recv_cdp(&mut reply_rx, std::time::Duration::from_secs(3)).await;
+                    let is_response = value["id"] == 5;
+                    almost_idle_wait_messages.push(value);
+                    if is_response {
+                        break;
+                    }
+                }
+                let almost_idle_response = almost_idle_wait_messages.last().unwrap();
+                assert!(almost_idle_response.get("error").is_none());
+                let almost_idle_loader = almost_idle_response["result"]["loaderId"]
+                    .as_str()
+                    .expect("networkidle2 loader id");
+                assert!(almost_idle_wait_messages.iter().any(|value| {
+                    is_lifecycle(value, "networkAlmostIdle")
+                        && value["params"]["loaderId"] == almost_idle_loader
+                }));
+                assert!(almost_idle_wait_messages.iter().all(|value| {
+                    !is_lifecycle(value, "networkIdle")
+                        || value["params"]["loaderId"] != almost_idle_loader
+                }));
+                fixture.fetch_release.add_permits(1);
+                let mut saw_network_idle = false;
+                while !saw_network_idle {
+                    let value = recv_cdp(&mut reply_rx, std::time::Duration::from_secs(2)).await;
+                    if is_lifecycle(&value, "networkIdle")
+                        && value["params"]["loaderId"] == almost_idle_loader
+                    {
+                        saw_network_idle = true;
+                    }
+                }
+                assert!(saw_network_idle, "networkIdle must follow fetch completion");
+
+                // A stalled fetch does not delay load, but it prevents
+                // networkidle0. The five-second browser timeout must surface as
+                // a command error and must never publish networkIdle for that
+                // loader (networkAlmostIdle remains a valid earlier milestone).
+                send(json!({
+                    "id": 6,
+                    "method": "Page.navigate",
+                    "sessionId": session_id,
+                    "params": {
+                        "url": format!("{}/network-idle-timeout", fixture.base_url),
+                        "waitUntil": "networkidle0",
+                    },
+                }));
+                let permit = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    fixture.fetch_started.acquire(),
+                )
+                .await
+                .expect("timeout fetch was not requested")
+                .expect("fetch-start semaphore");
+                permit.forget();
+                let mut idle_wait_messages = Vec::new();
+                loop {
+                    let value = recv_cdp(&mut reply_rx, std::time::Duration::from_secs(8)).await;
+                    let is_response = value["id"] == 6;
+                    idle_wait_messages.push(value);
+                    if is_response {
+                        break;
+                    }
+                }
+                let response = idle_wait_messages.last().unwrap();
+                assert!(response["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("network idle wait timed out")));
+                assert!(idle_wait_messages
+                    .iter()
+                    .any(|value| value["method"] == "Page.loadEventFired"));
+                assert!(idle_wait_messages
+                    .iter()
+                    .any(|value| is_lifecycle(value, "networkAlmostIdle")));
+                assert!(idle_wait_messages
+                    .iter()
+                    .all(|value| !is_lifecycle(value, "networkIdle")));
+
+                fixture.fetch_release.add_permits(1);
+                fixture.task.abort();
+                drop(server_tx);
+                tokio::time::timeout(std::time::Duration::from_secs(2), processor)
+                    .await
+                    .expect("processor shutdown timeout")
+                    .expect("processor task");
+            })
+            .await;
+    }
+
     #[test]
     fn cookie_delta_merges_changes_without_reverting_other_connections() {
         let destination = CookieJar::new();
@@ -1888,7 +4656,9 @@ mod tests {
         merge_cookie_delta(&destination, &initial, &current);
 
         let cookies = destination.get_all_cookies();
-        assert!(cookies.iter().any(|c| c.name == "sid" && c.value == "newer"));
+        assert!(cookies
+            .iter()
+            .any(|c| c.name == "sid" && c.value == "newer"));
         assert!(cookies.iter().any(|c| c.name == "other"));
         assert!(cookies.iter().any(|c| c.name == "added"));
         assert!(!cookies.iter().any(|c| c.name == "removed"));
@@ -1962,7 +4732,10 @@ mod tests {
         let response: serde_json::Value =
             serde_json::from_str(&reply_rx.try_recv().expect("one command response")).unwrap();
         assert_eq!(response["id"], 17);
-        assert!(reply_rx.try_recv().is_err(), "must not emit a duplicate response");
+        assert!(
+            reply_rx.try_recv().is_err(),
+            "must not emit a duplicate response"
+        );
     }
 
     #[cfg(feature = "render")]
@@ -1988,14 +4761,9 @@ mod tests {
         .await
         .expect("navigate screencast fixture");
         ctx.pending_events.clear();
-        crate::domains::page::handle(
-            "startScreencast",
-            &json!({}),
-            &mut ctx,
-            &session,
-        )
-        .await
-        .expect("start screencast");
+        crate::domains::page::handle("startScreencast", &json!({}), &mut ctx, &session)
+            .await
+            .expect("start screencast");
         let stream_id = ctx
             .pending_events
             .iter()
@@ -2013,7 +4781,9 @@ mod tests {
         pump_live_page_event_loop(&mut ctx).await.unwrap();
         pump_and_forward_screencast_frames(&mut ctx, Some(&reply_tx)).await;
         let first_update: serde_json::Value = serde_json::from_str(
-            &reply_rx.try_recv().expect("timer mutation should emit a frame"),
+            &reply_rx
+                .try_recv()
+                .expect("timer mutation should emit a frame"),
         )
         .unwrap();
         assert_eq!(first_update["method"], "Page.screencastFrame");
@@ -2077,14 +4847,9 @@ mod tests {
         .await
         .expect("navigate visual-damage fixture");
         ctx.pending_events.clear();
-        crate::domains::page::handle(
-            "startScreencast",
-            &json!({}),
-            &mut ctx,
-            &session,
-        )
-        .await
-        .expect("start screencast");
+        crate::domains::page::handle("startScreencast", &json!({}), &mut ctx, &session)
+            .await
+            .expect("start screencast");
         let initial = ctx
             .pending_events
             .iter()

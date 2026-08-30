@@ -18,10 +18,8 @@ from threading import Thread
 
 ROUNDS = 5
 PROCESS_TIMEOUT_SECONDS = 45
-LATENCY_FAILURE_RATIO = 1.20
-LATENCY_FAILURE_DELTA_MS = 10.0
-RSS_FAILURE_RATIO = 1.15
-RSS_FAILURE_DELTA_KIB = 8 * 1024
+LATENCY_FAILURE_RATIO = 1.10
+RSS_FAILURE_RATIO = 1.10
 HTML = b"<!doctype html><html><body><main id='root'></main></body></html>"
 SCENARIOS = {
     "dom-build": (
@@ -131,6 +129,18 @@ def add_summary(markdown: str) -> None:
         print(markdown)
 
 
+def performance_regression_failures(
+    scenario: str, latency_ratio: float, rss_ratio: float
+) -> list[str]:
+    """Return failures for ratios that strictly exceed the 10% noise line."""
+    failures = []
+    if latency_ratio > LATENCY_FAILURE_RATIO:
+        failures.append(f"{scenario} latency is {latency_ratio:.6f}x the base")
+    if rss_ratio > RSS_FAILURE_RATIO:
+        failures.append(f"{scenario} RSS is {rss_ratio:.6f}x the base")
+    return failures
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", type=Path, required=True)
@@ -169,7 +179,7 @@ def main() -> None:
     report: dict[str, object] = {"rounds": ROUNDS, "scenarios": {}}
     lines = [
         "## Performance smoke comparison\n\n",
-        "Fails above 20% and 10 ms for latency, or above 15% and 8 MiB for RSS.\n\n",
+        "Fails when median latency or peak RSS is more than 1.10x the base.\n\n",
         "| Scenario | Base latency | PR latency | Change | Base RSS | PR RSS | Change |\n",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     ]
@@ -195,15 +205,9 @@ def main() -> None:
             f"{(latency_ratio - 1) * 100:+.1f}% | {base_rss / 1024:.1f} MiB | "
             f"{pr_rss / 1024:.1f} MiB | {(rss_ratio - 1) * 100:+.1f}% |\n"
         )
-        latency_delta = pr_latency - base_latency
-        rss_delta = pr_rss - base_rss
-        if (
-            latency_ratio > LATENCY_FAILURE_RATIO
-            and latency_delta > LATENCY_FAILURE_DELTA_MS
-        ):
-            failures.append(f"{scenario} latency is {latency_ratio:.2f}x the base")
-        if rss_ratio > RSS_FAILURE_RATIO and rss_delta > RSS_FAILURE_DELTA_KIB:
-            failures.append(f"{scenario} RSS is {rss_ratio:.2f}x the base")
+        failures.extend(
+            performance_regression_failures(scenario, latency_ratio, rss_ratio)
+        )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
