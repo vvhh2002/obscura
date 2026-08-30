@@ -5,7 +5,7 @@ on:
 
 # Pull requests execute contributor-controlled build scripts, proc macros,
 # tests, and binaries. They must never receive a write token or repository
-# secrets. Publishing remains isolated in the tag-only release workflows.
+# secrets. Publishing remains isolated in the release workflows.
 permissions:
   contents: read
 

@@ -98,3 +98,49 @@ python3 tests/test_all.py
 
 Use `cargo nextest`, not `cargo test`: runtime tests require process isolation
 because the engine owns a single V8 isolate per process.
+
+## GitHub Actions CI
+
+Pull requests continue to use `.github/workflows/ci.yml`, including the
+base-revision policy and performance comparison. Pushes to `main` or
+`VVDevelop` use `.github/workflows/ci-branch.yml`. The branch workflow can also
+be started manually from the Actions tab and runs the release-mode render test
+suite plus the render/stealth/no-render build configurations. It has read-only
+repository permissions and receives no repository secrets.
+
+GitHub only exposes a workflow's **Run workflow** button after that workflow
+exists on the repository's default branch. When developing the workflow on a
+different branch, merge it into the default branch first or make that branch
+the default, then select the desired source branch in the workflow picker.
+
+## Manual releases
+
+`.github/workflows/release.yml` still runs automatically for a pushed `v*`
+tag. It also supports `workflow_dispatch` for a guarded manual build:
+
+1. Open **Actions → Release → Run workflow** and select the exact branch whose
+   current commit should be released.
+2. Enter a SemVer tag with a leading `v`, such as `v0.2.0`.
+3. Leave **publish** disabled to build downloadable workflow artifacts only.
+4. To create or update a GitHub Release, enable **publish**. If the tag does
+   not exist yet, also enable **create_tag**; otherwise the workflow fails
+   before compiling. A pre-existing tag must resolve to the selected commit.
+5. Enable **draft** when the release should remain unpublished. Prerelease tags
+   such as `v0.2.0-rc.1` are always marked as prereleases.
+
+The prepare job resolves one immutable commit SHA. Every native matrix build
+checks out that SHA, and the tag without its leading `v` is injected as the CLI
+version. Immediately before publication, the workflow resolves the tag again
+(including annotated tags) and fails if it moved while the matrix was building.
+The matrix builds Linux x86_64/ARM64, macOS Apple Silicon/Intel, and Windows
+x86_64. Each platform produces default, stealth, no-render, and
+no-render-stealth archives, runs an offline V8 startup smoke test, and uploads
+the packages for seven days. Published releases also contain `SHA256SUMS`.
+
+Only the final publish job receives `contents: write`; it does not check out or
+execute repository code. The build jobs remain read-only. A tag created by the
+repository `GITHUB_TOKEN` does not start another workflow, so a tag created by
+manual binary publication does not automatically run the separate Docker
+workflow. When a Docker image is required too, create and push the tag through
+the normal Git flow instead of allowing the manual release to create it; that
+tag push starts both the binary Release and Docker workflows.
