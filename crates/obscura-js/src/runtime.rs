@@ -13,16 +13,14 @@ use crate::import_map::ImportMap;
 use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
-use crate::ops::{build_extension, node_is_script, ObscuraState, StoredNetworkResponseBody};
 #[cfg(feature = "render")]
 use crate::ops::{
     begin_animation_task, clamp_scroll_offset, document_base_url, ensure_resolved_scroll,
 };
+use crate::ops::{build_extension, node_is_script, ObscuraState, StoredNetworkResponseBody};
 
 #[cfg(feature = "render")]
-struct RuntimeCanvasSurfaceSource<'a>(
-    &'a HashMap<NodeId, crate::ops::CanvasBackingSurface>,
-);
+struct RuntimeCanvasSurfaceSource<'a>(&'a HashMap<NodeId, crate::ops::CanvasBackingSurface>);
 
 /// Every connected node in the document and its nested shadow trees.
 ///
@@ -80,6 +78,115 @@ static ISOLATE_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 const DEFAULT_CDP_AWAIT_TIMEOUT_MS: u64 = 30_000;
 const HEAP_LIMIT_RECOVERY_HEADROOM_BYTES: usize = 64 * 1024 * 1024;
 
+fn pending_frame_bytes(frame: &crate::ops::PendingFrame) -> usize {
+    frame
+        .url
+        .len()
+        .saturating_add(frame.inherited_base_url.as_deref().map_or(0, str::len))
+        .saturating_add(frame.inherited_origin.as_deref().map_or(0, str::len))
+        .saturating_add(frame.html.len())
+}
+
+/// Cancellation-safe ownership of the native frame-document queue.
+///
+/// Page attachment performs network awaits. If its future is dropped, this
+/// guard puts the current and not-yet-visited documents back ahead of anything
+/// queued meanwhile, preserving both creation order and queue byte accounting.
+pub struct PendingFrameDrain {
+    state: crate::ops::SharedState,
+    pending: std::collections::VecDeque<crate::ops::PendingFrame>,
+    current: Option<crate::ops::PendingFrame>,
+    remaining_bytes: usize,
+}
+
+impl PendingFrameDrain {
+    pub fn is_empty(&self) -> bool {
+        self.current.is_none() && self.pending.is_empty()
+    }
+
+    pub fn next(&mut self) -> Option<&crate::ops::PendingFrame> {
+        debug_assert!(self.current.is_none());
+        self.current = self.pending.pop_front();
+        self.current.as_ref()
+    }
+
+    pub fn finish_current(&mut self) {
+        if let Some(frame) = self.current.take() {
+            let bytes = pending_frame_bytes(&frame);
+            self.remaining_bytes = self.remaining_bytes.saturating_sub(bytes);
+            let mut state = self.state.borrow_mut();
+            state.draining_frame_documents = state.draining_frame_documents.saturating_sub(1);
+            state.draining_frame_bytes = state.draining_frame_bytes.saturating_sub(bytes);
+        }
+    }
+}
+
+impl Drop for PendingFrameDrain {
+    fn drop(&mut self) {
+        if self.current.is_none() && self.pending.is_empty() {
+            return;
+        }
+        // FrameRealm initialization can synchronously reserve or queue
+        // descendant documents before Page reaches its first network await.
+        // If that await is cancelled, the staged realm is dropped and those
+        // descendants must be rolled back with it rather than surviving as
+        // blockers owned by a context which never committed.
+        let cancelled_owner = self.current.as_ref().map(|frame| frame.frame_id);
+        let mut restored =
+            Vec::with_capacity(usize::from(self.current.is_some()) + self.pending.len());
+        if let Some(frame) = self.current.take() {
+            restored.push(frame);
+        }
+        restored.extend(self.pending.drain(..));
+        let mut state = self.state.borrow_mut();
+        if let Some(owner) = cancelled_owner {
+            let mut discarded_owners = std::collections::HashSet::from([owner]);
+            loop {
+                let before = discarded_owners.len();
+                for frame in restored.iter().chain(state.pending_frames.iter()) {
+                    if discarded_owners.contains(&frame.parent_frame_id) {
+                        discarded_owners.insert(frame.frame_id);
+                    }
+                }
+                for (&frame_id, &parent_frame_id) in &state.reserved_frame_ids {
+                    if discarded_owners.contains(&parent_frame_id) {
+                        discarded_owners.insert(frame_id);
+                    }
+                }
+                if discarded_owners.len() == before {
+                    break;
+                }
+            }
+            // Keep the cancelled current document itself so a later pump can
+            // retry its attachment, but remove every queued/reserved browsing
+            // context whose owner existed only in the discarded staged realm.
+            restored.retain(|frame| !discarded_owners.contains(&frame.parent_frame_id));
+            state
+                .reserved_frame_ids
+                .retain(|_, parent_frame_id| !discarded_owners.contains(parent_frame_id));
+            state
+                .pending_frames
+                .retain(|frame| !discarded_owners.contains(&frame.parent_frame_id));
+            state.pending_frame_bytes = state
+                .pending_frames
+                .iter()
+                .map(pending_frame_bytes)
+                .fold(0usize, usize::saturating_add);
+        }
+        self.remaining_bytes = restored
+            .iter()
+            .map(pending_frame_bytes)
+            .fold(0usize, usize::saturating_add);
+        state.draining_frame_documents = 0;
+        state.draining_frame_bytes = 0;
+        restored.append(&mut state.pending_frames);
+        state.pending_frames = restored;
+        state.pending_frame_bytes = state
+            .pending_frame_bytes
+            .saturating_add(self.remaining_bytes);
+    }
+}
+
 #[derive(Default)]
 struct HeapLimitState {
     tripped: std::sync::atomic::AtomicBool,
@@ -119,13 +226,9 @@ fn with_sync_render_loading_disabled<R>(
     state: &mut ObscuraState,
     capture: impl FnOnce(&mut ObscuraState) -> R,
 ) -> R {
-    let previous = state
-        .render_resources
-        .set_sync_loading_enabled(false);
+    let previous = state.render_resources.set_sync_loading_enabled(false);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| capture(state)));
-    state
-        .render_resources
-        .set_sync_loading_enabled(previous);
+    state.render_resources.set_sync_loading_enabled(previous);
     match result {
         Ok(value) => value,
         Err(payload) => std::panic::resume_unwind(payload),
@@ -218,6 +321,8 @@ pub struct WatchdogToken {
     pair: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     join: Option<std::thread::JoinHandle<()>>,
     fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: IsolateHandle,
+    stopped: bool,
 }
 
 /// Arm a V8 termination watchdog directly from an isolate handle, with no
@@ -230,6 +335,7 @@ pub fn spawn_watchdog(handle: IsolateHandle, budget: std::time::Duration) -> Wat
     let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let pair_c = pair.clone();
     let fired_c = fired.clone();
+    let watchdog_handle = handle.clone();
     let join = std::thread::spawn(move || {
         let (lock, cvar) = &*pair_c;
         let mut cancelled = lock.lock().unwrap();
@@ -260,23 +366,44 @@ pub fn spawn_watchdog(handle: IsolateHandle, budget: std::time::Duration) -> Wat
         pair,
         join: Some(join),
         fired,
+        handle: watchdog_handle,
+        stopped: false,
     }
 }
 
 impl WatchdogToken {
-    /// Stop the watchdog. Returns true if it had already fired (terminated the
-    /// isolate). The caller must then clear the termination flag via
-    /// [`ObscuraJsRuntime::cancel_termination`] before the next eval.
-    pub fn stop(mut self) -> bool {
+    fn stop_inner(&mut self) -> bool {
+        if self.stopped {
+            return self.fired.load(std::sync::atomic::Ordering::SeqCst);
+        }
+        self.stopped = true;
         {
             let (lock, cvar) = &*self.pair;
             *lock.lock().unwrap() = true;
             cvar.notify_one();
         }
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
         }
         self.fired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Stop the watchdog. Returns true if it had already fired (terminated the
+    /// isolate). The caller must then clear the termination flag via
+    /// [`ObscuraJsRuntime::cancel_termination`] before the next eval.
+    pub fn stop(mut self) -> bool {
+        self.stop_inner()
+    }
+}
+
+impl Drop for WatchdogToken {
+    fn drop(&mut self) {
+        // Navigation futures can be cancelled at any await point. Leaving the
+        // watchdog thread detached would let it terminate an otherwise healthy
+        // isolate later, with nobody left to clear V8's termination flag.
+        if self.stop_inner() {
+            self.handle.cancel_terminate_execution();
+        }
     }
 }
 
@@ -315,12 +442,8 @@ impl ObscuraJsRuntime {
         let state_clone = state.clone();
         let import_map = state.borrow().import_map.clone();
 
-        let module_loader = ObscuraModuleLoader::with_page_state(
-            base_url,
-            proxy_url,
-            &state,
-            import_map.clone(),
-        );
+        let module_loader =
+            ObscuraModuleLoader::with_page_state(base_url, proxy_url, &state, import_map.clone());
         let module_load_activity = module_loader.activity();
         let loaded_module_specifiers = module_loader.loaded_specifiers();
         let module_loader = Rc::new(module_loader);
@@ -590,6 +713,35 @@ impl ObscuraJsRuntime {
         }
     }
 
+    /// Runs `source` inside `realm` and converts the result directly from its
+    /// V8 value. In particular, this must not consult the realm's mutable
+    /// `JSON.stringify`: frame code is allowed to replace that function, while
+    /// lifecycle and liveness probes remain host decisions.
+    pub(crate) fn eval_json_in_realm(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+        source: &str,
+    ) -> Result<serde_json::Value, String> {
+        use deno_core::v8;
+
+        let isolate = self.runtime.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+        let context = v8::Local::new(scope, realm);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let scope = &mut v8::TryCatch::new(scope);
+
+        let code = v8::String::new(scope, source).ok_or("source too large")?;
+        let script = match v8::Script::compile(scope, code, None) {
+            Some(script) => script,
+            None => return Err(exception_text(scope)),
+        };
+        let value = match script.run(scope) {
+            Some(value) => value,
+            None => return Err(exception_text(scope)),
+        };
+        deno_core::serde_v8::from_v8(scope, value).map_err(|error| error.to_string())
+    }
+
     /// Installs one CDP `Runtime.addBinding` function in `context` without
     /// making deno_core's op table page-visible again.
     ///
@@ -632,14 +784,14 @@ impl ObscuraJsRuntime {
             "(function(__call,__name){const __String=String;return function(arg){if(arguments.length!==1)return;try{const payload=typeof arg==='string'?arg:__String(arg);__call(__name,payload);}catch(_){}};})",
         )
         .ok_or_else(|| "could not allocate binding factory source".to_string())?;
-        let script = v8::Script::compile(scope, source, None)
-            .ok_or_else(|| exception_text(scope))?;
+        let script =
+            v8::Script::compile(scope, source, None).ok_or_else(|| exception_text(scope))?;
         let factory = script
             .run(scope)
             .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
             .ok_or_else(|| exception_text(scope))?;
-        let binding_name = v8::String::new(scope, name)
-            .ok_or_else(|| "binding name is too large".to_string())?;
+        let binding_name =
+            v8::String::new(scope, name).ok_or_else(|| "binding name is too large".to_string())?;
         let receiver = v8::undefined(scope);
         let arguments = [op.into(), binding_name.into()];
         let wrapper = factory
@@ -647,8 +799,8 @@ impl ObscuraJsRuntime {
             .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
             .ok_or_else(|| exception_text(scope))?;
 
-        let global_key = v8::String::new(scope, name)
-            .ok_or_else(|| "binding name is too large".to_string())?;
+        let global_key =
+            v8::String::new(scope, name).ok_or_else(|| "binding name is too large".to_string())?;
         if !context
             .global(scope)
             .set(scope, global_key.into(), wrapper.into())
@@ -759,6 +911,20 @@ impl ObscuraJsRuntime {
         }
     }
 
+    /// Origin of a live frame document. Inline documents carry their inherited
+    /// principal separately from their observable about: URL.
+    pub(crate) fn frame_origin(&self, frame_id: u32) -> Option<String> {
+        let state = self.realm_states().borrow().by_frame_id(frame_id)?;
+        let state = state.borrow();
+        if let Some(origin) = &state.inherited_origin {
+            return Some(origin.clone());
+        }
+        Some(match url::Url::parse(&state.url) {
+            Ok(parsed) if parsed.origin().is_tuple() => parsed.origin().ascii_serialization(),
+            _ => "null".to_string(),
+        })
+    }
+
     /// Gives a same-origin frame realm the page's security token.
     ///
     /// V8 access-checks property reads across contexts and answers `undefined`
@@ -771,14 +937,40 @@ impl ObscuraJsRuntime {
         &mut self,
         realm: &deno_core::v8::Global<deno_core::v8::Context>,
     ) {
+        let main = self.runtime.main_context();
+        self.share_security_token_from_context(realm, &main);
+    }
+
+    /// Gives a child the token of its immediate frame owner. This is distinct
+    /// from the top document token for A -> B -> B nesting.
+    pub(crate) fn share_security_token_with_frame(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+        owner_frame_id: u32,
+    ) -> bool {
+        let owner = self
+            .realm_states()
+            .borrow()
+            .context_by_frame_id(owner_frame_id);
+        let Some(owner) = owner else {
+            return false;
+        };
+        self.share_security_token_from_context(realm, &owner);
+        true
+    }
+
+    fn share_security_token_from_context(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+        source: &deno_core::v8::Global<deno_core::v8::Context>,
+    ) {
         use deno_core::v8;
 
-        let main = self.runtime.main_context();
         let isolate = self.runtime.v8_isolate();
         let scope = &mut v8::HandleScope::new(isolate);
-        let main = v8::Local::new(scope, main);
+        let source = v8::Local::new(scope, source);
         let realm = v8::Local::new(scope, realm);
-        let token = main.get_security_token(scope);
+        let token = source.get_security_token(scope);
         realm.set_security_token(token);
     }
 
@@ -796,9 +988,37 @@ impl ObscuraJsRuntime {
         realm: &deno_core::v8::Global<deno_core::v8::Context>,
         frame_id: u32,
     ) -> bool {
+        let main = self.runtime.main_context();
+        self.publish_realm_objects_into(realm, &main, frame_id)
+    }
+
+    /// Publishes a nested frame into the realm that owns its iframe element.
+    /// The page realm also keeps its existing publication for message-source
+    /// identity, but `iframe.contentWindow` is resolved in the immediate owner.
+    pub(crate) fn publish_realm_objects_to_frame(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+        frame_id: u32,
+        owner_frame_id: u32,
+    ) -> bool {
+        let owner = self
+            .realm_states()
+            .borrow()
+            .context_by_frame_id(owner_frame_id);
+        let Some(owner) = owner else {
+            return false;
+        };
+        self.publish_realm_objects_into(realm, &owner, frame_id)
+    }
+
+    fn publish_realm_objects_into(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+        owner: &deno_core::v8::Global<deno_core::v8::Context>,
+        frame_id: u32,
+    ) -> bool {
         use deno_core::v8;
 
-        let main = self.runtime.main_context();
         let isolate = self.runtime.v8_isolate();
         let scope = &mut v8::HandleScope::new(isolate);
 
@@ -819,37 +1039,31 @@ impl ObscuraJsRuntime {
             )
         };
 
-        let main_context = v8::Local::new(scope, main);
-        let scope = &mut v8::ContextScope::new(scope, main_context);
-        let global = main_context.global(scope);
-        let Some(registry_key) = v8::String::new(scope, "__obscura_frameObjects") else {
+        let owner_context = v8::Local::new(scope, owner);
+        let scope = &mut v8::ContextScope::new(scope, owner_context);
+        let global = owner_context.global(scope);
+        let Some(publish_key) = v8::String::new(scope, "__obscura_publishFrameObjects") else {
             return false;
         };
-        let registry = match global
-            .get(scope, registry_key.into())
-            .and_then(|value| value.to_object(scope))
-        {
-            Some(registry) if !registry.is_null_or_undefined() => registry,
-            _ => {
-                let fresh = v8::Object::new(scope);
-                global.set(scope, registry_key.into(), fresh.into());
-                fresh
-            }
+        let Some(publish) = global
+            .get(scope, publish_key.into())
+            .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+        else {
+            return false;
         };
-
-        let entry = v8::Object::new(scope);
         let window = v8::Local::new(scope, frame_window);
-        if let Some(key) = v8::String::new(scope, "window") {
-            entry.set(scope, key.into(), window.into());
-        }
-        if let (Some(key), Some(document)) = (
-            v8::String::new(scope, "document"),
-            frame_document.map(|document| v8::Local::new(scope, document)),
-        ) {
-            entry.set(scope, key.into(), document);
-        }
         let index = v8::Integer::new_from_unsigned(scope, frame_id);
-        registry.set(scope, index.into(), entry.into()).unwrap_or(false)
+        let document = frame_document
+            .map(|document| v8::Local::new(scope, document))
+            .unwrap_or_else(|| v8::undefined(scope).into());
+        publish
+            .call(
+                scope,
+                global.into(),
+                &[index.into(), window.into(), document],
+            )
+            .map(|value| value.boolean_value(scope))
+            .unwrap_or(false)
     }
 
     /// The table ops consult to find the calling realm's document.
@@ -870,6 +1084,25 @@ impl ObscuraJsRuntime {
         std::mem::take(&mut state.pending_frames)
     }
 
+    /// Drain queued frame documents without losing them if the async caller is
+    /// cancelled while fetching one frame's parser resources.
+    pub fn take_pending_frame_drain(&self) -> PendingFrameDrain {
+        let mut state = self.state.borrow_mut();
+        let pending = std::mem::take(&mut state.pending_frames);
+        let remaining_bytes = std::mem::take(&mut state.pending_frame_bytes);
+        debug_assert_eq!(state.draining_frame_documents, 0);
+        debug_assert_eq!(state.draining_frame_bytes, 0);
+        state.draining_frame_documents = pending.len();
+        state.draining_frame_bytes = remaining_bytes;
+        drop(state);
+        PendingFrameDrain {
+            state: self.state.clone(),
+            pending: pending.into(),
+            current: None,
+            remaining_bytes,
+        }
+    }
+
     /// Frame documents which have completed fetching but still await a realm.
     /// Archive callers use this as a final-state barrier instead of treating a
     /// not-yet-drained native queue as an empty frame tree.
@@ -879,9 +1112,76 @@ impl ObscuraJsRuntime {
             state
                 .pending_frames
                 .len()
-                .saturating_add(state.reserved_frame_ids.len()),
-            state.pending_frame_bytes,
+                .saturating_add(state.reserved_frame_ids.len())
+                .saturating_add(state.draining_frame_documents),
+            state
+                .pending_frame_bytes
+                .saturating_add(state.draining_frame_bytes),
         )
+    }
+
+    /// Count in-flight and queued child documents by their embedding realm.
+    /// Parent id `0` is the top document.
+    pub fn frame_document_load_blockers_by_parent(&self) -> std::collections::BTreeMap<u32, usize> {
+        let state = self.state.borrow();
+        let mut blockers = std::collections::BTreeMap::new();
+        for parent_frame_id in state.reserved_frame_ids.values().copied() {
+            *blockers.entry(parent_frame_id).or_insert(0usize) += 1;
+        }
+        for frame in &state.pending_frames {
+            *blockers.entry(frame.parent_frame_id).or_insert(0usize) += 1;
+        }
+        blockers
+    }
+
+    /// Cancel every in-flight or queued child document owned by a browsing
+    /// context subtree which is being discarded. A late fetch completion still
+    /// carries its old reservation id; removing that reservation makes the op
+    /// reject it instead of falling back to the top realm after its parent
+    /// context has been unregistered.
+    pub fn cancel_frame_documents_owned_by(&self, parent_frame_ids: &[u32]) {
+        if parent_frame_ids.is_empty() {
+            return;
+        }
+        let mut parent_frame_ids = parent_frame_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let mut state = self.state.borrow_mut();
+        loop {
+            let before = parent_frame_ids.len();
+            for frame in &state.pending_frames {
+                if parent_frame_ids.contains(&frame.parent_frame_id) {
+                    parent_frame_ids.insert(frame.frame_id);
+                }
+            }
+            for (&frame_id, &parent_frame_id) in &state.reserved_frame_ids {
+                if parent_frame_ids.contains(&parent_frame_id) {
+                    parent_frame_ids.insert(frame_id);
+                }
+            }
+            if parent_frame_ids.len() == before {
+                break;
+            }
+        }
+        state
+            .reserved_frame_ids
+            .retain(|_, parent_frame_id| !parent_frame_ids.contains(parent_frame_id));
+        state
+            .pending_frames
+            .retain(|frame| !parent_frame_ids.contains(&frame.parent_frame_id));
+        state.pending_frame_bytes = state
+            .pending_frames
+            .iter()
+            .map(|frame| {
+                frame
+                    .url
+                    .len()
+                    .saturating_add(frame.inherited_base_url.as_deref().map_or(0, str::len))
+                    .saturating_add(frame.inherited_origin.as_deref().map_or(0, str::len))
+                    .saturating_add(frame.html.len())
+            })
+            .fold(0usize, usize::saturating_add);
     }
 
     /// Bounded frame-queue failures observed in this document generation.
@@ -913,6 +1213,51 @@ impl ObscuraJsRuntime {
         std::mem::take(&mut state.pending_frame_messages)
     }
 
+    /// Whether a message target has a fetched or in-flight document but no
+    /// committed realm yet. Such a message must survive the current delivery
+    /// pass and be retried after attachment.
+    pub fn frame_document_is_pending(&self, frame_id: u32) -> bool {
+        let state = self.state.borrow();
+        state.reserved_frame_ids.contains_key(&frame_id)
+            || state
+                .pending_frames
+                .iter()
+                .any(|frame| frame.frame_id == frame_id)
+    }
+
+    /// Put messages for not-yet-attached frames back before traffic generated
+    /// while the current batch was being delivered.
+    pub fn restore_pending_frame_messages(
+        &self,
+        mut messages: Vec<crate::ops::PendingFrameMessage>,
+    ) {
+        if messages.is_empty() {
+            return;
+        }
+        let mut state = self.state.borrow_mut();
+        messages.append(&mut state.pending_frame_messages);
+        let entry_limit = crate::ops::frame_message_queue_entry_limit();
+        let byte_limit = crate::ops::frame_message_queue_byte_limit();
+        let mut retained_bytes = 0usize;
+        let mut retained = 0usize;
+        for message in &messages {
+            let next_bytes = retained_bytes.saturating_add(message.data_json.len());
+            if retained == entry_limit || next_bytes > byte_limit {
+                break;
+            }
+            retained += 1;
+            retained_bytes = next_bytes;
+        }
+        if retained != messages.len() {
+            state
+                .resource_archive_incomplete_reasons
+                .insert("frame postMessage retry queue cap reached".to_string());
+            messages.truncate(retained);
+        }
+        state.pending_frame_message_bytes = retained_bytes;
+        state.pending_frame_messages = messages;
+    }
+
     /// Restore the configured V8 heap limit after the emergency headroom has
     /// allowed a terminated allocation to unwind. The callback is then armed
     /// again so a second hostile script cannot grow the isolate without bound.
@@ -930,8 +1275,7 @@ impl ObscuraJsRuntime {
             .heap_limit_state
             .restore_limit
             .swap(0, std::sync::atomic::Ordering::SeqCst);
-        self.runtime
-            .remove_near_heap_limit_callback(restore_limit);
+        self.runtime.remove_near_heap_limit_callback(restore_limit);
         install_heap_limit_guard(
             &mut self.runtime,
             self.isolate_handle.clone(),
@@ -1177,18 +1521,11 @@ impl ObscuraJsRuntime {
     pub fn set_screen_size_override(&mut self, size: Option<(f64, f64)>, emulated: bool) {
         let script = match size {
             Some((width, height))
-                if width.is_finite()
-                    && height.is_finite()
-                    && width > 0.0
-                    && height > 0.0 =>
+                if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 =>
             {
-                format!(
-                    "globalThis.__obscura_set_screen_override({width},{height},{emulated});"
-                )
+                format!("globalThis.__obscura_set_screen_override({width},{height},{emulated});")
             }
-            _ => format!(
-                "globalThis.__obscura_set_screen_override(null,null,{emulated});"
-            ),
+            _ => format!("globalThis.__obscura_set_screen_override(null,null,{emulated});"),
         };
         let _ = self.execute_runtime_script("<set-screen-size>", script);
     }
@@ -1204,10 +1541,7 @@ impl ObscuraJsRuntime {
     /// Select the document-timeline instant used by the next render flush.
     /// Returns false for invalid times and preserves the current sample.
     #[cfg(feature = "render")]
-    pub fn set_animation_sample_time(
-        &self,
-        sample: obscura_render::AnimationSampleTime,
-    ) -> bool {
+    pub fn set_animation_sample_time(&self, sample: obscura_render::AnimationSampleTime) -> bool {
         self.set_animation_sample(obscura_render::AnimationSample::document(
             sample.milliseconds,
         ))
@@ -1220,8 +1554,8 @@ impl ObscuraJsRuntime {
         }
         let mut state = self.state.borrow_mut();
         if state.animation_sample != sample {
-            let forward_document_sample =
-                sample.mode == obscura_render::AnimationSampleMode::DocumentTime
+            let forward_document_sample = sample.mode
+                == obscura_render::AnimationSampleMode::DocumentTime
                 && state.animation_sample.mode == obscura_render::AnimationSampleMode::DocumentTime
                 && sample.time.milliseconds > state.animation_sample.time.milliseconds;
             if forward_document_sample
@@ -1307,11 +1641,7 @@ impl ObscuraJsRuntime {
         viewport: (f32, f32),
         base_url: Option<&str>,
     ) -> Option<Vec<u8>> {
-        self.screenshot_prepared_with_surface_color(
-            viewport,
-            base_url,
-            [255, 255, 255, 255],
-        )
+        self.screenshot_prepared_with_surface_color(viewport, base_url, [255, 255, 255, 255])
     }
 
     /// Paint an unprepared view of the current document against the runtime's
@@ -1572,9 +1902,7 @@ impl ObscuraJsRuntime {
                             .map(|value| value.trim().to_ascii_lowercase())
                             .as_deref()
                         {
-                            Some("use-credentials") => {
-                                crate::ops::ImageRequestProfile::CorsInclude
-                            }
+                            Some("use-credentials") => crate::ops::ImageRequestProfile::CorsInclude,
                             Some(_) => crate::ops::ImageRequestProfile::CorsSameOrigin,
                             None => crate::ops::ImageRequestProfile::NoCorsInclude,
                         };
@@ -1611,9 +1939,7 @@ impl ObscuraJsRuntime {
     }
 
     #[cfg(feature = "render")]
-    pub(crate) fn render_resource_style_sources_for_state(
-        state: &ObscuraState,
-    ) -> Vec<String> {
+    pub(crate) fn render_resource_style_sources_for_state(state: &ObscuraState) -> Vec<String> {
         let Some(dom) = state.dom.as_ref() else {
             return Vec::new();
         };
@@ -1657,9 +1983,7 @@ impl ObscuraJsRuntime {
     }
 
     #[cfg(feature = "render")]
-    pub(crate) fn shadow_inline_stylesheet_sources_for_state(
-        state: &ObscuraState,
-    ) -> Vec<String> {
+    pub(crate) fn shadow_inline_stylesheet_sources_for_state(state: &ObscuraState) -> Vec<String> {
         let Some(dom) = state.dom.as_ref() else {
             return Vec::new();
         };
@@ -1694,8 +2018,7 @@ impl ObscuraJsRuntime {
         let Some(dom) = state.dom.as_ref() else {
             return Vec::new();
         };
-        let base_url = document_base_url(state)
-            .and_then(|base| url::Url::parse(&base).ok());
+        let base_url = document_base_url(state).and_then(|base| url::Url::parse(&base).ok());
         let mut materialized = std::collections::HashSet::new();
         let nodes = shadow_including_document_descendants(dom);
         for id in &nodes {
@@ -1848,6 +2171,22 @@ impl ObscuraJsRuntime {
         self.v8_to_json(result)
     }
 
+    /// Evaluate a host-owned probe without consulting page-mutable JSON
+    /// methods. Public evaluation retains its compatibility serialization,
+    /// while lifecycle and liveness decisions must be derived from the actual
+    /// V8 value returned by the expression.
+    #[doc(hidden)]
+    pub fn evaluate_host_probe(&mut self, expression: &str) -> Result<serde_json::Value, String> {
+        self.begin_javascript_task();
+        let wrapped = Self::wrap_expression(expression);
+        let result = self
+            .execute_runtime_script("<host-probe>", wrapped)
+            .map_err(|e| format!("JS error: {}", e))?;
+        let scope = &mut self.runtime.handle_scope();
+        let value = deno_core::v8::Local::new(scope, result);
+        deno_core::serde_v8::from_v8(scope, value).map_err(|error| error.to_string())
+    }
+
     #[cfg(test)]
     fn set_test_ops_visible(&mut self, visible: bool) -> Result<(), String> {
         use deno_core::v8;
@@ -1895,11 +2234,7 @@ impl ObscuraJsRuntime {
     }
 
     #[cfg(test)]
-    fn execute_script_with_ops_for_test(
-        &mut self,
-        name: &str,
-        source: &str,
-    ) -> Result<(), String> {
+    fn execute_script_with_ops_for_test(&mut self, name: &str, source: &str) -> Result<(), String> {
         self.set_test_ops_visible(true)?;
         let result = self.execute_script(name, source);
         self.set_test_ops_visible(false)?;
@@ -1909,9 +2244,7 @@ impl ObscuraJsRuntime {
     /// Inline author stylesheets in stable author order. Bridge styles created
     /// for linked, imported, or adopted sheets are excluded because their
     /// network owner is represented elsewhere in the DOM.
-    pub fn inline_stylesheet_sources(
-        &mut self,
-    ) -> Result<Vec<(usize, String, String)>, String> {
+    pub fn inline_stylesheet_sources(&mut self) -> Result<Vec<(usize, String, String)>, String> {
         let value = self.evaluate(
             r#"[...document.querySelectorAll('style')]
                 .filter(node => {
@@ -1944,9 +2277,10 @@ impl ObscuraJsRuntime {
                     href: node.getAttribute('href') || '',
                     disabled: node.hasAttribute('disabled'),
                     loaded: node.sheet != null,
+                    parser_pending: globalThis.__obscura_isParserStylesheetPending?.(node) === true,
                     import_depth: Number(node.getAttribute('data-obscura-import-depth') || 0),
                 }))
-                .filter(sheet => !sheet.disabled && !sheet.loaded && sheet.href)
+                .filter(sheet => !sheet.disabled && !sheet.loaded && !sheet.parser_pending && sheet.href)
                 .map(sheet => [sheet.link_index, sheet.href, sheet.import_depth])"#,
         )?;
         serde_json::from_value(value)
@@ -2364,6 +2698,14 @@ impl ObscuraJsRuntime {
             let code = format!("delete globalThis.__obscura_objects['{}'];", object_id,);
             let _ = self.execute_runtime_script("<release>", code);
         }
+    }
+
+    /// Resolve an opaque CDP object id to the private expression which reads
+    /// it in this runtime. The browser layer uses this to await a function's
+    /// returned Promise while it interleaves native frame attachment between
+    /// JavaScript turns; callers still never expose this expression to CDP.
+    pub fn object_expression_for_cdp(&self, object_id: &str) -> Option<String> {
+        self.object_store.get(object_id).cloned()
     }
 
     pub fn release_object_group(&mut self) {
@@ -2810,6 +3152,15 @@ impl ObscuraJsRuntime {
             .unwrap_or(false)
     }
 
+    /// Whether scripts, observed images, or dynamic stylesheets which joined
+    /// this document's load-event delay set still have completion work.
+    pub fn has_pending_load_delaying_resources(&mut self) -> bool {
+        self.evaluate("globalThis.__obscura_hasPendingLoadDelayingResources?.() === true")
+            .ok()
+            .and_then(|value| value.as_bool())
+            .unwrap_or_else(|| self.has_pending_load_delaying_scripts())
+    }
+
     /// Generation of observable connected-document mutations. This excludes
     /// detached-tree construction and no-op writes, which cannot affect a
     /// screenshot or DOM dump.
@@ -2834,9 +3185,9 @@ impl ObscuraJsRuntime {
 
     fn next_pending_timeout_delay_ms(&mut self) -> Option<f64> {
         self.evaluate("globalThis.__obscura_nextPendingTimeoutDelay?.() ?? -1")
-        .ok()
-        .and_then(|value| value.as_f64())
-        .filter(|delay| *delay >= 0.0)
+            .ok()
+            .and_then(|value| value.as_f64())
+            .filter(|delay| *delay >= 0.0)
     }
 
     /// Arm a hard wall-clock backstop on synchronous V8 work. A page stuck in a
@@ -2897,11 +3248,11 @@ impl ObscuraJsRuntime {
         // per cooperative task. Adding the floor after the observation budget
         // guarantees that even a task beginning just before `deadline` gets
         // the same bounded completion allowance.
-        let synchronous_budget = budget
-            .saturating_add(std::time::Duration::from_millis(SYNCHRONOUS_TASK_FLOOR_MS));
-        let token =
-            self.arm_watchdog(synchronous_budget
-                + std::time::Duration::from_millis(WATCHDOG_SCHEDULING_MARGIN_MS));
+        let synchronous_budget =
+            budget.saturating_add(std::time::Duration::from_millis(SYNCHRONOUS_TASK_FLOOR_MS));
+        let token = self.arm_watchdog(
+            synchronous_budget + std::time::Duration::from_millis(WATCHDOG_SCHEDULING_MARGIN_MS),
+        );
         let result = loop {
             if tokio::time::Instant::now() >= deadline {
                 break Ok(());
@@ -2924,7 +3275,9 @@ impl ObscuraJsRuntime {
         let fired = self.disarm_watchdog(token);
         match result {
             Err(error) if error.contains("heap limit exceeded") => Err(error),
-            Err(error) if fired || error.contains("execution terminated") => Ok(()),
+            Err(error) if fired || error.contains("execution terminated") => Err(format!(
+                "JavaScript task exceeded its execution budget: {error}"
+            )),
             other => other,
         }
     }
@@ -2967,12 +3320,10 @@ impl ObscuraJsRuntime {
                 .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
             match tick {
                 std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(true)),
-                std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
-                    "Event loop error: {error}"
-                ))),
-                std::task::Poll::Pending if waiting_for_wake => {
-                    std::task::Poll::Ready(Ok(false))
+                std::task::Poll::Ready(Err(error)) => {
+                    std::task::Poll::Ready(Err(format!("Event loop error: {error}")))
                 }
+                std::task::Poll::Pending if waiting_for_wake => std::task::Poll::Ready(Ok(false)),
                 std::task::Poll::Pending => {
                     waiting_for_wake = true;
                     std::task::Poll::Pending
@@ -3033,12 +3384,10 @@ impl ObscuraJsRuntime {
             }
             match tick {
                 std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(true)),
-                std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
-                    "Event loop error: {error}"
-                ))),
-                std::task::Poll::Pending if waiting_for_wake => {
-                    std::task::Poll::Ready(Ok(false))
+                std::task::Poll::Ready(Err(error)) => {
+                    std::task::Poll::Ready(Err(format!("Event loop error: {error}")))
                 }
+                std::task::Poll::Pending if waiting_for_wake => std::task::Poll::Ready(Ok(false)),
                 std::task::Poll::Pending => {
                     waiting_for_wake = true;
                     std::task::Poll::Pending
@@ -3092,8 +3441,7 @@ impl ObscuraJsRuntime {
         let activity_tail = std::time::Duration::from_millis(OBSERVABLE_ACTIVITY_TAIL_MS);
         let mut activity_deadline = deadline.min(started + activity_tail);
         let token = self.arm_watchdog(
-            budget
-                .saturating_add(std::time::Duration::from_millis(SYNCHRONOUS_TASK_FLOOR_MS))
+            budget.saturating_add(std::time::Duration::from_millis(SYNCHRONOUS_TASK_FLOOR_MS))
                 + std::time::Duration::from_millis(WATCHDOG_SCHEDULING_MARGIN_MS),
         );
         let mut generation = self.activity_generation();
@@ -3159,14 +3507,12 @@ impl ObscuraJsRuntime {
                     + std::time::Duration::from_millis(SYNCHRONOUS_TASK_FLOOR_MS)
                     + std::time::Duration::from_millis(WATCHDOG_SCHEDULING_MARGIN_MS),
             );
-            let tick = tokio::time::timeout_at(
-                policy_deadline,
-                self.run_cooperative_event_loop_tick(),
-            )
-            .await;
+            let tick =
+                tokio::time::timeout_at(policy_deadline, self.run_cooperative_event_loop_tick())
+                    .await;
             let tick_fired = self.disarm_watchdog(tick_watchdog);
             if tick_fired {
-                break Ok(());
+                break Err("JavaScript task exceeded its execution budget".to_string());
             }
             self.runtime.v8_isolate().perform_microtask_checkpoint();
             match tick {
@@ -3178,7 +3524,9 @@ impl ObscuraJsRuntime {
         let fired = self.disarm_watchdog(token);
         match result {
             Err(error) if error.contains("heap limit exceeded") => Err(error),
-            Err(error) if fired || error.contains("execution terminated") => Ok(()),
+            Err(error) if fired || error.contains("execution terminated") => Err(format!(
+                "JavaScript task exceeded its execution budget: {error}"
+            )),
             other => other,
         }
     }
@@ -3240,11 +3588,7 @@ impl ObscuraJsRuntime {
     /// added ~7s per click because Puppeteer's `isIntersectingViewport`
     /// disconnects its observer in the callback, but our scheduled
     /// re-fires keep the event loop "busy" until they all fire.
-    pub async fn resolve_promises_until<F>(
-        &mut self,
-        mut done_check: F,
-        max_total_ms: u64,
-    ) -> bool
+    pub async fn resolve_promises_until<F>(&mut self, mut done_check: F, max_total_ms: u64) -> bool
     where
         F: FnMut(&mut Self) -> bool,
     {
@@ -3793,8 +4137,107 @@ mod tests {
             "a rejected iframe transport must release its reserved owner id",
         );
         assert!(rt.resource_archive_incomplete_reasons().is_empty());
-        rt.evaluate_with_ops_for_test("globalThis.__obscura_test_ops.op_fetch_url = globalThis.__originalFrameFetchOp")
-            .unwrap();
+        rt.evaluate_with_ops_for_test(
+            "globalThis.__obscura_test_ops.op_fetch_url = globalThis.__originalFrameFetchOp",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cancelled_frame_attachment_restores_only_the_current_document() {
+        let rt = setup_runtime("<html><body></body></html>");
+        let pending = |frame_id, parent_frame_id, html: &str| crate::ops::PendingFrame {
+            frame_id,
+            url: format!("https://example.test/{frame_id}"),
+            inherited_base_url: None,
+            inherited_origin: None,
+            html: html.to_string(),
+            viewport_width: 300,
+            viewport_height: 150,
+            parent_frame_id,
+        };
+        {
+            let mut state = rt.state.borrow_mut();
+            state.pending_frames = vec![
+                pending(1, 0, "parent"),
+                pending(2, 1, "child"),
+                pending(3, 2, "grandchild"),
+            ];
+            state.pending_frame_bytes = state
+                .pending_frames
+                .iter()
+                .map(super::pending_frame_bytes)
+                .sum();
+        }
+
+        let mut drain = rt.take_pending_frame_drain();
+        assert_eq!(rt.pending_frame_document_queue().0, 3);
+        assert_eq!(drain.next().map(|frame| frame.frame_id), Some(1));
+        {
+            let mut state = rt.state.borrow_mut();
+            state.pending_frames.push(pending(4, 1, "late-child"));
+            state.reserved_frame_ids.insert(5, 4);
+            state.pending_frame_bytes = state
+                .pending_frames
+                .iter()
+                .map(super::pending_frame_bytes)
+                .sum();
+        }
+        drop(drain);
+
+        let state = rt.state.borrow();
+        assert_eq!(
+            state
+                .pending_frames
+                .iter()
+                .map(|frame| (frame.frame_id, frame.parent_frame_id))
+                .collect::<Vec<_>>(),
+            vec![(1, 0)],
+        );
+        assert!(state.reserved_frame_ids.is_empty());
+        assert_eq!(state.draining_frame_documents, 0);
+        assert_eq!(state.draining_frame_bytes, 0);
+        assert_eq!(
+            state.pending_frame_bytes,
+            super::pending_frame_bytes(&state.pending_frames[0]),
+        );
+    }
+
+    #[test]
+    fn frame_registry_compatibility_views_cannot_interpose_host_mutation() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                  const original = globalThis.__obscura_frameObjects;
+                  let replaced = false;
+                  let trapped = false;
+                  try { globalThis.__obscura_frameObjects = new Proxy({}, {}); } catch (_) {}
+                  try {
+                    Object.defineProperty(globalThis.__obscura_frameObjects, '1', {
+                      set() { trapped = true; }, configurable: false
+                    });
+                  } catch (_) {}
+                  return {
+                    same: globalThis.__obscura_frameObjects === original,
+                    replaced,
+                    trapped,
+                    publishFixed: Object.getOwnPropertyDescriptor(
+                      globalThis, '__obscura_publishFrameObjects').writable === false,
+                    forgetFixed: Object.getOwnPropertyDescriptor(
+                      globalThis, '__obscura_forgetFrame').configurable === false,
+                  };
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!({
+                "same": true,
+                "replaced": false,
+                "trapped": false,
+                "publishFixed": true,
+                "forgetFixed": true,
+            }),
+        );
     }
 
     #[test]
@@ -3928,10 +4371,8 @@ mod tests {
         // kept those declarations local to the compiled function, so they never
         // reached globalThis.
         let mut rt = setup_runtime("<html><body></body></html>");
-        rt.evaluate(
-            "setTimeout('var __leaked = 42; function __leakedFn(){ return 7; }', 0)",
-        )
-        .unwrap();
+        rt.evaluate("setTimeout('var __leaked = 42; function __leakedFn(){ return 7; }', 0)")
+            .unwrap();
         rt.run_event_loop_bounded(100).await.unwrap();
         let v = rt
             .evaluate(
@@ -4662,7 +5103,9 @@ mod tests {
 
     #[test]
     fn clone_node_deep_copies_children_and_attributes() {
-        let mut rt = setup_runtime(r#"<html><body><ul id="l"><li class="a">one</li><li class="b">two</li></ul></body></html>"#);
+        let mut rt = setup_runtime(
+            r#"<html><body><ul id="l"><li class="a">one</li><li class="b">two</li></ul></body></html>"#,
+        );
         let out = rt
             .evaluate(
                 "(function(){var c=document.getElementById('l').cloneNode(true); return c.children.length + '|' + c.children[0].className + '|' + c.children[1].textContent;})()",
@@ -4688,7 +5131,9 @@ mod tests {
 
     #[test]
     fn clone_node_shallow_copies_attributes_without_children() {
-        let mut rt = setup_runtime(r#"<html><body><div id="d" data-x="7"><span>kid</span></div></body></html>"#);
+        let mut rt = setup_runtime(
+            r#"<html><body><div id="d" data-x="7"><span>kid</span></div></body></html>"#,
+        );
         let out = rt
             .evaluate(
                 "(function(){var c=document.getElementById('d').cloneNode(false); return c.getAttribute('data-x') + '|' + c.childNodes.length;})()",
@@ -4705,7 +5150,10 @@ mod tests {
                 "(function(){var d=document.getElementById('d');d.style.color='red';d.style.fontSize='12px';var c=d.cloneNode(false);return c.style.color+'|'+c.style.fontSize+'|'+c.style.cssText;})()",
             )
             .unwrap();
-        assert_eq!(out, serde_json::json!("red|12px|color: red; font-size: 12px;"));
+        assert_eq!(
+            out,
+            serde_json::json!("red|12px|color: red; font-size: 12px;")
+        );
     }
 
     #[test]
@@ -4732,7 +5180,8 @@ mod tests {
 
     #[test]
     fn insert_adjacent_html_position_is_case_insensitive() {
-        let mut rt = setup_runtime(r#"<html><body><div id="host"><span>base</span></div></body></html>"#);
+        let mut rt =
+            setup_runtime(r#"<html><body><div id="host"><span>base</span></div></body></html>"#);
         let out = rt
             .evaluate("(function(){var h=document.getElementById('host'); h.insertAdjacentHTML('BeforeEnd','<b>x</b>'); return h.lastElementChild ? h.lastElementChild.tagName : 'NULL';})()")
             .unwrap();
@@ -4808,7 +5257,10 @@ mod tests {
         let v = rt
             .evaluate("(function(){var s=document.createElementNS('http://www.w3.org/2000/svg','svg');s.setAttributeNS('http://www.w3.org/1999/xlink','xlink:href','#g');return s.getAttribute('xlink:href')+'|'+s.getAttributeNames()[0]+'|'+s.outerHTML;})()")
             .unwrap();
-        assert_eq!(v, serde_json::json!("#g|xlink:href|<svg xlink:href=\"#g\"></svg>"));
+        assert_eq!(
+            v,
+            serde_json::json!("#g|xlink:href|<svg xlink:href=\"#g\"></svg>")
+        );
     }
 
     #[test]
@@ -4846,9 +5298,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             v,
-            serde_json::json!(
-                "NamespaceError|InvalidCharacterError|NamespaceError|NamespaceError"
-            )
+            serde_json::json!("NamespaceError|InvalidCharacterError|NamespaceError|NamespaceError")
         );
     }
 
@@ -5430,15 +5880,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result,
-            serde_json::json!([
-                true,
-                "{\"ready\":true}",
-                true,
-                2,
-                true,
-                true,
-                "undefined"
-            ])
+            serde_json::json!([true, "{\"ready\":true}", true, 2, true, true, "undefined"])
         );
     }
 
@@ -5506,8 +5948,7 @@ mod tests {
         assert_eq!(
             result,
             serde_json::json!([
-                true, true, true, true, true, true, true, true, true, true, true, true,
-                true
+                true, true, true, true, true, true, true, true, true, true, true, true, true
             ])
         );
     }
@@ -6222,9 +6663,7 @@ mod tests {
         .unwrap();
 
         let started = std::time::Instant::now();
-        rt.run_event_loop_until_quiescent(2_000, 150)
-            .await
-            .unwrap();
+        rt.run_event_loop_until_quiescent(2_000, 150).await.unwrap();
         let elapsed = started.elapsed();
 
         assert!(
@@ -6250,17 +6689,20 @@ mod tests {
         .unwrap();
 
         let started = std::time::Instant::now();
-        rt.run_event_loop_until_quiescent(2_000, 150)
+        let error = rt
+            .run_event_loop_until_quiescent(2_000, 150)
             .await
-            .unwrap();
+            .expect_err("a watchdog-terminated callback must fail the settle operation");
         let elapsed = started.elapsed();
 
         assert!(
+            error.contains("execution budget"),
+            "unexpected watchdog failure: {error}"
+        );
+
+        assert!(
             elapsed >= std::time::Duration::from_millis(SYNCHRONOUS_TASK_FLOOR_MS)
-                && elapsed
-                    < std::time::Duration::from_millis(
-                        SYNCHRONOUS_TASK_FLOOR_MS + 1_500,
-                    ),
+                && elapsed < std::time::Duration::from_millis(SYNCHRONOUS_TASK_FLOOR_MS + 1_500,),
             "one synchronous callback drain escaped the bounded task allowance: {elapsed:?}"
         );
         assert_eq!(
@@ -6271,6 +6713,20 @@ mod tests {
             .unwrap(),
             serde_json::json!("usable"),
             "the per-turn watchdog must leave the isolate reusable",
+        );
+    }
+
+    #[test]
+    fn dropping_a_watchdog_cancels_its_future_termination() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let watchdog = rt.arm_watchdog(std::time::Duration::from_millis(20));
+        drop(watchdog);
+        std::thread::sleep(std::time::Duration::from_millis(40));
+
+        assert_eq!(
+            rt.evaluate("1 + 1").unwrap(),
+            serde_json::json!(2.0),
+            "a cancelled navigation must not leave a detached watchdog that poisons the isolate",
         );
     }
 
@@ -6343,8 +6799,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn quiescent_event_loop_allows_fetch_hydration_within_network_grace() {
-        let (mut rt, accepted) =
-            delayed_fetch_runtime(std::time::Duration::from_millis(700));
+        let (mut rt, accepted) = delayed_fetch_runtime(std::time::Duration::from_millis(700));
         rt.execute_script(
             "quiescent-fetch-hydration",
             "fetch('/hydrate').then(response => response.text()).then(text => {\
@@ -6354,9 +6809,7 @@ mod tests {
         .unwrap();
 
         let started = std::time::Instant::now();
-        rt.run_event_loop_until_quiescent(3_000, 150)
-            .await
-            .unwrap();
+        rt.run_event_loop_until_quiescent(3_000, 150).await.unwrap();
         let elapsed = started.elapsed();
 
         accepted
@@ -6387,9 +6840,7 @@ mod tests {
         .unwrap();
 
         let started = std::time::Instant::now();
-        rt.run_event_loop_until_quiescent(4_000, 150)
-            .await
-            .unwrap();
+        rt.run_event_loop_until_quiescent(4_000, 150).await.unwrap();
         let elapsed = started.elapsed();
 
         accepted
@@ -6420,9 +6871,7 @@ mod tests {
         .unwrap();
 
         let started = std::time::Instant::now();
-        rt.run_event_loop_until_quiescent(4_000, 150)
-            .await
-            .unwrap();
+        rt.run_event_loop_until_quiescent(4_000, 150).await.unwrap();
         let elapsed = started.elapsed();
 
         assert_eq!(
@@ -8688,10 +9137,12 @@ mod tests {
             Some(br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"/>"#.to_vec()),
         );
         let state = rt.state.borrow();
-        let prepared = state.prepared_render.as_ref().expect("retained style graph");
+        let prepared = state
+            .prepared_render
+            .as_ref()
+            .expect("retained style graph");
         assert_eq!(
-            prepared as *const obscura_render::PreparedRender as usize,
-            prepared_address,
+            prepared as *const obscura_render::PreparedRender as usize, prepared_address,
             "resource arrival waits for the next geometry flush"
         );
         assert_eq!(
@@ -8731,8 +9182,8 @@ mod tests {
             state
                 .prepared_render
                 .as_ref()
-                .expect("initial prepared render") as *const obscura_render::PreparedRender
-                as usize
+                .expect("initial prepared render")
+                as *const obscura_render::PreparedRender as usize
         };
 
         // Preserve already queued framework damage and coalesce repeated
@@ -8764,14 +9215,20 @@ mod tests {
                 state
                     .pending_style_mutations
                     .iter()
-                    .filter(|mutation| matches!(mutation, obscura_render::RetainedStyleMutation::Resource))
+                    .filter(|mutation| matches!(
+                        mutation,
+                        obscura_render::RetainedStyleMutation::Resource
+                    ))
                     .count(),
                 1,
             );
-            assert!(state.pending_style_mutations.iter().any(|mutation| matches!(
-                mutation,
-                obscura_render::RetainedStyleMutation::Attribute(_)
-            )));
+            assert!(state
+                .pending_style_mutations
+                .iter()
+                .any(|mutation| matches!(
+                    mutation,
+                    obscura_render::RetainedStyleMutation::Attribute(_)
+                )));
         }
 
         let after = rt
@@ -9259,23 +9716,52 @@ mod tests {
                 __animation.currentTime = 50;
             "#,
         ).unwrap();
-        assert_eq!(rt.evaluate("box.style.opacity").unwrap(), serde_json::json!(".2"));
-        assert_eq!(rt.evaluate("box.getAnimations()[0] === __animation").unwrap(), serde_json::json!(true));
-        assert_eq!(rt.evaluate("document.getAnimations()[0] === __animation").unwrap(), serde_json::json!(true));
-        assert_eq!(rt.evaluate("__animation.playState").unwrap(), serde_json::json!("paused"));
+        assert_eq!(
+            rt.evaluate("box.style.opacity").unwrap(),
+            serde_json::json!(".2")
+        );
+        assert_eq!(
+            rt.evaluate("box.getAnimations()[0] === __animation")
+                .unwrap(),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            rt.evaluate("document.getAnimations()[0] === __animation")
+                .unwrap(),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            rt.evaluate("__animation.playState").unwrap(),
+            serde_json::json!("paused")
+        );
         assert_eq!(
             rt.evaluate("!('easingBezier' in __animation.effect.getTiming()) && !('linearEasing' in __animation.effect.getComputedTiming())").unwrap(),
             serde_json::json!(true),
         );
         let opacity = rt.evaluate("getComputedStyle(box).opacity").unwrap();
         let opacity = opacity.as_str().unwrap().parse::<f32>().unwrap();
-        assert!((opacity - 0.6).abs() < 0.001, "midpoint opacity was {opacity}");
+        assert!(
+            (opacity - 0.6).abs() < 0.001,
+            "midpoint opacity was {opacity}"
+        );
 
         rt.execute_script("cancel", "__animation.cancel()").unwrap();
-        assert_eq!(rt.evaluate("box.style.opacity").unwrap(), serde_json::json!(".2"));
-        assert_eq!(rt.evaluate("getComputedStyle(box).opacity").unwrap(), serde_json::json!("0.2"));
-        assert_eq!(rt.evaluate("box.getAnimations().length").unwrap(), serde_json::json!(0.0));
-        assert_eq!(rt.evaluate("document.getAnimations().length").unwrap(), serde_json::json!(0.0));
+        assert_eq!(
+            rt.evaluate("box.style.opacity").unwrap(),
+            serde_json::json!(".2")
+        );
+        assert_eq!(
+            rt.evaluate("getComputedStyle(box).opacity").unwrap(),
+            serde_json::json!("0.2")
+        );
+        assert_eq!(
+            rt.evaluate("box.getAnimations().length").unwrap(),
+            serde_json::json!(0.0)
+        );
+        assert_eq!(
+            rt.evaluate("document.getAnimations().length").unwrap(),
+            serde_json::json!(0.0)
+        );
     }
 
     #[cfg(feature = "render")]
@@ -9298,9 +9784,18 @@ mod tests {
         rt.run_event_loop_bounded(20).await.unwrap();
         assert_eq!(rt.evaluate("__ready").unwrap(), serde_json::json!(true));
         assert_eq!(rt.evaluate("__finished").unwrap(), serde_json::json!(true));
-        assert_eq!(rt.evaluate("__finishEvent").unwrap(), serde_json::json!(true));
-        assert_eq!(rt.evaluate("__animation.playState").unwrap(), serde_json::json!("finished"));
-        assert_eq!(rt.evaluate("getComputedStyle(box).opacity").unwrap(), serde_json::json!("1"));
+        assert_eq!(
+            rt.evaluate("__finishEvent").unwrap(),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            rt.evaluate("__animation.playState").unwrap(),
+            serde_json::json!("finished")
+        );
+        assert_eq!(
+            rt.evaluate("getComputedStyle(box).opacity").unwrap(),
+            serde_json::json!("1")
+        );
     }
 
     #[cfg(feature = "render")]
@@ -9345,9 +9840,11 @@ mod tests {
         rt.set_viewport(80.0, 60.0);
         rt.run_page_init();
 
-        assert!(rt.set_animation_sample_time(obscura_render::AnimationSampleTime {
-            milliseconds: 100.0,
-        }));
+        assert!(
+            rt.set_animation_sample_time(obscura_render::AnimationSampleTime {
+                milliseconds: 100.0,
+            })
+        );
         let first = rt
             .screenshot_prepared((80.0, 60.0), Some("http://example.test/page"))
             .expect("first static frame");
@@ -9356,9 +9853,11 @@ mod tests {
             state.prepared_render.as_ref().unwrap() as *const _ as usize
         };
 
-        assert!(rt.set_animation_sample_time(obscura_render::AnimationSampleTime {
-            milliseconds: 250.0,
-        }));
+        assert!(
+            rt.set_animation_sample_time(obscura_render::AnimationSampleTime {
+                milliseconds: 250.0,
+            })
+        );
         let second = rt
             .screenshot_prepared((80.0, 60.0), Some("http://example.test/page"))
             .expect("second static frame");
@@ -9453,9 +9952,7 @@ mod tests {
             );
             assert_eq!(
                 state.pending_style_mutations,
-                vec![obscura_render::RetainedStyleMutation::WaapiAnimation {
-                    node: box_node
-                }]
+                vec![obscura_render::RetainedStyleMutation::WaapiAnimation { node: box_node }]
             );
         }
         let initial = rt
@@ -9507,7 +10004,10 @@ mod tests {
             .unwrap()
             .as_f64()
             .unwrap();
-        assert!(animated_opacity > 0.9, "animated opacity={animated_opacity}");
+        assert!(
+            animated_opacity > 0.9,
+            "animated opacity={animated_opacity}"
+        );
 
         rt.evaluate("__cancelAnimation.cancel()").unwrap();
         assert!(
@@ -9536,9 +10036,11 @@ mod tests {
         rt.set_viewport(80.0, 60.0);
         rt.run_page_init();
 
-        assert!(rt.set_animation_sample_time(obscura_render::AnimationSampleTime {
-            milliseconds: 150.0,
-        }));
+        assert!(
+            rt.set_animation_sample_time(obscura_render::AnimationSampleTime {
+                milliseconds: 150.0,
+            })
+        );
         let completed = rt
             .screenshot_prepared((80.0, 60.0), Some("http://example.test/page"))
             .expect("completed animation frame");
@@ -9548,26 +10050,24 @@ mod tests {
             state.prepared_render.as_ref().unwrap() as *const _ as usize
         };
 
-        assert!(rt.set_animation_sample_time(obscura_render::AnimationSampleTime {
-            milliseconds: 300.0,
-        }));
+        assert!(
+            rt.set_animation_sample_time(obscura_render::AnimationSampleTime {
+                milliseconds: 300.0,
+            })
+        );
         let later = rt
             .screenshot_prepared((80.0, 60.0), Some("http://example.test/page"))
             .expect("later completed frame");
         assert_eq!(completed, later);
         assert_eq!(
-            rt.state
-                .borrow()
-                .prepared_render
-                .as_ref()
-                .unwrap() as *const _ as usize,
+            rt.state.borrow().prepared_render.as_ref().unwrap() as *const _ as usize,
             prepared_address,
             "a finite fill-forwards animation must not relayout after completion"
         );
 
-        assert!(rt.set_animation_sample_time(obscura_render::AnimationSampleTime {
-            milliseconds: 0.0,
-        }));
+        assert!(
+            rt.set_animation_sample_time(obscura_render::AnimationSampleTime { milliseconds: 0.0 })
+        );
         assert!(
             rt.state.borrow().prepared_render.is_none(),
             "backward timeline seeks must invalidate the completed frame"
@@ -9610,9 +10110,11 @@ mod tests {
             let state = rt.state.borrow();
             state.prepared_render.as_ref().unwrap() as *const _ as usize
         };
-        assert!(rt.set_animation_sample_time(obscura_render::AnimationSampleTime {
-            milliseconds: 5_000.0,
-        }));
+        assert!(
+            rt.set_animation_sample_time(obscura_render::AnimationSampleTime {
+                milliseconds: 5_000.0,
+            })
+        );
         let later = rt
             .screenshot_prepared((80.0, 60.0), Some("http://example.test/page"))
             .expect("later frame");
@@ -9662,13 +10164,18 @@ mod tests {
 
         rt.state.borrow_mut().animation_timeline_origin =
             std::time::Instant::now() - std::time::Duration::from_millis(1_000);
-        rt.evaluate("var box=document.getElementById('box');box.remove();document.body.appendChild(box)")
-            .unwrap();
+        rt.evaluate(
+            "var box=document.getElementById('box');box.remove();document.body.appendChild(box)",
+        )
+        .unwrap();
         assert!(rt.set_animation_sample(obscura_render::AnimationSample::document(1_100.0)));
         rt.screenshot_prepared((200.0, 80.0), Some("http://example.test/page"))
             .unwrap();
         let restarted = animation_test_width(&rt, "box");
-        assert!((5.0..20.0).contains(&restarted), "restarted width={restarted}");
+        assert!(
+            (5.0..20.0).contains(&restarted),
+            "restarted width={restarted}"
+        );
     }
 
     #[cfg(feature = "render")]
@@ -9784,7 +10291,10 @@ mod tests {
         let direct_rt = make_runtime();
         assert!(direct_rt.set_animation_sample(fixed));
         let direct = direct_rt
-            .screenshot_prepared((160.0, 100.0), Some("http://example.test/github-like-shell"))
+            .screenshot_prepared(
+                (160.0, 100.0),
+                Some("http://example.test/github-like-shell"),
+            )
             .expect("direct fixed-time capture");
 
         let mut geometry_rt = make_runtime();
@@ -9794,7 +10304,10 @@ mod tests {
         assert_eq!(rect["width"].as_f64(), Some(120.0));
         assert!(geometry_rt.set_animation_sample(fixed));
         let after_geometry = geometry_rt
-            .screenshot_prepared((160.0, 100.0), Some("http://example.test/github-like-shell"))
+            .screenshot_prepared(
+                (160.0, 100.0),
+                Some("http://example.test/github-like-shell"),
+            )
             .expect("fixed-time capture after geometry");
 
         assert_eq!(
@@ -9925,10 +10438,8 @@ mod tests {
         );
         assert!(rt.state.borrow().prepared_render.is_some());
 
-        rt.evaluate(
-            "document.getElementById('box').setAttributeNS(null, 'class', 'box')",
-        )
-        .unwrap();
+        rt.evaluate("document.getElementById('box').setAttributeNS(null, 'class', 'box')")
+            .unwrap();
         assert!(
             rt.state.borrow().prepared_render.is_some(),
             "an identical null-namespace attribute must retain layout"
@@ -10323,10 +10834,8 @@ mod tests {
             .unwrap();
         rt.run_event_loop_bounded(40).await.unwrap();
         assert_eq!(
-            rt.evaluate(
-                "__resizeRecords.map(record => [record.content[0], record.border[0]])"
-            )
-            .unwrap(),
+            rt.evaluate("__resizeRecords.map(record => [record.content[0], record.border[0]])")
+                .unwrap(),
             serde_json::json!([[102, 120], [122, 140]])
         );
         assert_eq!(
@@ -10650,7 +11159,8 @@ mod tests {
             .unwrap();
         rt.run_event_loop_bounded(40).await.unwrap();
         assert_eq!(
-            rt.evaluate("[__resizeCallbacks, __resizeLoopErrors]").unwrap(),
+            rt.evaluate("[__resizeCallbacks, __resizeLoopErrors]")
+                .unwrap(),
             serde_json::json!([2, 2])
         );
     }
@@ -10836,11 +11346,7 @@ mod tests {
         rt.run_event_loop_bounded(100).await.unwrap();
         assert_eq!(
             rt.evaluate("__intersectionDeliveryOrder").unwrap(),
-            serde_json::json!([
-                "first-observer",
-                "second-observer",
-                "callback-posted-task",
-            ])
+            serde_json::json!(["first-observer", "second-observer", "callback-posted-task",])
         );
     }
 
@@ -10965,10 +11471,7 @@ mod tests {
         // clips it. Programmatic scrolling then reveals the complete box.
         assert_eq!(
             result.value.unwrap(),
-            serde_json::json!([
-                [false, 0, [0, 0, 0, 0]],
-                [true, 1, [10, 100, 100, 20]],
-            ])
+            serde_json::json!([[false, 0, [0, 0, 0, 0]], [true, 1, [10, 100, 100, 20]],])
         );
     }
 
@@ -11840,8 +12343,16 @@ mod tests {
             result,
             serde_json::json!([
                 [true, 0, true, true, 1, 2],
-                ["\"a;b\"", "url(\"data:image/svg+xml;utf8,<svg/>\")"], true,
-                73, 91, "91px", 11, 64, 2, "#box", true
+                ["\"a;b\"", "url(\"data:image/svg+xml;utf8,<svg/>\")"],
+                true,
+                73,
+                91,
+                "91px",
+                11,
+                64,
+                2,
+                "#box",
+                true
             ])
         );
     }
@@ -11881,8 +12392,15 @@ mod tests {
         assert_eq!(
             result,
             serde_json::json!([
-                1, 1, true,
-                ["\"a;b\"", "url(\"data:image/svg+xml;utf8,<svg/>\")", true, true],
+                1,
+                1,
+                true,
+                [
+                    "\"a;b\"",
+                    "url(\"data:image/svg+xml;utf8,<svg/>\")",
+                    true,
+                    true
+                ],
                 ""
             ])
         );
@@ -12210,7 +12728,10 @@ mod tests {
             green_half.alpha()
         );
         let clipped = pixmap.pixel(23, 8).expect("outside overflow clip");
-        assert_eq!((clipped.red(), clipped.green(), clipped.blue()), (0, 0, 255));
+        assert_eq!(
+            (clipped.red(), clipped.green(), clipped.blue()),
+            (0, 0, 255)
+        );
         let blank = pixmap.pixel(34, 8).expect("transparent blank canvas");
         assert_eq!((blank.red(), blank.green(), blank.blue()), (0, 0, 255));
         let overlay = pixmap.pixel(11, 8).expect("higher z-index overlay");
@@ -12225,12 +12746,9 @@ mod tests {
         );
         let padded_content = pixmap.pixel(36, 23).expect("padded canvas content pixel");
         assert!(
-            padded_content.red() > 220
-                && padded_content.green() < 40
-                && padded_content.blue() < 40,
+            padded_content.red() > 220 && padded_content.green() < 40 && padded_content.blue() < 40,
             "canvas bitmap must start at the CSS content-box origin"
         );
-
     }
 
     #[test]
@@ -12795,7 +13313,9 @@ mod tests {
 
         let base = format!("http://{address}");
         let mut rt = ObscuraJsRuntime::new();
-        rt.set_dom(parse_html(&format!(r#"<img id="image" src="{base}/plain.png">"#)));
+        rt.set_dom(parse_html(&format!(
+            r#"<img id="image" src="{base}/plain.png">"#
+        )));
         // Deliberately make the image cross-origin from the document.
         rt.set_url("http://127.0.0.1:1/page.html");
         rt.set_http_client(std::sync::Arc::new(
@@ -12824,8 +13344,11 @@ mod tests {
             serde_json::json!([true, 2, ["load"]])
         );
 
-        rt.execute_script("require-anonymous-cors", r#"image.crossOrigin = "anonymous";"#)
-            .unwrap();
+        rt.execute_script(
+            "require-anonymous-cors",
+            r#"image.crossOrigin = "anonymous";"#,
+        )
+        .unwrap();
         rt.run_event_loop_bounded(100).await.unwrap();
         assert_eq!(
             rt.evaluate("[image.complete, image.naturalWidth, __profileEvents]")
@@ -13168,20 +13691,16 @@ mod tests {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let loader_calls = calls.clone();
         let png = two_by_three_png();
-        let mut rt = parser_image_runtime(
-            r#"<img id="late" src="late.png">"#,
-            move |_url: &str| {
+        let mut rt =
+            parser_image_runtime(r#"<img id="late" src="late.png">"#, move |_url: &str| {
                 loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Some(png.clone())
-            },
-        );
+            });
         {
             let mut state = rt.state.borrow_mut();
             let previous = state.render_resources.set_sync_loading_enabled(false);
             assert!(ensure_prepared_render(&mut state).is_some());
-            state
-                .render_resources
-                .set_sync_loading_enabled(previous);
+            state.render_resources.set_sync_loading_enabled(previous);
             assert!(state.prepared_render.is_some());
         }
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -13197,10 +13716,8 @@ mod tests {
         .unwrap();
         rt.run_event_loop_bounded(100).await.unwrap();
         assert_eq!(
-            rt.evaluate(
-                "[late.complete, late.naturalWidth, late.naturalHeight, __lateEvents]"
-            )
-            .unwrap(),
+            rt.evaluate("[late.complete, late.naturalWidth, late.naturalHeight, __lateEvents]")
+                .unwrap(),
             serde_json::json!([true, 2, 3, ["load"]])
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -13220,11 +13737,8 @@ mod tests {
             assert!(ensure_prepared_render(&mut state).is_some());
             assert!(state.prepared_render.is_some());
         }
-        rt.execute_script(
-            "reload-retained-image",
-            r#"late.src = "late.png";"#,
-        )
-        .unwrap();
+        rt.execute_script("reload-retained-image", r#"late.src = "late.png";"#)
+            .unwrap();
         rt.run_event_loop_bounded(100).await.unwrap();
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(rt.state.borrow().prepared_render.is_some());
@@ -13242,9 +13756,7 @@ mod tests {
             let mut state = missing.state.borrow_mut();
             let previous = state.render_resources.set_sync_loading_enabled(false);
             assert!(ensure_prepared_render(&mut state).is_some());
-            state
-                .render_resources
-                .set_sync_loading_enabled(previous);
+            state.render_resources.set_sync_loading_enabled(previous);
             assert!(state.prepared_render.is_some());
         }
         missing
@@ -13266,10 +13778,7 @@ mod tests {
                 .unwrap(),
             serde_json::json!([true, 0, 0, ["error"]])
         );
-        assert_eq!(
-            missing_calls.load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
+        assert_eq!(missing_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(missing.state.borrow().prepared_render.is_some());
     }
 
@@ -13310,10 +13819,8 @@ mod tests {
         .unwrap();
         rt.run_event_loop_bounded(100).await.unwrap();
         assert_eq!(
-            rt.evaluate(
-                "[__stableGetterResizeRecords, __obscura_nextPendingTimeoutDelay()]"
-            )
-            .unwrap(),
+            rt.evaluate("[__stableGetterResizeRecords, __obscura_nextPendingTimeoutDelay()]")
+                .unwrap(),
             serde_json::json!([1, -1])
         );
 
@@ -13332,10 +13839,8 @@ mod tests {
         // Cached lifecycle reads do not change intrinsic dimensions, so they
         // must not enqueue a rendering checkpoint (and its geometry walk).
         assert_eq!(
-            rt.evaluate(
-                "[__stableGetterResizeRecords, __obscura_nextPendingTimeoutDelay()]"
-            )
-            .unwrap(),
+            rt.evaluate("[__stableGetterResizeRecords, __obscura_nextPendingTimeoutDelay()]")
+                .unwrap(),
             serde_json::json!([1, -1])
         );
     }
@@ -15128,6 +15633,492 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ua_lifecycle_events_use_captured_dispatch_and_trusted_state() {
+        let mut rt = setup_runtime(
+            r#"<html><head>
+                <script id="parser-script"></script>
+                <link id="parser-sheet" rel="stylesheet" href="/trusted.css">
+            </head><body></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const script = document.getElementById("parser-script");
+                    const sheet = document.getElementById("parser-sheet");
+                    const frame = document.createElement("iframe");
+                    document.body.appendChild(frame);
+                    frame.setAttribute("srcdoc", "<!doctype html><p>child</p>");
+                    const frameId = frame._frameId || 0;
+                    const observed = {};
+                    const record = (name, owner) => event => {
+                        observed[name] = {
+                            trusted: event.isTrusted,
+                            target: event.target === owner,
+                            currentTarget: event.currentTarget === owner,
+                            bubbles: event.bubbles,
+                            cancelable: event.cancelable,
+                        };
+                    };
+                    script.addEventListener("load", record("script", script));
+                    sheet.addEventListener("load", record("sheet", sheet));
+                    frame.addEventListener("load", record("frame", frame));
+                    window.addEventListener("load", event => {
+                        observed.window = {
+                            trusted: event.isTrusted,
+                            target: event.target === document,
+                            currentTarget: event.currentTarget === window,
+                            bubbles: event.bubbles,
+                            cancelable: event.cancelable,
+                        };
+                    });
+                    observed.documentLifecycle = [];
+                    const recordDocumentLifecycle = label => event => {
+                        observed.documentLifecycle.push({
+                            label,
+                            type: event.type,
+                            trusted: event.isTrusted,
+                            targetIsDocument: event.target === document,
+                            currentTargetIsDocument: event.currentTarget === document,
+                            currentTargetIsWindow: event.currentTarget === window,
+                            phase: event.eventPhase,
+                            bubbles: event.bubbles,
+                            cancelable: event.cancelable,
+                        });
+                    };
+                    window.addEventListener(
+                        "readystatechange", recordDocumentLifecycle("ready-window-capture"), true);
+                    document.addEventListener(
+                        "readystatechange", recordDocumentLifecycle("ready-document"));
+                    window.addEventListener(
+                        "DOMContentLoaded", recordDocumentLifecycle("dcl-window-capture"), true);
+                    document.addEventListener(
+                        "DOMContentLoaded", recordDocumentLifecycle("dcl-document"));
+                    window.addEventListener(
+                        "DOMContentLoaded", recordDocumentLifecycle("dcl-window-bubble"));
+
+                    const originalEvent = globalThis.Event;
+                    const originalElementDispatch = Element.prototype.dispatchEvent;
+                    const originalDocumentDispatch = Document.prototype.dispatchEvent;
+                    const originalWindowDispatch = globalThis.dispatchEvent;
+                    const originalMarkTrusted = globalThis.__obscura_markTrusted;
+                    try {
+                        globalThis.Event = function InterposedEvent() {
+                            throw new Error("page Event constructor ran");
+                        };
+                        Element.prototype.dispatchEvent = function() {
+                            throw new Error("page Element.dispatchEvent ran");
+                        };
+                        Document.prototype.dispatchEvent = function() {
+                            throw new Error("page Document.dispatchEvent ran");
+                        };
+                        document.dispatchEvent = Document.prototype.dispatchEvent;
+                        globalThis.dispatchEvent = function() {
+                            throw new Error("page Window.dispatchEvent ran");
+                        };
+                        globalThis.__obscura_markTrusted = function() {
+                            throw new Error("page trust helper ran");
+                        };
+                        script.dispatchEvent = Element.prototype.dispatchEvent;
+                        sheet.dispatchEvent = Element.prototype.dispatchEvent;
+                        frame.dispatchEvent = Element.prototype.dispatchEvent;
+
+                        observed.results = {
+                            readystatechange:
+                                globalThis.__obscura_dispatchDocumentLifecycleEvent(
+                                    "readystatechange"),
+                            domContentLoaded:
+                                globalThis.__obscura_dispatchDocumentLifecycleEvent(
+                                    "DOMContentLoaded"),
+                            script: globalThis.__obscura_dispatchParserScriptEvent(
+                                script._nid, "load"),
+                            sheet: globalThis.__obscura_completeLinkedStylesheet(
+                                sheet, "load", "http://example.com/trusted.css"),
+                            window: globalThis.__obscura_dispatchWindowLoad(),
+                            frameFirst: frameId
+                                ? globalThis.__obscura_dispatchFrameOwnerLoad(frameId)
+                                : false,
+                            frameSecond: frameId
+                                ? globalThis.__obscura_dispatchFrameOwnerLoad(frameId)
+                                : false,
+                        };
+                    } finally {
+                        globalThis.Event = originalEvent;
+                        Element.prototype.dispatchEvent = originalElementDispatch;
+                        Document.prototype.dispatchEvent = originalDocumentDispatch;
+                        delete document.dispatchEvent;
+                        globalThis.dispatchEvent = originalWindowDispatch;
+                        globalThis.__obscura_markTrusted = originalMarkTrusted;
+                    }
+
+                    const fixed = [
+                        "__obscura_dispatchParserScriptEvent",
+                        "__obscura_completeLinkedStylesheet",
+                        "__obscura_dispatchDocumentLifecycleEvent",
+                        "__obscura_dispatchWindowLoad",
+                        "__obscura_dispatchFrameOwnerLoad",
+                    ].every(name => {
+                        const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
+                        return descriptor
+                            && descriptor.writable === false
+                            && descriptor.configurable === false;
+                    });
+                    return { observed, fixed, frameId };
+                })()"#,
+            )
+            .unwrap();
+
+        assert_eq!(result["fixed"], serde_json::json!(true));
+        assert!(result["frameId"].as_u64().unwrap_or(0) > 0, "{result:#?}");
+        assert_eq!(
+            result["observed"]["results"],
+            serde_json::json!({
+                "readystatechange": true,
+                "domContentLoaded": true,
+                "script": true,
+                "sheet": true,
+                "window": true,
+                "frameFirst": true,
+                "frameSecond": false,
+            }),
+        );
+        for owner in ["script", "sheet", "frame", "window"] {
+            let event = &result["observed"][owner];
+            assert_eq!(event["trusted"], true, "{owner}: {result:#?}");
+            assert_eq!(event["target"], true, "{owner}: {result:#?}");
+            assert_eq!(event["currentTarget"], true, "{owner}: {result:#?}");
+            assert_eq!(event["bubbles"], false, "{owner}: {result:#?}");
+            assert_eq!(event["cancelable"], false, "{owner}: {result:#?}");
+        }
+        assert_eq!(
+            result["observed"]["documentLifecycle"],
+            serde_json::json!([
+                {
+                    "label": "ready-window-capture",
+                    "type": "readystatechange",
+                    "trusted": true,
+                    "targetIsDocument": true,
+                    "currentTargetIsDocument": false,
+                    "currentTargetIsWindow": true,
+                    "phase": 1,
+                    "bubbles": false,
+                    "cancelable": false,
+                },
+                {
+                    "label": "ready-document",
+                    "type": "readystatechange",
+                    "trusted": true,
+                    "targetIsDocument": true,
+                    "currentTargetIsDocument": true,
+                    "currentTargetIsWindow": false,
+                    "phase": 2,
+                    "bubbles": false,
+                    "cancelable": false,
+                },
+                {
+                    "label": "dcl-window-capture",
+                    "type": "DOMContentLoaded",
+                    "trusted": true,
+                    "targetIsDocument": true,
+                    "currentTargetIsDocument": false,
+                    "currentTargetIsWindow": true,
+                    "phase": 1,
+                    "bubbles": true,
+                    "cancelable": false,
+                },
+                {
+                    "label": "dcl-document",
+                    "type": "DOMContentLoaded",
+                    "trusted": true,
+                    "targetIsDocument": true,
+                    "currentTargetIsDocument": true,
+                    "currentTargetIsWindow": false,
+                    "phase": 2,
+                    "bubbles": true,
+                    "cancelable": false,
+                },
+                {
+                    "label": "dcl-window-bubble",
+                    "type": "DOMContentLoaded",
+                    "trusted": true,
+                    "targetIsDocument": true,
+                    "currentTargetIsDocument": false,
+                    "currentTargetIsWindow": true,
+                    "phase": 3,
+                    "bubbles": true,
+                    "cancelable": false,
+                },
+            ]),
+        );
+    }
+
+    #[test]
+    fn document_redispatch_resets_stop_flags() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const log = [];
+                    const event = new Event("reused", { bubbles: true });
+                    window.addEventListener("reused", () => log.push("window-capture"), true);
+                    window.addEventListener("reused", () => log.push("window-bubble"));
+                    document.addEventListener("reused", event => {
+                        log.push("stop");
+                        event.stopImmediatePropagation();
+                    }, { once: true });
+                    document.addEventListener("reused", () => log.push("document-second"));
+                    document.dispatchEvent(event);
+                    const afterFirst = [event.currentTarget === null, event.eventPhase];
+                    document.dispatchEvent(event);
+                    return {
+                        log,
+                        afterFirst,
+                        afterSecond: [
+                            event.currentTarget === null,
+                            event.eventPhase,
+                            event._propagationStopped,
+                            event._immediatePropagationStopped,
+                        ],
+                    };
+                })()"#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "log": [
+                    "window-capture",
+                    "stop",
+                    "window-capture",
+                    "document-second",
+                    "window-bubble",
+                ],
+                "afterFirst": [true, 0],
+                "afterSecond": [true, 0, false, false],
+            }),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn namespace_and_disabled_link_mutations_drive_stylesheet_loading() {
+        let mut rt = setup_runtime(
+            r#"<html><head>
+                <link id="initially-disabled" rel="stylesheet"
+                      href="/disabled.css" disabled>
+            </head><body></body></html>"#,
+        );
+        rt.set_test_ops_visible(true).unwrap();
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = globalThis.__obscura_test_ops.op_fetch_url;
+                    const calls = [];
+                    try {
+                        globalThis.__obscura_test_ops.op_fetch_url = url => {
+                            calls.push(url);
+                            return JSON.stringify({
+                                status: 200,
+                                headers: { "content-type": "text/css" },
+                                body: `.probe { color: ${calls.length === 1 ? "red" : "blue"} }`,
+                                url,
+                            });
+                        };
+                        const onceLoad = link => new Promise(resolve => {
+                            link.addEventListener("load", resolve, { once: true });
+                        });
+
+                        const namespaced = document.createElement("link");
+                        document.head.appendChild(namespaced);
+                        namespaced.setAttributeNS(null, "rel", "stylesheet");
+                        let loaded = onceLoad(namespaced);
+                        namespaced.setAttributeNS(null, "href", "/ns-first.css");
+                        const firstEvent = await loaded;
+                        const firstInstalled = namespaced.sheet !== null
+                            && !!document.querySelector(
+                                'style[data-obscura-linked="http://example.com/ns-first.css"]');
+
+                        namespaced.removeAttributeNS(null, "href");
+                        const firstRemoved = !document.querySelector(
+                            'style[data-obscura-linked="http://example.com/ns-first.css"]');
+                        loaded = onceLoad(namespaced);
+                        namespaced.setAttributeNS(null, "href", "/ns-second.css");
+                        const secondEvent = await loaded;
+                        namespaced.removeAttributeNS(null, "rel");
+                        const secondRemoved = !document.querySelector(
+                            'style[data-obscura-linked="http://example.com/ns-second.css"]');
+
+                        const disabled = document.getElementById("initially-disabled");
+                        let disabledLoads = 0;
+                        disabled.addEventListener("load", () => { disabledLoads++; });
+                        loaded = onceLoad(disabled);
+                        disabled.removeAttributeNS(null, "disabled");
+                        const disabledEvent = await loaded;
+                        const enabledInstalled = disabled.sheet !== null;
+                        disabled.setAttributeNS(null, "disabled", "");
+                        const disabledRemoved = !document.querySelector(
+                            'style[data-obscura-linked="http://example.com/disabled.css"]');
+                        disabled.removeAttributeNS(null, "disabled");
+                        await Promise.resolve();
+                        const reenabledWithoutRefetch = disabled.sheet !== null
+                            && disabledLoads === 1
+                            && calls.filter(url => url.endsWith("/disabled.css")).length === 1;
+
+                        return {
+                            calls,
+                            trusted: [firstEvent, secondEvent, disabledEvent]
+                                .every(event => event.isTrusted),
+                            firstInstalled,
+                            firstRemoved,
+                            secondRemoved,
+                            enabledInstalled,
+                            disabledRemoved,
+                            reenabledWithoutRefetch,
+                        };
+                    } finally {
+                        globalThis.__obscura_test_ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        rt.set_test_ops_visible(false).unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "calls": [
+                    "http://example.com/ns-first.css",
+                    "http://example.com/ns-second.css",
+                    "http://example.com/disabled.css",
+                ],
+                "trusted": true,
+                "firstInstalled": true,
+                "firstRemoved": true,
+                "secondRemoved": true,
+                "enabledInstalled": true,
+                "disabledRemoved": true,
+                "reenabledWithoutRefetch": true,
+            }),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn in_flight_link_removal_and_same_url_reset_starts_a_fresh_request() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        rt.set_test_ops_visible(true).unwrap();
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = globalThis.__obscura_test_ops.op_fetch_url;
+                    const requests = [];
+                    try {
+                        globalThis.__obscura_test_ops.op_fetch_url = url =>
+                            new Promise(resolve => requests.push({ url, resolve }));
+
+                        const settleOldThenNew = async (link, invalidate, restore) => {
+                            let loadCalls = 0;
+                            link.addEventListener("load", () => { loadCalls++; });
+                            const loaded = new Promise(resolve => {
+                                link.addEventListener("load", resolve, { once: true });
+                            });
+                            const firstIndex = requests.length;
+                            document.head.appendChild(link);
+                            invalidate(link);
+                            restore(link);
+                            const restarted = requests.length === firstIndex + 2;
+
+                            requests[firstIndex].resolve(JSON.stringify({
+                                status: 200,
+                                headers: { "content-type": "text/css" },
+                                body: ".probe { color: old-response; }",
+                                url: requests[firstIndex].url,
+                            }));
+                            await new Promise(resolve => setTimeout(resolve, 0));
+                            const oldIgnored = loadCalls === 0
+                                && !Array.from(document.querySelectorAll(
+                                    "style[data-obscura-linked]"))
+                                    .some(style => style.textContent.includes("old-response"));
+
+                            requests[firstIndex + 1].resolve(JSON.stringify({
+                                status: 200,
+                                headers: { "content-type": "text/css" },
+                                body: ".probe { color: fresh-response; }",
+                                url: requests[firstIndex + 1].url,
+                            }));
+                            const event = await loaded;
+                            const freshWon = loadCalls === 1
+                                && event.isTrusted
+                                && Array.from(document.querySelectorAll(
+                                    "style[data-obscura-linked]"))
+                                    .some(style => style.textContent.includes("fresh-response"));
+                            link.remove();
+                            return { restarted, oldIgnored, freshWon };
+                        };
+
+                        const hrefLink = document.createElement("link");
+                        hrefLink.rel = "stylesheet";
+                        hrefLink.setAttributeNS(null, "href", "/same-href.css");
+                        const href = await settleOldThenNew(
+                            hrefLink,
+                            link => link.removeAttributeNS(null, "href"),
+                            link => link.setAttributeNS(null, "href", "/same-href.css"),
+                        );
+
+                        const relLink = document.createElement("link");
+                        relLink.rel = "stylesheet";
+                        relLink.href = "/same-rel.css";
+                        const rel = await settleOldThenNew(
+                            relLink,
+                            link => link.removeAttribute("rel"),
+                            link => link.setAttribute("rel", "stylesheet"),
+                        );
+
+                        return {
+                            requestUrls: requests.map(request => request.url),
+                            href,
+                            rel,
+                        };
+                    } finally {
+                        globalThis.__obscura_test_ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        rt.set_test_ops_visible(false).unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "requestUrls": [
+                    "http://example.com/same-href.css",
+                    "http://example.com/same-href.css",
+                    "http://example.com/same-rel.css",
+                    "http://example.com/same-rel.css",
+                ],
+                "href": {
+                    "restarted": true,
+                    "oldIgnored": true,
+                    "freshWon": true,
+                },
+                "rel": {
+                    "restarted": true,
+                    "oldIgnored": true,
+                    "freshWon": true,
+                },
+            }),
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn unsuccessful_dynamic_script_response_fires_error_without_evaluating_body() {
         let mut rt = setup_runtime("<html><head></head><body></body></html>");
@@ -15740,9 +16731,7 @@ mod tests {
                     .and_then(|line| line.split_ascii_whitespace().nth(1))
                     .unwrap_or("/");
                 let body = match path {
-                    "/entry.js" => {
-                        "import './shared.js'; globalThis.__module_entry_ran = true;"
-                    }
+                    "/entry.js" => "import './shared.js'; globalThis.__module_entry_ran = true;",
                     "/shared.js" => {
                         "globalThis.__shared_module_runs = \
                          (globalThis.__shared_module_runs || 0) + 1;"
@@ -15961,7 +16950,8 @@ mod tests {
         rt.evaluate_prepared_module(shared, 1_000).await.unwrap();
 
         assert_eq!(
-            rt.evaluate("globalThis.__module_entry_ran === true").unwrap(),
+            rt.evaluate("globalThis.__module_entry_ran === true")
+                .unwrap(),
             serde_json::json!(true),
         );
         assert_eq!(
@@ -15987,7 +16977,8 @@ mod tests {
                 "unexpected heap failure: {error}",
             );
             assert_eq!(
-                rt.evaluate("globalThis.__runtime_survived_oom = true").unwrap(),
+                rt.evaluate("globalThis.__runtime_survived_oom = true")
+                    .unwrap(),
                 serde_json::json!(true),
             );
         }
@@ -16133,7 +17124,10 @@ mod tests {
             .collect::<Vec<_>>();
         for request in &requests {
             let lower = request.to_ascii_lowercase();
-            assert!(lower.contains("\r\norigin: http://127.0.0.1:1\r\n"), "{request}");
+            assert!(
+                lower.contains("\r\norigin: http://127.0.0.1:1\r\n"),
+                "{request}"
+            );
             assert!(!lower.contains("\r\ncookie:"), "{request}");
         }
         let child = requests

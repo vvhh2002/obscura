@@ -55,8 +55,9 @@ The relevant options are:
 | Option | Meaning |
 | --- | --- |
 | `--assets-dir DIR` | New or empty destination directory. Requires `--dump assets`. |
-| `--wait SECONDS` | Fixed post-load observation window in archive mode; default `5` when omitted. Delayed timers and asynchronous work can run during it. |
-| `--timeout SECONDS` | Deadline used for navigation and any `--eval` expression, separate from settling and final resource warm-up. |
+| `--wait-until CONDITION` | Navigation boundary: `load` (default), `domcontentloaded`, `networkidle0`, or `networkidle2`. |
+| `--wait SECONDS` | Fixed observation window after the selected `--wait-until` condition in archive mode; default `5` when omitted. The default condition is `load`. Delayed timers and asynchronous work can run during it. |
+| `--timeout SECONDS` | Deadline used for navigation, including the selected DOM load boundary, and separately for any `--eval` expression. It does not include settling or final resource warm-up. |
 | `--assets-max-resources N` | Maximum retained responses; default `4096`. |
 | `--assets-max-bytes N` | Maximum total retained response bytes; default `536870912` (512 MiB). |
 | `--quiet` | Suppress progress logging; it does not change the archive. |
@@ -66,6 +67,51 @@ JavaScript navigations during the settle window. When another top-level
 document commits, capture advances to a new document generation and discards
 responses owned only by the replaced document. The manifest therefore
 describes the final committed page, not a mixture of intermediate pages.
+
+### Lifecycle boundary
+
+Archive mode defaults to `--wait-until load`. Navigation first runs
+parser-discovered scripts and their supported element `load`/`error` events,
+transitions the top `Document` through `interactive` and `DOMContentLoaded`,
+and then waits for the tracked load-delay set. That set includes unfinished
+child documents, connected dynamic scripts prepared before completion,
+parser-created eager images and dynamic images queued by the DOM shim, and
+linked stylesheets. Child frames complete from the leaves upward: a child's Window
+load precedes the `load` event on its owner `<iframe>`, and the top Window load
+runs only after the live descendant tree has completed. The final top transition is
+`readyState = "complete"`, `readystatechange`, then Window load. See
+[Document and Window lifecycle](Architecture-overview.md#document-and-window-lifecycle)
+for the exact event shapes and current conformance limits.
+
+For a parser stylesheet in a child frame, the owner link does not complete
+until its bounded recursive `@import` graph has reached terminal responses and
+been materialized. Its link event retains the original parser position even if
+an earlier preload or script inserts or reorders DOM nodes.
+
+Parser scripts, linked stylesheets, and inline `@import` roots retain the
+effective base URL from their own parser encounter in both the top document and
+child frames. Changing `<base>` later cannot retarget those frozen requests. A
+direct rewrite of a parser link's raw `href` is instead treated as a new dynamic
+request; a late response for the old URL is rejected before it can install
+stale CSS or consume the new request's owner event.
+
+`--timeout` bounds this navigation phase, so with the default `load` condition
+a hung load-delaying resource can make navigation fail before archive writing
+starts. The load driver also shares `OBSCURA_SCRIPT_DEADLINE_MS`, 30 seconds by
+default, with parser and module execution; time spent reaching
+DOMContentLoaded is not replenished for the load wait. The CLI timeout and
+script deadline are independent, and the earlier one wins. A navigation
+failure is different from a completed capture with `complete: false`: the
+former can occur before there is a manifest to inspect.
+
+Callers may select `--wait-until domcontentloaded`, but that only establishes
+the earlier DOM boundary. The fixed `--wait` and archive warm-up turns can
+subsequently finish the pending Window load. The archive's independent
+completeness probes report known pending or missing resource work at the
+capture boundary. DOM load is not archive completeness: unobserved lazy
+images, fonts, CSS `url()` resources, ordinary `fetch()`/XHR, timers, and other
+final-DOM assets are intentionally handled by the later observation and
+resource-warm-up barriers rather than by the Window load-delay set.
 
 Archive mode accepts a single URL and conflicts with `--file`; use a distinct
 new directory for each URL in a multi-page workflow. After the fixed settle
@@ -212,6 +258,12 @@ document and live frame realms, including:
   graphs in supported document stylesheets;
 - images, selected responsive-image candidates, posters, CSS URLs, and SVG
   `use` references inside nested open or closed shadow roots.
+
+Insertion preparation is shadow-including. If script populates a shadow root
+while its host is detached and later inserts that host, Obscura starts the
+newly connected scripts, stylesheets, eager images, and iframe documents at
+that insertion boundary; a closed root is handled through the native shadow
+registry rather than through `querySelectorAll`.
 
 Inline `@import` inside a shadow root is not recursively materialized in all
 cases. An unmaterializable shadow stylesheet owner is reported as

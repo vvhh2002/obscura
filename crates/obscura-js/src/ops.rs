@@ -158,6 +158,12 @@ pub struct ObscuraState {
     pub pending_frames: Vec<PendingFrame>,
     /// Total URL and HTML bytes held by `pending_frames`.
     pub pending_frame_bytes: usize,
+    /// Documents temporarily owned by Page's cancellation-safe attachment
+    /// drain. They no longer live in `pending_frames`, but must continue to
+    /// count against the same entry and byte caps until each attachment is
+    /// committed or the drain restores it.
+    pub draining_frame_documents: usize,
+    pub draining_frame_bytes: usize,
     /// Frame ids reserved while an iframe document request is in flight,
     /// mapped to the parent realm which made the reservation. Reserving before
     /// the response arrives lets passive response capture attribute the
@@ -331,6 +337,8 @@ impl ObscuraState {
             js_network_events: Vec::new(),
             pending_frames: Vec::new(),
             pending_frame_bytes: 0,
+            draining_frame_documents: 0,
+            draining_frame_bytes: 0,
             reserved_frame_ids: HashMap::new(),
             frame_id_counter: 0,
             resource_archive_incomplete_reasons: std::collections::BTreeSet::new(),
@@ -578,6 +586,16 @@ impl RealmStates {
             .iter()
             .find(|(_, id, _)| *id == frame_id)
             .map(|(_, _, state)| state.clone())
+    }
+
+    pub(crate) fn context_by_frame_id(
+        &self,
+        frame_id: u32,
+    ) -> Option<v8::Global<v8::Context>> {
+        self.entries
+            .iter()
+            .find(|(_, id, _)| *id == frame_id)
+            .map(|(context, _, _)| context.clone())
     }
 }
 
@@ -1396,13 +1414,18 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         .unwrap_or("\"\"".into()),
         "document_origin" => serde_json::to_string(&document_origin(&gs))
             .unwrap_or("\"null\"".into()),
-        "connected_iframes" => {
+        "connected_iframes" | "connected_images" => {
+            let wanted = if cmd == "connected_iframes" {
+                "iframe"
+            } else {
+                "img"
+            };
             let mut ids = shadow_including_connected_nodes(dom)
                 .into_iter()
                 .filter(|id| {
                     dom.get_node(*id).is_some_and(|node| {
                         node.as_element()
-                            .is_some_and(|name| name.local.as_ref() == "iframe")
+                            .is_some_and(|name| name.local.as_ref() == wanted)
                     })
                 })
                 .map(|id| id.index())
@@ -4278,14 +4301,14 @@ fn op_navigate(
     gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));
 }
 
-fn frame_message_queue_entry_limit() -> usize {
+pub(crate) fn frame_message_queue_entry_limit() -> usize {
     std::env::var("OBSCURA_FRAME_MESSAGE_QUEUE_ENTRIES")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4096)
 }
 
-fn frame_message_queue_byte_limit() -> usize {
+pub(crate) fn frame_message_queue_byte_limit() -> usize {
     std::env::var("OBSCURA_FRAME_MESSAGE_QUEUE_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -4366,7 +4389,8 @@ fn reserve_pending_frame_id(state: &mut ObscuraState, parent_frame_id: u32) -> u
     let pending_documents = state
         .pending_frames
         .len()
-        .saturating_add(state.reserved_frame_ids.len());
+        .saturating_add(state.reserved_frame_ids.len())
+        .saturating_add(state.draining_frame_documents);
     if pending_documents >= MAX_PENDING_FRAME_DOCUMENTS {
         state.resource_archive_incomplete_reasons.insert(format!(
             "frame document queue entry cap reached ({MAX_PENDING_FRAME_DOCUMENTS} documents)"
@@ -4374,7 +4398,9 @@ fn reserve_pending_frame_id(state: &mut ObscuraState, parent_frame_id: u32) -> u
         tracing::warn!(
             "refusing a frame document reservation: {} pending documents, {} bytes",
             pending_documents,
-            state.pending_frame_bytes,
+            state
+                .pending_frame_bytes
+                .saturating_add(state.draining_frame_bytes),
         );
         return 0;
     }
@@ -4427,6 +4453,7 @@ fn queue_pending_frame_document(
         .pending_frames
         .len()
         .saturating_add(state.reserved_frame_ids.len())
+        .saturating_add(state.draining_frame_documents)
         >= MAX_PENDING_FRAME_DOCUMENTS
     {
         state.resource_archive_incomplete_reasons.insert(format!(
@@ -4439,7 +4466,12 @@ fn queue_pending_frame_document(
         );
         return 0;
     }
-    if state.pending_frame_bytes.saturating_add(bytes) > MAX_PENDING_FRAME_BYTES {
+    if state
+        .pending_frame_bytes
+        .saturating_add(state.draining_frame_bytes)
+        .saturating_add(bytes)
+        > MAX_PENDING_FRAME_BYTES
+    {
         state.resource_archive_incomplete_reasons.insert(format!(
             "frame document queue byte cap reached ({MAX_PENDING_FRAME_BYTES} bytes)"
         ));

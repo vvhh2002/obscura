@@ -34,6 +34,34 @@ const SHADOW_PARENT_HTML: &str = r#"<!doctype html><html><head><title>parent</ti
 </script>
 </body></html>"#;
 
+const CLOSED_SHADOW_REINSERT_PARENT_HTML: &str = r#"<!doctype html><html><body>
+<script>
+  window.__shadowReinsert = { loads: 0, childRuns: [] };
+  const host = document.createElement('div');
+  const root = host.attachShadow({mode: 'closed'});
+  const frame = document.createElement('iframe');
+  let firstWindow = null;
+  frame.srcdoc = '<!doctype html><script>window.__ran = (window.__ran || 0) + 1;<\/script>';
+  frame.onload = function () {
+    __shadowReinsert.loads++;
+    __shadowReinsert.childRuns.push(frame.contentWindow.__ran || 0);
+    if (__shadowReinsert.loads === 1) {
+      firstWindow = frame.contentWindow;
+      __shadowReinsert.firstFrameId = frame._frameId;
+      host.remove();
+      __shadowReinsert.resetFrameId = frame._frameId;
+      document.body.appendChild(host);
+    } else if (__shadowReinsert.loads === 2) {
+      __shadowReinsert.secondFrameId = frame._frameId;
+      __shadowReinsert.windowChanged = frame.contentWindow !== firstWindow;
+    }
+  };
+  root.appendChild(frame);
+  document.body.appendChild(host);
+  window.__closedShadowHost = host;
+</script>
+</body></html>"#;
+
 const RESET_PARENT_HTML: &str = r#"<!doctype html><html><head><title>parent</title></head><body>
 <script>
   var f = document.createElement('iframe');
@@ -251,6 +279,26 @@ async fn a_shadow_dom_child_frame_stays_alive_and_runs_its_script() {
         page.evaluate_in_frame(0, "window.__ran").unwrap(),
         serde_json::json!("YES"),
     );
+}
+
+#[tokio::test]
+async fn removing_and_reinserting_a_closed_shadow_host_recreates_its_iframe() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let base = spawn_server(CLOSED_SHADOW_REINSERT_PARENT_HTML);
+
+    let browser = Browser::new().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+    page.goto(&base).await.unwrap();
+    page.settle(2_000).await;
+
+    let state = page.evaluate("window.__shadowReinsert");
+    assert_eq!(state["loads"], 2, "closed-shadow iframe did not reload: {state:#?}");
+    assert_eq!(state["childRuns"], serde_json::json!([1, 1]), "replacement child script did not run: {state:#?}");
+    assert_eq!(state["resetFrameId"], 0, "removed iframe kept its frame id: {state:#?}");
+    assert_ne!(state["firstFrameId"], state["secondFrameId"], "frame id was reused: {state:#?}");
+    assert_eq!(state["windowChanged"], true, "contentWindow survived removal: {state:#?}");
+    assert_eq!(page.evaluate("window.__closedShadowHost.shadowRoot"), serde_json::Value::Null);
+    assert_eq!(page.frame_urls(), vec!["about:srcdoc".to_string()]);
 }
 
 /// The whole point of a child frame having a scripting context: it can report

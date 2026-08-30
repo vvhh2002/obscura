@@ -25,10 +25,17 @@ const _core = Deno.core;
     '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameWindows',
     '__obscura_frameObjects', '__obscura_frameElements', '__obscura_deliverMessage',
     '__obscura_liveFrameIds', '__obscura_forgetFrame',
-    '__obscura_registerLinkedStylesheet', '__obscura_activateLabel',
+    '__obscura_dispatchFrameOwnerLoad',
+    '__obscura_registerLinkedStylesheet', '__obscura_completeLinkedStylesheet',
+    '__obscura_activateLabel',
     '__obscura_isDisabled', '__obscura_labeledControl', '__obscura_interactiveHost',
-    '__markParserScripts', '__obscura_hasPendingDynamicScripts',
+    '__obscura_dispatchWindowLoad', '__obscura_dispatchDocumentLifecycleEvent',
+    '__obscura_dispatchParserScriptEvent',
+    '__obscura_installParsedBodyLoadHandler',
+    '__markParserScripts', '__markParserStylesheets',
+    '__obscura_isParserStylesheetPending', '__obscura_hasPendingDynamicScripts',
     '__obscura_hasPendingLoadDelayingScripts',
+    '__obscura_hasPendingLoadDelayingResources',
     '__obscura_nextPendingTimeoutDelay',
     '__obscura_hw', '__obscura_mem',
     '__documentReadyState__', '__currentUrl',
@@ -91,22 +98,43 @@ globalThis.onunhandledrejection = function(e) { if (e?.preventDefault) e.prevent
 globalThis.onerror = function(msg, src, line, col, error) {
   globalThis.__obscura_errors.push({msg: String(msg), src: String(src||""), line, error: String(error||"")});
 };
-globalThis.__windowListeners = {};
-globalThis.addEventListener = function(type, fn) {
-  if (!globalThis.__windowListeners[type]) globalThis.__windowListeners[type] = [];
-  globalThis.__windowListeners[type].push(fn);
+globalThis.addEventListener = function(type, callback, options) {
+  _eventTargetAdd(globalThis, type, callback, options);
 };
-globalThis.removeEventListener = function(type, fn) {
-  if (globalThis.__windowListeners[type]) {
-    globalThis.__windowListeners[type] = globalThis.__windowListeners[type].filter(h => h !== fn);
-  }
+globalThis.removeEventListener = function(type, callback, options) {
+  _eventTargetRemove(globalThis, type, callback, options);
 };
 globalThis.dispatchEvent = function(event) {
-  if (!event) return true;
-  const handlers = globalThis.__windowListeners[event.type] || [];
-  for (const h of handlers) { try { h.call(globalThis, event); } catch(e) { console.error(e); } }
-  return !event.defaultPrevented;
+  return _eventTargetDispatch(globalThis, event);
 };
+// The navigation `load` event is dispatched at Window but has Document as its
+// legacy target. Keep this special case out of the ordinary Window
+// dispatchEvent path: script-created events dispatched at Window still target
+// Window, while the browser lifecycle uses this helper exactly once.
+Object.defineProperty(globalThis, "__obscura_dispatchWindowLoad", {
+  value: function() { return _dispatchTrustedWindowLoadEvent(); },
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
+Object.defineProperty(globalThis, "__obscura_dispatchDocumentLifecycleEvent", {
+  value: function(type) { return _dispatchTrustedDocumentLifecycleEvent(type); },
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
+Object.defineProperty(globalThis, "__obscura_dispatchParserScriptEvent", {
+  value: function(nid, type) {
+    type = String(type);
+    if (type !== "load" && type !== "error") return false;
+    const script = _wrapEl(+nid);
+    if (!script || script.localName !== "script") return false;
+    return _dispatchTrustedElementEvent(script, type);
+  },
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
 
 let _domMutationEpoch = 0;
 let _treeMutationEpoch = 0;
@@ -257,6 +285,7 @@ let __dynScriptQueue = [];
 let __dynScriptBusy = false;
 let __dynClassicPending = 0;
 let __dynLoadDelayingPending = 0;
+let __resourceLoadDelayingPending = 0;
 Object.defineProperty(globalThis, '__obscura_hasPendingDynamicScripts', {
   value: function() {
     return __dynClassicPending > 0 || __dynScriptBusy || __dynScriptQueue.length > 0;
@@ -276,6 +305,22 @@ Object.defineProperty(globalThis, '__obscura_hasPendingLoadDelayingScripts', {
   enumerable: false,
   configurable: false,
 });
+Object.defineProperty(globalThis, '__obscura_hasPendingLoadDelayingResources', {
+  value: function() {
+    return __dynLoadDelayingPending > 0 || __resourceLoadDelayingPending > 0;
+  },
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
+function _beginResourceLoadDelay() {
+  if (globalThis.__documentReadyState__ === 'complete') return false;
+  __resourceLoadDelayingPending++;
+  return true;
+}
+function _endResourceLoadDelay(active) {
+  if (active && __resourceLoadDelayingPending > 0) __resourceLoadDelayingPending--;
+}
 function _decodeDataScriptUrl(url) {
   const comma = url.indexOf(',');
   if (!url.startsWith('data:') || comma < 5) {
@@ -389,14 +434,14 @@ async function __runDynScriptTask(task) {
     // Fire load via dispatchEvent only: it invokes the element's onload
     // property handler and any addEventListener('load') listeners, read live
     // off the element. Calling onload separately would double-fire it.
-    try { task.dispatchEvent(new Event('load')); } catch(e) {}
+    try { _dispatchTrustedElementEvent(task.element, 'load'); } catch(e) {}
   } catch(e) {
     console.error('Dynamic script fetch error:', e.message);
-    try { task.dispatchEvent(new Event('error')); } catch(ex) {}
+    try { _dispatchTrustedElementEvent(task.element, 'error'); } catch(ex) {}
   } finally {
     if (task.delaysLoad) {
       task.delaysLoad = false;
-      __dynLoadDelayingPending = Math.max(0, __dynLoadDelayingPending - 1);
+      if (__dynLoadDelayingPending > 0) __dynLoadDelayingPending--;
     }
   }
 }
@@ -444,11 +489,55 @@ function _resolveResourceUrl(src) {
 
 const _linkedStylesheetNodes = new WeakMap();
 const _linkElementSheets = new WeakMap();
+const _linkedStylesheetLoadStates = new WeakMap();
+// Parser-owned links are fetched by the native document transport. Keep them
+// out of the dynamic loader and renderer warmup until that transport reaches
+// their frozen parser encounter point; otherwise the same response is fetched
+// once as parser work and again from the fully built backing DOM.
+const _parserStylesheetPending = new WeakMap();
 
 function _linkedStylesheetHref(link, explicitHref) {
   const raw = explicitHref || link?.getAttribute?.("href") || link?.href || "";
   return raw ? _resolveResourceUrl(String(raw)) : "";
 }
+
+Object.defineProperty(globalThis, "__markParserStylesheets", {
+  value: function(entries) {
+    for (const entry of entries || []) {
+      const structured = entry && typeof entry === "object";
+      const link = _wrapEl(+(structured ? entry.nid : entry));
+      if (!link) continue;
+      const rawHref = structured && Object.prototype.hasOwnProperty.call(entry, "rawHref")
+        ? (entry.rawHref == null ? null : String(entry.rawHref))
+        : link.getAttribute("href");
+      const requestHref = structured && entry.requestHref != null
+        ? String(entry.requestHref)
+        : _linkedStylesheetHref(link);
+      _parserStylesheetPending.set(link, { rawHref, requestHref });
+    }
+  },
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
+Object.defineProperty(globalThis, "__obscura_isParserStylesheetPending", {
+  value: function(link) {
+    if (!link || !_parserStylesheetPending.has(link)) return false;
+    const expected = _parserStylesheetPending.get(link);
+    const rel = (link.getAttribute("rel") || link.rel || "")
+      .toString().toLowerCase().split(/\s+/);
+    if (expected.rawHref === link.getAttribute("href") && rel.includes("stylesheet")) {
+      return true;
+    }
+    // A preload changed href before the parser transport completed. The new
+    // request is dynamic work and must no longer be suppressed by the old one.
+    _parserStylesheetPending.delete(link);
+    return false;
+  },
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
 
 function _linkedStylesheetIsOriginClean(href) {
   try {
@@ -474,7 +563,52 @@ function _registerLinkedStylesheet(link, sourceNode, explicitHref) {
   sheet._bindLinkedOwner(link, sourceNode, href, _linkedStylesheetIsOriginClean(href));
   return sheet;
 }
-globalThis.__obscura_registerLinkedStylesheet = _registerLinkedStylesheet;
+Object.defineProperty(globalThis, "__obscura_registerLinkedStylesheet", {
+  value: _registerLinkedStylesheet,
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
+
+// The asynchronous DOM loader and the native page-transport warmup can race
+// to materialize the same dynamic link. They still represent one stylesheet
+// request and therefore one owner load/error event. Key the completion by the
+// link's current resolved href so a later href change receives a fresh event.
+function _completeLinkedStylesheet(link, type, explicitHref, expectedRawHref) {
+  if (!link) return false;
+  type = String(type);
+  if (type !== "load" && type !== "error") return false;
+  const href = _linkedStylesheetHref(link, explicitHref);
+  const hasParserToken = expectedRawHref !== undefined;
+  if (hasParserToken) {
+    const rawHref = expectedRawHref == null ? null : String(expectedRawHref);
+    const pending = _parserStylesheetPending.get(link);
+    const rel = (link.getAttribute("rel") || link.rel || "")
+      .toString().toLowerCase().split(/\s+/);
+    if (!pending
+        || pending.rawHref !== rawHref
+        || link.getAttribute("href") !== rawHref
+        || !rel.includes("stylesheet")) return false;
+  } else if (explicitHref && _linkedStylesheetHref(link) !== href) {
+    return false;
+  }
+  _parserStylesheetPending.delete(link);
+  let state = _linkedStylesheetLoadStates.get(link);
+  if (!state || state.href !== href) {
+    state = { href, completed: false };
+    _linkedStylesheetLoadStates.set(link, state);
+  }
+  if (state.completed) return false;
+  state.completed = true;
+  _dispatchTrustedElementEvent(link, type);
+  return true;
+}
+Object.defineProperty(globalThis, "__obscura_completeLinkedStylesheet", {
+  value: _completeLinkedStylesheet,
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
 
 // A fetched sheet becomes an inline <style>, so relative url() references
 // must keep resolving against the stylesheet URL rather than document.URL.
@@ -597,6 +731,7 @@ async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
 // event before revealing their content; firing it while discarding the CSS
 // left the DOM loaded but unstyled. Issue #409.
 async function _loadLinkedStylesheet(c) {
+  if (!c.isConnected) return;
   // Archive/render warmup turns @import rules into synthetic link owners so
   // their response flows through the page transport with exact bytes, frame
   // attribution, recursive depth limits, and explicit failure diagnostics.
@@ -612,25 +747,99 @@ async function _loadLinkedStylesheet(c) {
   if (!rel.split(/\s+/).includes('stylesheet')) return;
   const href = c.getAttribute('href');
   if (!href) return;
+  // An explicitly disabled link does not start a new request. Enabling it
+  // later re-enters this loader through the disabled-attribute transition.
+  if (c.disabled || c.hasAttribute('disabled')) return;
   const fullUrl = _resolveResourceUrl(href);
+  if (globalThis.__obscura_isParserStylesheetPending(c)) return;
   let pageOrigin = "";
   try { pageOrigin = new URL(fullUrl).origin; } catch(e) {}
+  let loadState = _linkedStylesheetLoadStates.get(c);
+  if (loadState && loadState.href === fullUrl && loadState.pending) return;
+  loadState = { href: fullUrl, completed: false, pending: true };
+  _linkedStylesheetLoadStates.set(c, loadState);
+  const delaysLoad = _beginResourceLoadDelay();
   try {
     const css = await _fetchLinkedCss(fullUrl, pageOrigin);
+    const currentRel = (c.getAttribute('rel') || c.rel || '').toString().toLowerCase();
+    if (_linkedStylesheetLoadStates.get(c) !== loadState
+        || loadState.completed
+        || !c.isConnected
+        || _linkedStylesheetHref(c) !== fullUrl
+        || !currentRel.split(/\s+/).includes('stylesheet')) return;
     const previous = _linkedStylesheetNodes.get(c);
     if (previous?.parentNode) previous.parentNode.removeChild(previous);
     const media = c.getAttribute("media") || "";
     const style = document.createElement("style");
     style.setAttribute("data-obscura-linked", fullUrl);
+    if (media.trim()) style.setAttribute("media", media);
     style.textContent = css;
     _registerLinkedStylesheet(c, style, fullUrl);
-    if (c.parentNode && !c.disabled && _cssImportApplies(media)) {
+    if (c.parentNode && !c.disabled && !c.hasAttribute('disabled')) {
       c.parentNode.insertBefore(style, c.nextSibling);
     }
-    try { c.dispatchEvent(new Event('load', { bubbles: true })); } catch(e) {}
+    try { globalThis.__obscura_completeLinkedStylesheet(c, 'load', fullUrl); } catch(e) {}
   } catch(e) {
-    try { c.dispatchEvent(new Event('error', { bubbles: true })); } catch(e) {}
+    const currentRel = (c.getAttribute('rel') || c.rel || '').toString().toLowerCase();
+    if (_linkedStylesheetLoadStates.get(c) === loadState
+        && c.isConnected
+        && _linkedStylesheetHref(c) === fullUrl
+        && currentRel.split(/\s+/).includes('stylesheet')) {
+      try { globalThis.__obscura_completeLinkedStylesheet(c, 'error', fullUrl); } catch(e) {}
+    }
+  } finally {
+    if (_linkedStylesheetLoadStates.get(c) === loadState) loadState.pending = false;
+    _endResourceLoadDelay(delaysLoad);
   }
+}
+
+function _syncLinkedStylesheetDisabledState(link) {
+  if (!link || link.localName !== "link") return;
+  const source = _linkedStylesheetNodes.get(link);
+  if (link.disabled || link.hasAttribute("disabled")) {
+    if (source?.parentNode) source.parentNode.removeChild(source);
+    return;
+  }
+  if (!link.isConnected) return;
+  const rel = (link.getAttribute("rel") || link.rel || "")
+    .toString().toLowerCase().split(/\s+/);
+  const href = link.getAttribute("href");
+  if (source && rel.includes("stylesheet") && href) {
+    const media = link.getAttribute("media") || "";
+    if (media.trim()) source.setAttribute("media", media);
+    else source.removeAttribute("media");
+    if (source.parentNode !== link.parentNode) {
+      if (source.parentNode) source.parentNode.removeChild(source);
+      link.parentNode.insertBefore(source, link.nextSibling);
+    }
+    return;
+  }
+  _loadLinkedStylesheet(link);
+}
+
+function _linkedStylesheetAttributeChanged(link, name) {
+  if (!link || link.localName !== "link" || !link.isConnected) return;
+  if (name === "disabled") {
+    _syncLinkedStylesheetDisabledState(link);
+    return;
+  }
+  if (name !== "href" && name !== "rel") return;
+  const rel = (link.getAttribute("rel") || link.rel || "")
+    .toString().toLowerCase().split(/\s+/);
+  if (!link.getAttribute("href") || !rel.includes("stylesheet")) {
+    // Removing href/rel invalidates the identity of an in-flight request. If
+    // script restores the same URL before that request settles, it represents
+    // fresh link processing: the old response must neither win the race nor
+    // make the new loader return early because its URL happens to match.
+    _parserStylesheetPending.delete(link);
+    _linkedStylesheetLoadStates.delete(link);
+    const source = _linkedStylesheetNodes.get(link);
+    if (source?.parentNode) source.parentNode.removeChild(source);
+    _linkedStylesheetNodes.delete(link);
+    _detachLinkedStyleSheet(link);
+    return;
+  }
+  _loadLinkedStylesheet(link);
 }
 
 function _fpRand(salt) {
@@ -1666,6 +1875,25 @@ function _shallowCloneNode(node) {
 // DOM node.  This is also what makes `new EventTarget()` and subclasses used by
 // framework schedulers work: those targets deliberately have no native node id.
 const _eventTargetListeners = new WeakMap();
+const _eventTargetHandlers = new WeakMap();
+// V8 may replace a realm's WindowProxy handle between separate host-entered
+// script tasks.  A Window listener table keyed directly by that weak proxy can
+// consequently disappear while the underlying global object and document are
+// still alive (most visibly while an external resource is awaited before
+// Window.load).  Map every current WindowProxy for this realm to one strongly
+// retained closure key; ordinary EventTargets remain weakly keyed.
+const _windowEventTargetKey = {};
+const _windowEventTargetProxies = new WeakSet();
+function _eventTargetKey(target) {
+  if (target === globalThis) {
+    _windowEventTargetProxies.add(target);
+    return _windowEventTargetKey;
+  }
+  // AbortSignal removal closures retain the proxy that was current when the
+  // listener was registered.  Recognise that previous proxy after V8 has made
+  // another one current, so abort still removes from the stable Window table.
+  return _windowEventTargetProxies.has(target) ? _windowEventTargetKey : target;
+}
 function _eventCapture(options) {
   return typeof options === "boolean" ? options : !!(options && options.capture);
 }
@@ -1677,17 +1905,19 @@ function _eventTargetAdd(target, type, callback, options) {
   const capture = _eventCapture(options);
   const signal = options && typeof options === "object" ? options.signal : null;
   if (signal && signal.aborted) return;
-  let byType = _eventTargetListeners.get(target);
+  const targetKey = _eventTargetKey(target);
+  let byType = _eventTargetListeners.get(targetKey);
   if (!byType) {
     byType = new Map();
-    _eventTargetListeners.set(target, byType);
+    _eventTargetListeners.set(targetKey, byType);
   }
   let listeners = byType.get(type);
   if (!listeners) {
     listeners = [];
     byType.set(type, listeners);
   }
-  if (listeners.some((entry) => entry.callback === callback && entry.capture === capture)) return;
+  if (listeners.some((entry) => !entry.eventHandler
+      && entry.callback === callback && entry.capture === capture)) return;
   const entry = {
     callback,
     capture,
@@ -1695,6 +1925,7 @@ function _eventTargetAdd(target, type, callback, options) {
     passive: !!(options && typeof options === "object" && options.passive),
     signal,
     abortHandler: null,
+    eventHandler: false,
   };
   listeners.push(entry);
   if (signal && typeof signal.addEventListener === "function") {
@@ -1703,7 +1934,8 @@ function _eventTargetAdd(target, type, callback, options) {
   }
 }
 function _eventTargetRemove(target, type, callback, options) {
-  const byType = _eventTargetListeners.get(target);
+  const targetKey = _eventTargetKey(target);
+  const byType = _eventTargetListeners.get(targetKey);
   if (!byType) return;
   type = String(type);
   const listeners = byType.get(type);
@@ -1711,7 +1943,7 @@ function _eventTargetRemove(target, type, callback, options) {
   const capture = _eventCapture(options);
   for (let i = 0; i < listeners.length; i++) {
     const entry = listeners[i];
-    if (entry.callback !== callback || entry.capture !== capture) continue;
+    if (entry.eventHandler || entry.callback !== callback || entry.capture !== capture) continue;
     listeners.splice(i, 1);
     if (entry.signal && entry.abortHandler && typeof entry.signal.removeEventListener === "function") {
       entry.signal.removeEventListener("abort", entry.abortHandler);
@@ -1719,9 +1951,65 @@ function _eventTargetRemove(target, type, callback, options) {
     break;
   }
   if (listeners.length === 0) byType.delete(type);
-  if (byType.size === 0) _eventTargetListeners.delete(target);
+  if (byType.size === 0) _eventTargetListeners.delete(targetKey);
 }
-function _eventTargetDispatch(target, event) {
+function _eventTargetHandler(target, type) {
+  return _eventTargetHandlers.get(_eventTargetKey(target))?.get(String(type))?.callback || null;
+}
+function _eventTargetSetHandler(target, type, callback) {
+  const targetKey = _eventTargetKey(target);
+  type = String(type);
+  callback = typeof callback === "function" ? callback : null;
+  let handlers = _eventTargetHandlers.get(targetKey);
+  let entry = handlers?.get(type);
+  if (!callback) {
+    if (!entry) return;
+    const listeners = _eventTargetListeners.get(targetKey)?.get(type);
+    if (listeners) {
+      const index = listeners.indexOf(entry);
+      if (index !== -1) listeners.splice(index, 1);
+    }
+    handlers.delete(type);
+    if (handlers.size === 0) _eventTargetHandlers.delete(targetKey);
+    return;
+  }
+  if (entry) {
+    entry.callback = callback;
+    return;
+  }
+  let byType = _eventTargetListeners.get(targetKey);
+  if (!byType) {
+    byType = new Map();
+    _eventTargetListeners.set(targetKey, byType);
+  }
+  let listeners = byType.get(type);
+  if (!listeners) {
+    listeners = [];
+    byType.set(type, listeners);
+  }
+  entry = {
+    callback,
+    capture: false,
+    once: false,
+    passive: false,
+    signal: null,
+    abortHandler: null,
+    eventHandler: true,
+  };
+  listeners.push(entry);
+  if (!handlers) {
+    handlers = new Map();
+    _eventTargetHandlers.set(targetKey, handlers);
+  }
+  handlers.set(type, entry);
+}
+function _eventTargetDispatch(
+  target,
+  event,
+  eventPhase = 2,
+  listenerPhase = "all",
+  listenerSnapshot = null,
+) {
   if (!event || typeof event.type === "undefined") {
     throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
   }
@@ -1730,25 +2018,41 @@ function _eventTargetDispatch(target, event) {
   }
   if (!event.target) event.target = target;
   event.currentTarget = target;
-  event.eventPhase = 2;
-  const listeners = (_eventTargetListeners.get(target)?.get(String(event.type)) || []).slice();
+  event.eventPhase = eventPhase;
+  // Snapshot before the first callback. A listener added by an on* handler or
+  // another listener does not join the dispatch already in progress.
+  const listeners = listenerSnapshot
+    || (_eventTargetListeners.get(_eventTargetKey(target))?.get(String(event.type)) || []).slice();
   for (const entry of listeners) {
-    const current = _eventTargetListeners.get(target)?.get(String(event.type));
+    if (event._immediatePropagationStopped) break;
+    if (listenerPhase === "capture" && !entry.capture) continue;
+    if (listenerPhase === "bubble" && entry.capture) continue;
+    const current = _eventTargetListeners.get(_eventTargetKey(target))?.get(String(event.type));
     if (!current || !current.includes(entry)) continue;
-    if (entry.once) _eventTargetRemove(target, event.type, entry.callback, entry.capture);
+    if (entry.once && !entry.eventHandler) {
+      _eventTargetRemove(target, event.type, entry.callback, entry.capture);
+    }
     const callback = entry.callback;
     try {
-      if (typeof callback === "function") callback.call(target, event);
+      let result;
+      if (typeof callback === "function") result = callback.call(target, event);
       else callback.handleEvent.call(callback, event);
+      if (entry.eventHandler && result === false) event.preventDefault();
     } catch (error) {
       console.error(error);
     }
-    if (event._immediatePropagationStopped) break;
   }
   event.currentTarget = null;
   event.eventPhase = 0;
   return !event.defaultPrevented;
 }
+
+Object.defineProperty(globalThis, "onload", {
+  get() { return _eventTargetHandler(globalThis, "load"); },
+  set(callback) { _eventTargetSetHandler(globalThis, "load", callback); },
+  enumerable: true,
+  configurable: true,
+});
 
 // During custom-element upgrade, HTMLElement's constructor must return the
 // already-existing element being upgraded. A class constructor cannot be
@@ -1780,7 +2084,7 @@ function __prepareInsertedScript(script) {
     if (error) {
       console.error('Import map error:', error);
       queueMicrotask(() => {
-        try { script.dispatchEvent(new Event('error')); } catch (_) {}
+        try { _dispatchTrustedElementEvent(script, 'error'); } catch (_) {}
       });
     }
     return;
@@ -1818,7 +2122,7 @@ function __prepareInsertedScript(script) {
       nid: script._nid,
       prevNid,
       pageOrigin,
-      dispatchEvent: (ev) => { try { script.dispatchEvent(ev); } catch(e) {} },
+      element: script,
     };
     // Non-parser-inserted external scripts are async by default, but scripts
     // prepared while the document is still loading still delay window.load.
@@ -1856,7 +2160,7 @@ function __prepareInsertedScript(script) {
       nid: script._nid,
       prevNid,
       pageOrigin: "",
-      dispatchEvent: (ev) => { try { script.dispatchEvent(ev); } catch(e) {} },
+      element: script,
       delaysLoad: globalThis.document?.readyState !== 'complete',
     };
     if (task.delaysLoad) __dynLoadDelayingPending++;
@@ -1870,14 +2174,14 @@ function __prepareInsertedScript(script) {
   }
 }
 
-function __prepareInsertedSubtree(root) {
+function __prepareInsertedSubtree(root, includeRoot = true) {
   // HTML's script preparation algorithm leaves a disconnected script
   // unstarted.  When an ancestor is later connected, insertion steps visit
   // every script in that subtree in tree order.
   if (!root || !root.isConnected) return;
   const scripts = [];
   const seen = new Set();
-  if (root.nodeType === 1 && root.tagName === 'SCRIPT') {
+  if (includeRoot && root.nodeType === 1 && root.tagName === 'SCRIPT') {
     scripts.push(root);
     seen.add(root._nid);
   }
@@ -1890,16 +2194,103 @@ function __prepareInsertedSubtree(root) {
     }
   }
   for (const script of scripts) __prepareInsertedScript(script);
+
+  // A link in a detached subtree starts only when that subtree becomes
+  // connected. Scan from the connected insertion root just as the script
+  // preparation pass does, instead of letting detached links join the
+  // document's load-event delay set.
+  const links = [];
+  const seenLinks = new Set();
+  if (includeRoot && root.nodeType === 1 && root.tagName === 'LINK') {
+    links.push(root);
+    seenLinks.add(root._nid);
+  }
+  const linkIds = _domParse("query_selector_all_scoped", root._nid, "link") || [];
+  for (const nid of linkIds) {
+    const link = _wrapEl(+nid);
+    if (link && !seenLinks.has(link._nid)) {
+      links.push(link);
+      seenLinks.add(link._nid);
+    }
+  }
+  for (const link of links) _loadLinkedStylesheet(link);
+
+  // Like parser-created images, images parsed inside a detached subtree never
+  // passed through an IDL setter. Start eager requests when the subtree gains a
+  // document connection; lazy images deliberately stay outside the load-delay
+  // set until another observation starts them.
+  const images = [];
+  const seenImages = new Set();
+  if (includeRoot && root.nodeType === 1 && root.tagName === 'IMG') {
+    images.push(root);
+    seenImages.add(root._nid);
+  }
+  const imageIds = _domParse("query_selector_all_scoped", root._nid, "img") || [];
+  for (const nid of imageIds) {
+    const image = _wrapEl(+nid);
+    if (image && !seenImages.has(image._nid)) {
+      images.push(image);
+      seenImages.add(image._nid);
+    }
+  }
+  for (const image of images) {
+    if (image instanceof HTMLImageElement && image.loading !== 'lazy') {
+      image._queueImageRequest();
+    }
+  }
+
+  const frames = [];
+  const seenFrames = new Set();
+  if (includeRoot && root.nodeType === 1 && root.tagName === 'IFRAME') {
+    frames.push(root);
+    seenFrames.add(root._nid);
+  }
+  const frameIds = _domParse("query_selector_all_scoped", root._nid, "iframe") || [];
+  for (const nid of frameIds) {
+    const frame = _wrapEl(+nid);
+    if (frame && !seenFrames.has(frame._nid)) {
+      frames.push(frame);
+      seenFrames.add(frame._nid);
+    }
+  }
+  for (const frame of frames) {
+    if (frame.hasAttribute('srcdoc')) {
+      if (frame._iframeLoadingUrl !== 'about:srcdoc') {
+        frame._loadIframeSrcdoc(frame.getAttribute('srcdoc') || '');
+      }
+      continue;
+    }
+    const src = frame.getAttribute('src');
+    if (src && src !== 'about:blank') frame._loadIframeSrc(src);
+    else frame._loadIframeBlank();
+  }
+
+  // querySelectorAll deliberately stays inside the light tree. Insertion
+  // steps, however, are shadow-including: if a detached host already owns a
+  // populated open or closed shadow root when the host becomes connected,
+  // scripts and load-delaying resources in that root start at the same time.
+  // Walk every shadow host in this newly connected subtree explicitly.
+  const shadowHosts = [];
+  if (includeRoot && root.nodeType === 1) shadowHosts.push(root);
+  const descendantIds = _domParse("query_selector_all_scoped", root._nid, "*") || [];
+  for (const nid of descendantIds) {
+    const host = _wrapEl(+nid);
+    if (host) shadowHosts.push(host);
+  }
+  for (const host of shadowHosts) {
+    const shadow = _shadowRootForHost(host, true);
+    if (shadow) __prepareInsertedSubtree(shadow);
+  }
 }
 
 // Cancel child-document reservations before a DOM mutation removes their
 // owning iframe. Attached realms are still released by the host liveness
 // sweep; this synchronous cleanup covers requests which have an owner id but
 // have not produced a realm yet.
-function _cancelIframeDocumentsInSubtree(root) {
+function _cancelIframeDocumentsInSubtree(root, includeRoot = true) {
   if (!root || root._nid == null) return;
   const frames = [];
-  if (root.nodeType === 1 && root.localName === 'iframe') frames.push(root);
+  if (includeRoot && root.nodeType === 1 && root.localName === 'iframe') frames.push(root);
   const ids = _domParse('query_selector_all_scoped', root._nid, 'iframe') || [];
   for (const nid of ids) {
     const frame = _wrapEl(+nid);
@@ -1907,6 +2298,22 @@ function _cancelIframeDocumentsInSubtree(root) {
   }
   for (const frame of frames) {
     if (typeof frame._resetIframeFrame === 'function') frame._resetIframeFrame();
+  }
+
+  // Removal steps are shadow-including for the same reason insertion steps
+  // are: removing a host disconnects every iframe in its open or closed
+  // shadow tree. Cancel those browsing contexts synchronously, before a host
+  // can be reinserted and mistakenly reuse the old frame id/loading URL.
+  const shadowHosts = [];
+  if (includeRoot && root.nodeType === 1) shadowHosts.push(root);
+  const descendantIds = _domParse('query_selector_all_scoped', root._nid, '*') || [];
+  for (const nid of descendantIds) {
+    const host = _wrapEl(+nid);
+    if (host) shadowHosts.push(host);
+  }
+  for (const host of shadowHosts) {
+    const shadow = _shadowRootForHost(host, true);
+    if (shadow) _cancelIframeDocumentsInSubtree(shadow);
   }
 }
 
@@ -2064,9 +2471,6 @@ class Node {
     _registerWindowNamedTree(c);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [c._nid], []);
     __prepareInsertedSubtree(c);
-    if (c instanceof Element && c.tagName === 'LINK') {
-      _loadLinkedStylesheet(c);
-    }
     return c;
   }
   removeChild(c) {
@@ -2141,9 +2545,6 @@ class Node {
       globalThis.__notifyMutation('childList', this._nid, [newChild._nid], [oldChild._nid]);
     }
     __prepareInsertedSubtree(newChild);
-    if (newChild instanceof Element && newChild.tagName === 'LINK') {
-      _loadLinkedStylesheet(newChild);
-    }
     return oldChild;
   }
   insertBefore(n, ref) {
@@ -2178,9 +2579,6 @@ class Node {
     // observer sees it and whether a <link> loads its stylesheet.
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [n._nid], []);
     __prepareInsertedSubtree(n);
-    if (n instanceof Element && n.tagName === 'LINK') {
-      _loadLinkedStylesheet(n);
-    }
     return n;
   }
   contains(o) { return o ? _dom("contains", this._nid, o._nid) === "true" : false; }
@@ -2247,7 +2645,15 @@ class Node {
   get isConnected() {
     if (this._treeDetachedExact) return false;
     if (this._treeConnectedEpoch === _treeMutationEpoch) return this._treeConnected;
-    const connected = _dom("is_connected", this._nid) === "true";
+    // The native shadow tree has its own root, so its native connected bit does
+    // not change when a host that was detached at attachShadow() time is later
+    // inserted into the document. DOM connectedness is composed-tree
+    // connectedness: follow the ShadowRoot host before falling back to the
+    // light-tree native query.
+    const root = this.getRootNode();
+    const connected = globalThis.ShadowRoot && root instanceof globalThis.ShadowRoot
+      ? !!root.host?.isConnected
+      : _dom("is_connected", this._nid) === "true";
     this._treeConnected = connected;
     this._treeConnectedEpoch = _treeMutationEpoch;
     return connected;
@@ -3139,6 +3545,16 @@ class Element extends Node {
       return upgrading;
     }
     this._style = _styleProxy(new CSSStyleDeclaration(this));
+    // Parser-provided event-handler attributes predate any listener that page
+    // script registers after obtaining this wrapper. Activate them now so the
+    // shared EventTarget list preserves that registration order. body.onload
+    // is the HTML body-to-Window alias and is installed at the parser's body
+    // boundary instead of becoming a listener on the body element itself.
+    for (const name of this.getAttributeNames()) {
+      if (String(name).toLowerCase().startsWith("on")) {
+        this._syncContentEventHandler(name);
+      }
+    }
   }
   // Element wrappers always back a nodeType-1 node (_wrap/_wrapEl only build an
   // Element for element nodes, and node ids are never freed-and-reused), so this
@@ -3208,7 +3624,11 @@ class Element extends Node {
     // every MutationObserver subscriber and downstream hydration / polling
     // logic stalls.
     const previousWindowNames = _windowNamedNamesInTree(this);
-    _cancelIframeDocumentsInSubtree(this);
+    // Replacing an element's contents removes and inserts its children; the
+    // element itself remains connected. In particular, `iframe.innerHTML =`
+    // only changes fallback children and must not cancel/reload the iframe's
+    // current browsing context.
+    _cancelIframeDocumentsInSubtree(this, false);
     // Native fragment replacement bypasses Node.removeChild. Disassociate
     // descendant style sheets before the backing nodes leave the document so
     // retained CSSStyleSheet wrappers cannot keep stale owner/source nodes.
@@ -3228,6 +3648,7 @@ class Element extends Node {
       newChildren = _domParse("child_nodes", this._nid) || [];
       globalThis.__notifyMutation('childList', this._nid, newChildren, oldChildren);
     }
+    __prepareInsertedSubtree(this, false);
   }
   get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
   get innerText() { return this.textContent; }
@@ -3344,7 +3765,7 @@ class Element extends Node {
       // `srcdoc` wins whenever it is present, including an empty value.
       if (!this.hasAttribute("srcdoc")) {
         if (value && value !== "about:blank") this._loadIframeSrc(value);
-        else this._resetIframeFrame();
+        else this._loadIframeBlank();
       }
     }
     if (n === "srcdoc" && this.localName === "iframe") {
@@ -3353,6 +3774,7 @@ class Element extends Node {
     if (this._nullNamespaceAttrs instanceof Map) {
       this._nullNamespaceAttrs.set(n, value);
     }
+    if (n.startsWith("on")) this._syncContentEventHandler(n);
     if (n === "id" || (n === "name" && _windowNameEligibleElement(this))) {
       if (this.getRootNode() === globalThis.document) {
         _ensureWindowNamedProperty(value);
@@ -3374,6 +3796,10 @@ class Element extends Node {
         image._imageSourceChanged();
       }
     }
+    if (this.localName === "link"
+        && (n === "href" || n === "rel" || n === "disabled")) {
+      _linkedStylesheetAttributeChanged(this, n);
+    }
   }
   setAttributeNS(ns, n, v) {
     ns = ns == null || ns === '' ? '' : String(ns);
@@ -3386,6 +3812,13 @@ class Element extends Node {
     // instead of maintaining a second, subtly different key space here.
     this._nullNamespaceAttrs = null;
     if (ns === "" && n === "style") this._style._replaceFromAttribute(value);
+    if (ns === "" && n.toLowerCase().startsWith("on")) {
+      this._syncContentEventHandler(n);
+    }
+    if (ns === "" && this.localName === "link"
+        && (n === "href" || n === "rel" || n === "disabled")) {
+      _linkedStylesheetAttributeChanged(this, n);
+    }
   }
   removeAttribute(n) {
     n = _htmlAttrName(this, n);
@@ -3397,14 +3830,15 @@ class Element extends Node {
     if (this.localName === "iframe" && n === "srcdoc") {
       const fallback = this.getAttribute("src");
       if (fallback && fallback !== "about:blank") this._loadIframeSrc(fallback);
-      else this._resetIframeFrame();
+      else this._loadIframeBlank();
     } else if (this.localName === "iframe" && n === "src"
                && !this.hasAttribute("srcdoc")) {
-      this._resetIframeFrame();
+      this._loadIframeBlank();
     }
     if (this._nullNamespaceAttrs instanceof Map) {
       this._nullNamespaceAttrs.delete(n);
     }
+    if (n.startsWith("on")) this._syncContentEventHandler(n);
     if (previousWindowName
         && (n === "id" || (n === "name" && _windowNameEligibleElement(this)))) {
       _reconcileWindowNamedProperty(previousWindowName);
@@ -3421,6 +3855,10 @@ class Element extends Node {
         image._imageSourceChanged();
       }
     }
+    if (this.localName === "link"
+        && (n === "href" || n === "rel" || n === "disabled")) {
+      _linkedStylesheetAttributeChanged(this, n);
+    }
   }
   removeAttributeNS(ns, n) {
     ns = String(ns == null ? "" : ns);
@@ -3428,6 +3866,13 @@ class Element extends Node {
     _dom("remove_attribute_ns", this._nid, ns + "\0" + n);
     this._nullNamespaceAttrs = null;
     if (ns === "" && n === "style") this._style._replaceFromAttribute("");
+    if (ns === "" && n.toLowerCase().startsWith("on")) {
+      this._syncContentEventHandler(n);
+    }
+    if (ns === "" && this.localName === "link"
+        && (n === "href" || n === "rel" || n === "disabled")) {
+      _linkedStylesheetAttributeChanged(this, n);
+    }
   }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return this.attributes.length > 0; }
@@ -3545,44 +3990,69 @@ class Element extends Node {
     return null;
   }
   addEventListener(type, handler, opts) {
-    const key = this._nid;
-    if (!_eventRegistry[key]) _eventRegistry[key] = {};
-    if (!_eventRegistry[key][type]) _eventRegistry[key][type] = [];
-    _eventRegistry[key][type].push(handler);
+    _eventTargetAdd(this, type, handler, opts);
   }
-  removeEventListener(type, handler) {
-    const key = this._nid;
-    if (_eventRegistry[key] && _eventRegistry[key][type]) {
-      _eventRegistry[key][type] = _eventRegistry[key][type].filter(h => h !== handler);
-    }
+  removeEventListener(type, handler, opts) {
+    _eventTargetRemove(this, type, handler, opts);
   }
   dispatchEvent(event) {
-    if (!event) return true;
-    if (!event.target) event.target = this;
-    event.currentTarget = this;
-    // Spec: inline `onclick="..."` content attributes are event handlers
-    // for the matching event type. Fire them alongside any
-    // addEventListener handlers. Also honor the IDL property
-    // `el.onclick = fn` if set. Without this, b.click() never invokes
-    // the inline handler and forms with onsubmit / buttons with onclick
-    // are silently dead.
-    const handlerName = 'on' + event.type;
-    const inlineFn = this[handlerName] || this._resolveInlineHandler(handlerName);
-    if (typeof inlineFn === 'function') {
-      try {
-        const ret = inlineFn.call(this, event);
-        if (ret === false) event.preventDefault();
-      } catch(e) { console.error(e); }
+    if (!event || typeof event.type === "undefined") {
+      return _eventTargetDispatch(this, event);
     }
-    const handlers = (_eventRegistry[this._nid] || {})[event.type] || [];
-    for (const h of handlers) {
-      try { h.call(this, event); } catch(e) { console.error(e); }
-      if (event._immediatePropagationStopped) break;
+    event.target = this;
+    event._propagationStopped = false;
+    event._immediatePropagationStopped = false;
+
+    // Build one path and use the shared EventTarget listener records at every
+    // phase. This gives Element the same duplicate suppression, once/signal,
+    // handleEvent, listener snapshot, and handler/listener ordering as Window
+    // and Document while retaining ordinary DOM bubbling.
+    const path = [];
+    let ancestor = this.parentNode;
+    while (ancestor) {
+      path.push(ancestor);
+      ancestor = ancestor.parentNode;
     }
-    if (event.bubbles && !event._propagationStopped && this.parentNode) {
-      this.parentNode.dispatchEvent(event);
+    const reachesDocument = path.includes(globalThis.document);
+    if (reachesDocument) {
+      _eventTargetDispatch(globalThis, event, 1, "capture");
     }
+    for (let index = path.length - 1;
+         index >= 0 && !event._propagationStopped;
+         index--) {
+      _eventTargetDispatch(path[index], event, 1, "capture");
+    }
+    if (!event._propagationStopped) {
+      const atTargetListeners =
+        (_eventTargetListeners.get(this)?.get(String(event.type)) || []).slice();
+      _eventTargetDispatch(this, event, 2, "capture", atTargetListeners);
+      if (!event._immediatePropagationStopped) {
+        _eventTargetDispatch(this, event, 2, "bubble", atTargetListeners);
+      }
+    }
+    if (event.bubbles && !event._propagationStopped) {
+      for (const current of path) {
+        _eventTargetDispatch(current, event, 3, "bubble");
+        if (event._propagationStopped) break;
+      }
+      if (reachesDocument && !event._propagationStopped) {
+        _eventTargetDispatch(globalThis, event, 3, "bubble");
+      }
+    }
+    event.currentTarget = null;
+    event.eventPhase = 0;
     return !event.defaultPrevented;
+  }
+  _syncContentEventHandler(name) {
+    name = String(name).toLowerCase();
+    if (!name.startsWith("on") || name.length <= 2) return;
+    const type = name.slice(2);
+    if (this.localName === "body" && type === "load") return;
+    if (this.__inlineHandlerCache) delete this.__inlineHandlerCache[name];
+    const handler = this.getAttribute(name) === null
+      ? null
+      : this._resolveInlineHandler(name);
+    _eventTargetSetHandler(this, type, handler);
   }
   _resolveInlineHandler(name) {
     // name = 'onclick' / 'onsubmit' / etc. Compile the content attribute
@@ -3590,7 +4060,7 @@ class Element extends Node {
     const cache = this.__inlineHandlerCache || (this.__inlineHandlerCache = {});
     if (Object.prototype.hasOwnProperty.call(cache, name)) return cache[name];
     const src = this.getAttribute && this.getAttribute(name);
-    if (!src) { cache[name] = null; return null; }
+    if (src === null) { cache[name] = null; return null; }
     try {
       cache[name] = new Function('event', src);
     } catch (e) {
@@ -4124,24 +4594,73 @@ class Element extends Node {
     if (this.localName === 'iframe') this.setAttribute('srcdoc', String(v));
   }
   _resetIframeFrame() {
+    _endResourceLoadDelay(this._iframeBlankDelaysLoad);
+    this._iframeBlankDelaysLoad = false;
+    this._iframeBlankLoadPending = false;
+    this._iframeNavigationGeneration = (this._iframeNavigationGeneration || 0) + 1;
     const oldId = this._frameId;
     const requestId = this._iframeRequestFrameId;
     if (oldId) {
       _core.ops.op_cancel_frame_document(oldId);
-      delete globalThis.__obscura_frameElements[oldId];
-      delete globalThis.__obscura_frameWindows[oldId];
+      delete _obscuraFrameElements[oldId];
+      delete _obscuraFrameWindows[oldId];
     }
     if (requestId && requestId !== oldId) {
       _core.ops.op_cancel_frame_document(requestId);
     }
     this._frameId = 0;
     this._iframeRequestFrameId = 0;
+    this._iframeLoadDispatchedFrameId = 0;
     this._iframeLoadingUrl = null;
     this._iframeDoc = new _IframeDocument(
       '<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
     this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
   }
+  _loadIframeBlank() {
+    if (!this.isConnected) return;
+    if (this._iframeLoadingUrl === 'about:blank' && this._iframeBlankLoadPending) return;
+    this._resetIframeFrame();
+    this._iframeLoadingUrl = 'about:blank';
+    this._iframeBlankLoadPending = true;
+    this._iframeBlankDelaysLoad = _beginResourceLoadDelay();
+    const generation = this._iframeNavigationGeneration;
+    const el = this;
+    const complete = () => {
+      if (el._iframeNavigationGeneration !== generation
+          || el._iframeLoadingUrl !== 'about:blank'
+          || !el._iframeBlankLoadPending) return;
+      el._iframeBlankLoadPending = false;
+      try {
+        if (el.isConnected && el._iframeBlankLoadDispatchedGeneration !== generation) {
+          _dispatchTrustedElementEvent(el, 'load');
+          el._iframeBlankLoadDispatchedGeneration = generation;
+        }
+      } finally {
+        _endResourceLoadDelay(el._iframeBlankDelaysLoad);
+        el._iframeBlankDelaysLoad = false;
+      }
+    };
+    if (_scheduleAfter(0, complete) === undefined) complete();
+  }
+  _queueIframeFallbackLoad(expectedUrl) {
+    const generation = this._iframeNavigationGeneration;
+    const delaysLoad = _beginResourceLoadDelay();
+    const el = this;
+    const complete = () => {
+      try {
+        if (el._iframeNavigationGeneration === generation
+            && el._iframeLoadingUrl === expectedUrl
+            && el.isConnected) {
+          _dispatchTrustedElementEvent(el, 'load');
+        }
+      } finally {
+        _endResourceLoadDelay(delaysLoad);
+      }
+    };
+    if (_scheduleAfter(0, complete) === undefined) complete();
+  }
   _loadIframeSrc(url) {
+    if (!this.isConnected) return;
     let fullUrl = url;
     if (!url.includes('://')) {
       try { fullUrl = new URL(url, _domParse("document_base_url") || _domParse("document_url") || "about:blank").href; } catch(e) {}
@@ -4152,7 +4671,10 @@ class Element extends Node {
     this._resetIframeFrame();
     this._iframeLoadingUrl = fullUrl;
     const requestFrameId = _core.ops.op_reserve_frame_document();
-    if (!requestFrameId) return;
+    if (!requestFrameId) {
+      this._queueIframeFallbackLoad(fullUrl);
+      return;
+    }
     this._iframeRequestFrameId = requestFrameId;
     const el = this;
     _fetchWithResourceOwner(fullUrl, {mode: 'no-cors'}, requestFrameId).then(async resp => {
@@ -4175,7 +4697,7 @@ class Element extends Node {
           documentUrl, '', html, Math.round(box.width) || 300,
           Math.round(box.height) || 150, requestFrameId);
         el._iframeRequestFrameId = 0;
-        if (el._frameId) globalThis.__obscura_frameElements[el._frameId] = el;
+        if (el._frameId) _obscuraFrameElements[el._frameId] = el;
         el._iframeDoc = new _IframeDocument(html, documentUrl, el);
         el._iframeWin = new _IframeWindow(el._iframeDoc, documentUrl);
         // Bind the window to the realm the host just queued. This is what makes
@@ -4183,8 +4705,8 @@ class Element extends Node {
         // message coming back out arrive with this window as its `source`.
         if (el._frameId) {
           el._iframeWin._frameId = el._frameId;
-          globalThis.__obscura_frameWindows[el._frameId] = el._iframeWin;
-          globalThis.__obscura_frameElements[el._frameId] = el;
+          _obscuraFrameWindows[el._frameId] = el._iframeWin;
+          _obscuraFrameElements[el._frameId] = el;
         }
       } else {
         _core.ops.op_cancel_frame_document(requestFrameId);
@@ -4193,10 +4715,10 @@ class Element extends Node {
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
       }
 
-      // Dispatch through the element so the onload property/attribute and any
-      // addEventListener('load', ...) listeners all run. Calling el.onload()
-      // directly bypasses listeners registered via addEventListener.
-      el.dispatchEvent(new Event('load'));
+      // A successfully queued document is completed by the host only after its
+      // realm, scripts, load-delaying resources, and descendant frames finish.
+      // Failed navigations have no child realm to wait for and complete here.
+      if (!el._frameId) _dispatchTrustedElementEvent(el, 'load');
     }).catch(() => {
       if (el._iframeLoadingUrl !== fullUrl
           || el._iframeRequestFrameId !== requestFrameId) return;
@@ -4205,10 +4727,11 @@ class Element extends Node {
       el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
       el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
 
-      el.dispatchEvent(new Event('load'));
+      _dispatchTrustedElementEvent(el, 'load');
     });
   }
   _loadIframeSrcdoc(html) {
+    if (!this.isConnected) return;
     this._resetIframeFrame();
     this._iframeLoadingUrl = 'about:srcdoc';
     const inheritedBase = _domParse("document_base_url")
@@ -4217,21 +4740,18 @@ class Element extends Node {
     this._frameId = _core.ops.op_frame_document_ready(
       'about:srcdoc', inheritedBase, String(html),
       Math.round(box.width) || 300, Math.round(box.height) || 150, 0);
-    if (this._frameId) globalThis.__obscura_frameElements[this._frameId] = this;
+    if (this._frameId) _obscuraFrameElements[this._frameId] = this;
     this._iframeDoc = new _IframeDocument(
       String(html), 'about:srcdoc', this, inheritedBase);
     this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:srcdoc');
     if (this._frameId) {
       this._iframeWin._frameId = this._frameId;
-      globalThis.__obscura_frameWindows[this._frameId] = this._iframeWin;
-      globalThis.__obscura_frameElements[this._frameId] = this;
+      _obscuraFrameWindows[this._frameId] = this._iframeWin;
+      _obscuraFrameElements[this._frameId] = this;
     }
-    const el = this;
-    Promise.resolve().then(() => {
-      if (el._iframeLoadingUrl === 'about:srcdoc') {
-        el.dispatchEvent(new Event('load'));
-      }
-    });
+    if (!this._frameId) {
+      this._queueIframeFallbackLoad('about:srcdoc');
+    }
   }
   get contentDocument() {
     if (this.localName !== 'iframe') return undefined;
@@ -5196,6 +5716,14 @@ class Document extends Node {
     return "text/html";
   }
   get readyState() { return globalThis.__documentReadyState__ || 'complete'; }
+  get onreadystatechange() { return _eventTargetHandler(this, "readystatechange"); }
+  set onreadystatechange(callback) {
+    _eventTargetSetHandler(this, "readystatechange", callback);
+  }
+  get ondomcontentloaded() { return _eventTargetHandler(this, "DOMContentLoaded"); }
+  set ondomcontentloaded(callback) {
+    _eventTargetSetHandler(this, "DOMContentLoaded", callback);
+  }
   get currentScript() {
     // Next.js / Turbopack chunk loader reads document.currentScript.src to
     // derive its base path. page.rs sets __currentScriptNid before each
@@ -5361,21 +5889,44 @@ class Document extends Node {
   }
   createRange() { return new Range(); }
   addEventListener(type, fn, opts) {
-    if (typeof fn !== 'function') return;
-    if (!this._listeners) this._listeners = {};
-    if (!this._listeners[type]) this._listeners[type] = [];
-    if (!this._listeners[type].includes(fn)) this._listeners[type].push(fn);
+    _eventTargetAdd(this, type, fn, opts);
   }
-  removeEventListener(type, fn) {
-    if (this._listeners?.[type]) {
-      this._listeners[type] = this._listeners[type].filter(h => h !== fn);
-    }
+  removeEventListener(type, fn, opts) {
+    _eventTargetRemove(this, type, fn, opts);
   }
   dispatchEvent(event) {
-    if (!event) return true;
-    const handlers = (this._listeners?.[event.type] || []).slice();
-    for (const h of handlers) { try { h.call(this, event); } catch(e) { console.error('document event error:', e); } }
-    return !event.defaultPrevented;
+    if (!event || typeof event.type === "undefined") {
+      return _eventTargetDispatch(this, event);
+    }
+    event.target = this;
+    // The dispatch algorithm clears both stop flags between dispatches. Without
+    // this, reusing an Event which was stopped during its first dispatch skips
+    // Document (and potentially Window) listeners on every later dispatch.
+    event._propagationStopped = false;
+    event._immediatePropagationStopped = false;
+    // Window is the browsing-context parent of Document for event dispatch.
+    // Capture listeners observe even a non-bubbling readystatechange; a
+    // bubbling DOMContentLoaded then returns through Window in bubble phase.
+    _eventTargetDispatch(globalThis, event, 1, "capture");
+    if (!event._propagationStopped) {
+      // At-target capture listeners precede at-target non-capture listeners,
+      // regardless of their relative registration order.
+      const atTargetListeners =
+        (_eventTargetListeners.get(this)?.get(String(event.type)) || []).slice();
+      _eventTargetDispatch(this, event, 2, "capture", atTargetListeners);
+      if (!event._immediatePropagationStopped) {
+        _eventTargetDispatch(this, event, 2, "bubble", atTargetListeners);
+      }
+    }
+    if (event.bubbles && !event._propagationStopped) {
+      _eventTargetDispatch(globalThis, event, 3, "bubble");
+    }
+    const allowed = !event.defaultPrevented;
+    event.currentTarget = null;
+    event.eventPhase = 0;
+    event._propagationStopped = false;
+    event._immediatePropagationStopped = false;
+    return allowed;
   }
   createTreeWalker(root, whatToShow, filter) {
     // whatToShow is unsigned long; default SHOW_ALL only when the arg is omitted.
@@ -5737,6 +6288,7 @@ class DocumentFragment extends Node {
     } else {
       _dom("set_inner_html", this._nid, html);
     }
+    __prepareInsertedSubtree(this);
   }
   querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
   querySelectorAll(s) {
@@ -5900,6 +6452,7 @@ class HTMLImageElement extends Element {
     this._imageQueued = false;
     this._imageInitialized = false;
     this._imageCompletionDeferred = false;
+    this._imageDelaysLoad = false;
     this._imageComplete = typeof _core.ops.op_image_metadata === "function"
       ? true
       : !this.getAttribute("src");
@@ -5946,18 +6499,18 @@ class HTMLImageElement extends Element {
     this._queueImageRequest();
     return this._imageNaturalHeight;
   }
-  get onload() { return this._imageOnload || null; }
+  get onload() { return _eventTargetHandler(this, "load"); }
   set onload(value) {
-    this._imageOnload = typeof value === "function" ? value : null;
-    if (this._imageOnload) {
+    _eventTargetSetHandler(this, "load", value);
+    if (_eventTargetHandler(this, "load")) {
       this._refreshImageFromCache();
       this._queueImageRequest();
     }
   }
-  get onerror() { return this._imageOnerror || null; }
+  get onerror() { return _eventTargetHandler(this, "error"); }
   set onerror(value) {
-    this._imageOnerror = typeof value === "function" ? value : null;
-    if (this._imageOnerror) {
+    _eventTargetSetHandler(this, "error", value);
+    if (_eventTargetHandler(this, "error")) {
       this._refreshImageFromCache();
       this._queueImageRequest();
     }
@@ -5978,7 +6531,10 @@ class HTMLImageElement extends Element {
   set srcset(value) { this.setAttribute("srcset", value); }
   get sizes() { return this.getAttribute("sizes") || ""; }
   set sizes(value) { this.setAttribute("sizes", value); }
-  get loading() { return this.getAttribute("loading") || "eager"; }
+  get loading() {
+    const value = (this.getAttribute("loading") || "").toLowerCase();
+    return value === "lazy" ? "lazy" : "eager";
+  }
   set loading(value) { this.setAttribute("loading", value); }
   get decoding() { return this.getAttribute("decoding") || "auto"; }
   set decoding(value) { this.setAttribute("decoding", value); }
@@ -6035,6 +6591,7 @@ class HTMLImageElement extends Element {
   }
 
   _adoptImageCandidate(currentSrc) {
+    this._finishImageLoadDelay();
     this._rejectImageDecodes();
     this._imageRequest++;
     this._imageQueued = false;
@@ -6048,12 +6605,17 @@ class HTMLImageElement extends Element {
   _queueImageRequest() {
     if (this._imageQueued || this._imageComplete) return;
     this._imageQueued = true;
+    // Lazy images are explicitly removed from the document load-event delay
+    // set. Snapshot the mode when this request starts; changing the attribute
+    // later does not retroactively move an in-flight request between sets.
+    this._imageDelaysLoad = this.loading !== 'lazy' && _beginResourceLoadDelay();
     const request = this._imageRequest;
     setTimeout(() => {
       if (request === this._imageRequest && !this._imageComplete) {
         this._runImageRequest(request);
       } else if (request === this._imageRequest) {
         this._imageQueued = false;
+        this._finishImageLoadDelay();
       }
     }, 1);
   }
@@ -6063,6 +6625,7 @@ class HTMLImageElement extends Element {
       if (request !== this._imageRequest) return;
       this._imageQueued = false;
       if (metadata && metadata.state === "stale") {
+        this._finishImageLoadDelay();
         this._refreshImageFromCache(true);
         this._queueImageRequest();
         return;
@@ -6143,6 +6706,7 @@ class HTMLImageElement extends Element {
     }
     this._imageCompletionDeferred = false;
     this._imageComplete = true;
+    this._finishImageLoadDelay();
     this._imageCurrentSrc = selected || this.src;
     const width = Number(metadata && metadata.width);
     const height = Number(metadata && metadata.height);
@@ -6155,7 +6719,7 @@ class HTMLImageElement extends Element {
       this._imageNaturalHeight = Number.isFinite(height) && height > 0 ? Math.round(height) : 0;
       this._resolveImageDecodes(request);
       if (dispatchEvent) {
-        try { this.dispatchEvent(new Event("load")); } catch (_error) {}
+        try { _dispatchTrustedElementEvent(this, "load"); } catch (_error) {}
       }
     } else {
       this._imageDecoded = false;
@@ -6163,7 +6727,7 @@ class HTMLImageElement extends Element {
       this._imageNaturalHeight = 0;
       this._rejectImageDecodes(request);
       if (dispatchEvent) {
-        try { this.dispatchEvent(new Event("error")); } catch (_error) {}
+        try { _dispatchTrustedElementEvent(this, "error"); } catch (_error) {}
       }
     }
     const lifecycleChanged =
@@ -6199,6 +6763,11 @@ class HTMLImageElement extends Element {
       }
     }
     this._imageDecodeWaiters = remaining;
+  }
+
+  _finishImageLoadDelay() {
+    _endResourceLoadDelay(this._imageDelaysLoad);
+    this._imageDelaysLoad = false;
   }
 
   addEventListener(type, callback, options) {
@@ -6322,6 +6891,71 @@ globalThis.TextTrackCue = TextTrackCue;
 globalThis.TextTrackCueList = TextTrackCueList;
 globalThis.VTTCue = VTTCue;
 
+// The event-handler attributes exposed by <body> are aliases for handlers on
+// its Window, not handlers dispatched at the body element. In particular,
+// body.onload, window.onload, and a parser-provided <body onload="..."> all
+// name the same load handler. Keep the mapping in the wrapper so both parser
+// documents and bodies created or mutated by script take the same path.
+class HTMLBodyElement extends Element {
+  _installWindowLoadHandlerFromAttribute() {
+    if (this.getAttribute("onload") === null) return;
+    if (this.__inlineHandlerCache) delete this.__inlineHandlerCache.onload;
+    const handler = this._resolveInlineHandler("onload");
+    globalThis.onload = typeof handler === "function" ? handler : null;
+  }
+  get onload() {
+    return typeof globalThis.onload === "function" ? globalThis.onload : null;
+  }
+  set onload(value) {
+    globalThis.onload = typeof value === "function" ? value : null;
+  }
+  setAttribute(name, value) {
+    const normalized = _htmlAttrName(this, name);
+    super.setAttribute(name, value);
+    if (normalized === "onload") this._installWindowLoadHandlerFromAttribute();
+  }
+  removeAttribute(name) {
+    const normalized = _htmlAttrName(this, name);
+    const hadAttribute = this.hasAttribute(name);
+    super.removeAttribute(name);
+    if (normalized === "onload" && hadAttribute) {
+      if (this.__inlineHandlerCache) delete this.__inlineHandlerCache.onload;
+      globalThis.onload = null;
+    }
+  }
+  setAttributeNS(namespace, name, value) {
+    const normalized = _htmlAttrName(this, name);
+    super.setAttributeNS(namespace, name, value);
+    if ((namespace === null || namespace === "") && normalized === "onload") {
+      this._installWindowLoadHandlerFromAttribute();
+    }
+  }
+  removeAttributeNS(namespace, name) {
+    const normalized = _htmlAttrName(this, name);
+    const unnamespaced = namespace === null || namespace === "";
+    const hadAttribute = unnamespaced && this.hasAttribute(name);
+    super.removeAttributeNS(namespace, name);
+    if (hadAttribute && normalized === "onload") {
+      if (this.__inlineHandlerCache) delete this.__inlineHandlerCache.onload;
+      globalThis.onload = null;
+    }
+  }
+}
+
+const _installParsedBodyLoadHandler =
+  HTMLBodyElement.prototype._installWindowLoadHandlerFromAttribute;
+Object.defineProperty(globalThis, "__obscura_installParsedBodyLoadHandler", {
+  value: function() {
+    const body = globalThis.document?.body;
+    if (body instanceof HTMLBodyElement) {
+      _installParsedBodyLoadHandler.call(body);
+    }
+  },
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
+
 function _elementClassFor(nid) {
   const tag = _domParse("tag_name", nid);
   // HTML tagName values are ASCII-uppercase. Foreign SVG names retain their
@@ -6335,6 +6969,7 @@ function _elementClassFor(nid) {
   }
   if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
   if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
+  if (tag === "BODY") return HTMLBodyElement;
   if (tag === "IMG") return HTMLImageElement;
   if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
   if (tag === "AUDIO") return HTMLAudioElement;
@@ -6355,6 +6990,7 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     const tag = localName.toUpperCase();
     if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
     if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
+    if (tag === "BODY") return HTMLBodyElement;
     if (tag === "IMG") return HTMLImageElement;
     if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
     if (tag === "AUDIO") return HTMLAudioElement;
@@ -6385,7 +7021,12 @@ function _wrapEl(nid) {
   return n;
 }
 
-globalThis._wrap = _wrap;
+Object.defineProperty(globalThis, "_wrap", {
+  value: _wrap,
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
 globalThis.self = globalThis;
 
 globalThis.document = null;
@@ -6464,7 +7105,12 @@ for (const _ev of [
   if (!(_on in globalThis)) globalThis[_on] = null;
   for (const _proto of [Document.prototype, Element.prototype]) {
     if (!(_on in _proto)) {
-      Object.defineProperty(_proto, _on, { value: null, writable: true, configurable: true, enumerable: false });
+      Object.defineProperty(_proto, _on, {
+        get() { return _eventTargetHandler(this, _ev); },
+        set(callback) { _eventTargetSetHandler(this, _ev, callback); },
+        configurable: true,
+        enumerable: false,
+      });
     }
   }
 }
@@ -9602,6 +10248,51 @@ globalThis.Event = class Event {
   }
 };
 _markNative(Event);
+// Browser-generated lifecycle/resource events must not depend on page-mutable
+// constructors or dispatch methods. Capture both before page code can run and
+// mark through the closure-private trusted-event set rather than the public CDP
+// compatibility helper.
+const _uaEventConstructor = globalThis.Event;
+const _uaElementDispatchEvent = Element.prototype.dispatchEvent;
+const _uaDocumentDispatchEvent = Document.prototype.dispatchEvent;
+function _createTrustedUaEvent(type, init = {}) {
+  const event = new _uaEventConstructor(type, init);
+  _trustedEvents.add(event);
+  return event;
+}
+function _dispatchTrustedElementEvent(element, type, init = {}) {
+  return _uaElementDispatchEvent.call(
+    element,
+    _createTrustedUaEvent(type, {
+      bubbles: false,
+      cancelable: false,
+      ...init,
+    }),
+  );
+}
+function _dispatchTrustedDocumentLifecycleEvent(type) {
+  type = String(type);
+  if (type !== "readystatechange" && type !== "DOMContentLoaded") return false;
+  const document = globalThis.document;
+  if (!(document instanceof Document)) return false;
+  return _uaDocumentDispatchEvent.call(
+    document,
+    _createTrustedUaEvent(type, {
+      bubbles: type === "DOMContentLoaded",
+      cancelable: false,
+    }),
+  );
+}
+function _dispatchTrustedWindowLoadEvent() {
+  const event = _createTrustedUaEvent("load", {
+    bubbles: false,
+    cancelable: false,
+  });
+  // Window.load has a legacy target override of Document while its current
+  // target and listener table still belong to Window.
+  event.target = globalThis.document;
+  return _eventTargetDispatch(globalThis, event);
+}
 globalThis.CustomEvent = class extends Event {
   constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'CustomEvent': 1 argument required, but only 0 present."); super(t,o);this.detail=o.detail!==undefined?o.detail:null; }
   // Legacy DOM Level 2 init; some libraries (Starbucks China bundle, older
@@ -11331,7 +12022,7 @@ globalThis.HTMLStyleElement = Element;
 globalThis.HTMLLinkElement = Element;
 globalThis.HTMLMetaElement = Element;
 globalThis.HTMLHeadElement = Element;
-globalThis.HTMLBodyElement = Element;
+globalThis.HTMLBodyElement = HTMLBodyElement;
 globalThis.HTMLHtmlElement = Element;
 globalThis.HTMLBRElement = Element;
 globalThis.HTMLHRElement = Element;
@@ -12158,16 +12849,57 @@ const _iframeWindowProxyHandler = {
 // picks them up; a global added later would stay enumerable on `window`.
 globalThis.__obscura_frameId = 0;        // 0 is the page's own realm
 globalThis.__obscura_parentFrameId = 0;
-globalThis.__obscura_frameWindows = Object.create(null); // frame id -> its window
+const _obscuraFrameWindows = Object.create(null); // frame id -> its window
 // frame id -> the iframe element that owns it. The host uses this composed-tree
 // registry to retain frames inside closed shadow roots without keeping removed
 // elements alive after their browsing context is released.
-globalThis.__obscura_frameElements = Object.create(null);
+const _obscuraFrameElements = Object.create(null);
 // frame id -> that frame's real window and document, filled by the host.
 // Declared here rather than created by the host at runtime: the hide list is
 // computed from this global at snapshot time, so a property the host adds later
 // would stay enumerable on `window` and be visible to any script that walks it.
-globalThis.__obscura_frameObjects = Object.create(null);
+const _obscuraFrameObjects = Object.create(null);
+
+// Page code may inspect the compatibility tables, but it must not replace
+// them with a Proxy or install per-id accessors around host publication and
+// teardown. Those operations happen while Page owns the isolate and a hostile
+// setter would otherwise turn ordinary iframe churn into an unbounded context
+// leak (or a non-returning host call). The host mutates the closure-private
+// tables through the fixed helpers below; this view is intentionally read-only.
+function _readOnlyFrameRegistry(backing) {
+  return new Proxy(Object.create(null), {
+    get(_target, key) { return backing[key]; },
+    has(_target, key) { return key in backing; },
+    ownKeys() { return Reflect.ownKeys(backing); },
+    getOwnPropertyDescriptor(_target, key) {
+      if (!(key in backing)) return undefined;
+      return { value: backing[key], writable: false, enumerable: true, configurable: true };
+    },
+    set() { return false; },
+    defineProperty() { return false; },
+    deleteProperty() { return false; },
+    setPrototypeOf() { return false; },
+  });
+}
+for (const [name, backing] of [
+  ['__obscura_frameWindows', _obscuraFrameWindows],
+  ['__obscura_frameElements', _obscuraFrameElements],
+  ['__obscura_frameObjects', _obscuraFrameObjects],
+]) {
+  Object.defineProperty(globalThis, name, {
+    value: _readOnlyFrameRegistry(backing),
+    writable: false,
+    enumerable: true,
+    configurable: false,
+  });
+}
+
+globalThis.__obscura_publishFrameObjects = function(frameId, frameWindow, frameDocument) {
+  frameId = frameId >>> 0;
+  if (!frameId) return false;
+  _obscuraFrameObjects[frameId] = { window: frameWindow, document: frameDocument };
+  return true;
+};
 // The frames of this realm whose element is still in the document.
 //
 // Liveness is asked of the element, not of a document query: an iframe inside
@@ -12176,20 +12908,46 @@ globalThis.__obscura_frameObjects = Object.create(null);
 // Treating it as gone would tear down a frame that is still in the page.
 globalThis.__obscura_liveFrameIds = function () {
   const live = [];
-  for (const id in globalThis.__obscura_frameElements) {
-    const element = globalThis.__obscura_frameElements[id];
+  for (const id in _obscuraFrameElements) {
+    const element = _obscuraFrameElements[id];
     if (element && element.isConnected) live.push(id >>> 0);
   }
   return live;
+};
+
+globalThis.__obscura_frameOwnerIsLive = function(frameId) {
+  frameId = frameId >>> 0;
+  const element = _obscuraFrameElements[frameId];
+  return Boolean(element && element._frameId === frameId && element.isConnected);
+};
+
+// Complete the owner element only after the host has completed the matching
+// child realm. The id and connectivity guards suppress stale completions after
+// src/srcdoc replacement or removal, and the per-id marker makes repeated host
+// readiness sweeps idempotent.
+globalThis.__obscura_dispatchFrameOwnerLoad = function(frameId) {
+    frameId = frameId >>> 0;
+    const element = _obscuraFrameElements[frameId];
+    if (!element || !element.isConnected || element._frameId !== frameId) return false;
+    if (element._iframeLoadDispatchedFrameId === frameId) return false;
+    _dispatchTrustedElementEvent(element, "load");
+    element._iframeLoadDispatchedFrameId = frameId;
+    return true;
 };
 
 // Drop everything this realm holds for a frame the host has discarded. One
 // place, so a registry added later cannot be missed by the discard path: any
 // surviving reference keeps the frame's context and DOM tree alive.
 globalThis.__obscura_forgetFrame = function (frameId) {
-  delete globalThis.__obscura_frameElements[frameId];
-  delete globalThis.__obscura_frameObjects[frameId];
-  delete globalThis.__obscura_frameWindows[frameId];
+  frameId = frameId >>> 0;
+  const element = _obscuraFrameElements[frameId];
+  if (element && element._frameId === frameId) {
+    element._frameId = 0;
+    if (element._iframeWin) element._iframeWin._frameId = 0;
+  }
+  delete _obscuraFrameElements[frameId];
+  delete _obscuraFrameObjects[frameId];
+  delete _obscuraFrameWindows[frameId];
 };
 
 function _realmOrigin() {
@@ -12222,7 +12980,7 @@ function _sendRealmMessage(targetFrameId, data) {
 function _frameObjectsFor(element) {
   const frameId = element._frameId;
   if (!frameId) return null;
-  const entry = globalThis.__obscura_frameObjects[frameId];
+  const entry = _obscuraFrameObjects[frameId];
   return entry || null;
 }
 
@@ -12235,8 +12993,8 @@ function _frameObjectsFor(element) {
 // and receiver, losing the sender's origin and source.
 function _frameWindowFor(frameId) {
   if (!frameId) return null;
-  const real = globalThis.__obscura_frameObjects?.[frameId]?.window;
-  const existing = globalThis.__obscura_frameWindows[frameId];
+  const real = _obscuraFrameObjects[frameId]?.window;
+  const existing = _obscuraFrameWindows[frameId];
   if (!real) return existing || null;
   if (existing && existing.__obscura_wrapsRealm) return existing;
 
@@ -12255,8 +13013,19 @@ function _frameWindowFor(frameId) {
       return prop === '__obscura_wrapsRealm' || Reflect.has(target, prop);
     },
   });
-  globalThis.__obscura_frameWindows[frameId] = win;
+  _obscuraFrameWindows[frameId] = win;
   return win;
+}
+
+for (const name of [
+  '__obscura_publishFrameObjects', '__obscura_liveFrameIds',
+  '__obscura_frameOwnerIsLive', '__obscura_dispatchFrameOwnerLoad',
+  '__obscura_forgetFrame',
+]) {
+  const value = globalThis[name];
+  Object.defineProperty(globalThis, name, {
+    value, writable: false, enumerable: true, configurable: false,
+  });
 }
 
 // The host calls this inside the target realm.
@@ -14845,6 +15614,17 @@ globalThis.__obscura_init = function() {
   // wrongly changes everything after it.
   _installFramingRelationships();
 
+  // Parser-created images never pass through an IDL setter. Start every eager
+  // request before parser scripts can finish the document so the top-level
+  // load gate includes images even when page JavaScript never touches them.
+  // Use the native shadow-including traversal for declarative shadow roots.
+  for (const nid of (_domParse('connected_images') || [])) {
+    const image = _wrapEl(nid);
+    if (image instanceof HTMLImageElement && image.loading !== 'lazy') {
+      image._queueImageRequest();
+    }
+  }
+
   // Parser-created iframes never went through an IDL setter. Ask the native
   // tree for a shadow-including list: querySelectorAll intentionally cannot
   // pierce declarative shadow roots, but their browsing contexts still load.
@@ -14857,6 +15637,7 @@ globalThis.__obscura_init = function() {
     }
     const src = frame.getAttribute('src');
     if (src && src !== 'about:blank') frame._loadIframeSrc(src);
+    else frame._loadIframeBlank();
   }
 
   // Hide internals (_*, obscura, Obscura). The set of keys is static at

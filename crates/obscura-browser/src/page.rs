@@ -1,9 +1,12 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
-use obscura_js::frame::FrameRealm;
-use obscura_js::runtime::ObscuraJsRuntime;
+use obscura_js::frame::{FrameLifecycleState, FrameRealm};
+use obscura_js::runtime::{ObscuraJsRuntime, WatchdogToken};
 use obscura_net::{
     CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, RequestInfo,
     ResourceRequest, ResourceType, Response, ResponseCallback,
@@ -12,6 +15,14 @@ use url::Url;
 
 use crate::context::BrowserContext;
 use crate::lifecycle::LifecycleState;
+
+struct ScriptLoadPhase {
+    deadline: tokio::time::Instant,
+    watchdog: Option<WatchdogToken>,
+}
+
+const LIFECYCLE_CALLBACK_WATCHDOG_MS: u64 = 5_500;
+static NEXT_CDP_PAGE_AWAIT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Parse `OBSCURA_GEOLOCATION="lat,lon"` for the navigator.geolocation shim.
 /// Returns None when unset or malformed, leaving the built-in default in place.
@@ -392,6 +403,10 @@ pub struct Page {
     pub frames: Vec<FrameRealm>,
     pub js: Option<ObscuraJsRuntime>,
     pub lifecycle: LifecycleState,
+    /// The top document has fired DOMContentLoaded but still has load-event
+    /// blockers. Autonomous browser turns may complete it after a caller that
+    /// waited only for DOMContentLoaded has already returned.
+    top_load_pending: bool,
     pub http_client: Arc<ObscuraHttpClient>,
     pub context: Arc<BrowserContext>,
     pub title: String,
@@ -453,6 +468,11 @@ pub struct Page {
     // closure over the single binding op, so hiding `Deno.core.ops` does not
     // break exposeFunction or reopen the full native op table.
     preload_bindings: Vec<String>,
+    /// Fetched parser stylesheet completions waiting for their encounter point
+    /// in the HTML script runner. Fetching may happen eagerly, but installing
+    /// the sheet or dispatching its owner event must not jump ahead of an
+    /// earlier parser-blocking script.
+    pending_parser_stylesheet_events: std::collections::BTreeMap<u32, (usize, String)>,
     /// Document-owned HTML script preparation flags saved while the V8 realm
     /// is suspended for CDP/MCP tab switching.  These are restored only when
     /// the same surviving DomTree is resumed; navigation clears them.
@@ -509,16 +529,70 @@ struct LoadedStylesheet {
     rules: String,
 }
 
+struct FetchedStylesheets {
+    materialized: Vec<(AuthorStylesheetTarget, String)>,
+    failed_links: Vec<(u32, usize, String, Option<String>)>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StylesheetImport {
     url: String,
     media: Option<String>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum AuthorStylesheetTarget {
-    Linked(usize),
-    InlineImport(usize),
+    Linked {
+        nid: u32,
+        parser_order: usize,
+        raw_href: String,
+        request_href: String,
+    },
+    InlineImport {
+        nid: u32,
+    },
+}
+
+#[derive(Clone)]
+struct ParserStylesheetLinkSnapshot {
+    nid: u32,
+    parser_order: usize,
+    raw_href: String,
+    base_url: Url,
+}
+
+#[derive(Clone)]
+struct ParserInlineImportSnapshot {
+    nid: u32,
+    import: StylesheetImport,
+    base_url: Url,
+}
+
+struct ParserStylesheetSnapshot {
+    links: Vec<ParserStylesheetLinkSnapshot>,
+    inline_imports: Vec<ParserInlineImportSnapshot>,
+    body_parser_order: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ScriptKind {
+    Classic,
+    Module,
+    ImportMap,
+}
+
+#[derive(Debug)]
+struct ScriptInfo {
+    src: Option<String>,
+    inline: String,
+    is_defer: bool,
+    is_async: bool,
+    kind: ScriptKind,
+    nid: u32,
+    after_body_start: bool,
+    /// Document base URL at this element's parser encounter point.
+    base_url: String,
+    parser_order: usize,
 }
 
 fn canonical_stylesheet_url(mut url: Url) -> (String, Url) {
@@ -920,13 +994,44 @@ fn parse_import_url(stmt: &str) -> Option<StylesheetImport> {
 /// CSS cascade even when the external fetches themselves complete in order.
 /// The synthetic style retains the link's effective media query so the same
 /// fetched bytes can enter print layout without leaking into screen layout.
-fn materialize_linked_stylesheet_script(link_index: usize, css: &str) -> String {
+fn materialize_stylesheet_for_owner_script(
+    owner_expression: &str,
+    css: &str,
+    request_href: Option<&str>,
+    expected_raw_href: Option<&str>,
+) -> String {
     let escaped_css = escape_for_js_template_literal(css);
+    let request_href = request_href
+        .and_then(|value| serde_json::to_string(value).ok())
+        .unwrap_or_else(|| "null".to_string());
+    let expected_raw_href = expected_raw_href
+        .and_then(|value| serde_json::to_string(value).ok())
+        .unwrap_or_else(|| "null".to_string());
     format!(
         r#"(function() {{
-            var links = document.querySelectorAll('link[rel~="stylesheet"]');
-            var link = links[{link_index}];
+            var link = {owner_expression};
             if (!link || !link.parentNode) return;
+            var requestHref = {request_href};
+            var expectedRawHref = {expected_raw_href};
+            // Parser transport owns the request captured at the element's
+            // encounter point. A later href rewrite starts distinct dynamic
+            // work; the stale parser response must not install CSS or complete
+            // that newer request. Compare the raw token rather than baseURI,
+            // because a later <base> legitimately changes the live resolver
+            // without changing the already-started parser request.
+            if (expectedRawHref !== null
+                && link.getAttribute('href') !== expectedRawHref) return;
+            // href/rel removal invalidates the parser request even if script
+            // restores the same raw href before its response arrives. The
+            // closure-owned marker distinguishes that new processing epoch;
+            // raw-string equality alone cannot.
+            if (expectedRawHref !== null
+                && (!globalThis.__obscura_isParserStylesheetPending
+                    || !globalThis.__obscura_isParserStylesheetPending(link))) return;
+            // The JS loader may have completed while the page transport was
+            // fetching the same candidate. Its sheet and owner event win;
+            // materializing again would duplicate both CSS and load.
+            if (link.sheet != null) return;
             var style = null;
             function effectiveMedia() {{
                 // Until the generic Element shim reflects HTMLLinkElement.media,
@@ -942,7 +1047,8 @@ fn materialize_linked_stylesheet_script(link_index: usize, css: &str) -> String 
                     style = document.createElement('style');
                     style.setAttribute('data-obscura-external-stylesheets', '');
                     style.textContent = `{escaped_css}`;
-                    globalThis.__obscura_registerLinkedStylesheet(link, style);
+                    globalThis.__obscura_registerLinkedStylesheet(
+                        link, style, requestHref === null ? undefined : requestHref);
                 }}
                 var enabled = link.parentNode
                     && !link.disabled
@@ -963,8 +1069,84 @@ fn materialize_linked_stylesheet_script(link_index: usize, css: &str) -> String 
             // may then make the sheet applicable (the common
             // media=print/onload="this.media='all'" async-CSS pattern).
             syncSheet();
-            try {{ link.dispatchEvent(new Event('load')); }}
+            try {{
+                globalThis.__obscura_completeLinkedStylesheet(
+                    link,
+                    'load',
+                    requestHref === null ? undefined : requestHref,
+                    expectedRawHref === null ? undefined : expectedRawHref);
+            }}
             finally {{ syncSheet(); }}
+        }})()"#
+    )
+}
+
+fn materialize_linked_stylesheet_script(link_index: usize, css: &str) -> String {
+    materialize_stylesheet_for_owner_script(
+        &format!("document.querySelectorAll('link[rel~=\"stylesheet\"]')[{link_index}]"),
+        css,
+        None,
+        None,
+    )
+}
+
+/// Parser stylesheet completion addressed by the owner's stable native node
+/// id. Earlier parser scripts may insert, remove, or reorder other links, so a
+/// querySelectorAll index captured before script execution is not an identity.
+fn materialize_parser_stylesheet_script_with_token(
+    link_nid: u32,
+    css: &str,
+    request_href: &str,
+    expected_raw_href: &str,
+) -> String {
+    materialize_stylesheet_for_owner_script(
+        &format!("globalThis._wrap && globalThis._wrap({link_nid})"),
+        css,
+        Some(request_href),
+        Some(expected_raw_href),
+    )
+}
+
+fn materialize_parser_stylesheet_script(link_nid: u32, css: &str) -> String {
+    materialize_stylesheet_for_owner_script(
+        &format!("globalThis._wrap && globalThis._wrap({link_nid})"),
+        css,
+        None,
+        None,
+    )
+}
+
+fn complete_parser_stylesheet_script_with_token(
+    link_nid: u32,
+    event_type: &str,
+    request_href: Option<&str>,
+    expected_raw_href: &str,
+) -> String {
+    debug_assert!(matches!(event_type, "load" | "error"));
+    let request_href = request_href
+        .and_then(|value| serde_json::to_string(value).ok())
+        .unwrap_or_else(|| "undefined".to_string());
+    let expected_raw_href =
+        serde_json::to_string(expected_raw_href).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(function() {{
+            var link = globalThis._wrap && globalThis._wrap({link_nid});
+            if (link && typeof globalThis.__obscura_completeLinkedStylesheet === 'function') {{
+                globalThis.__obscura_completeLinkedStylesheet(
+                    link, '{event_type}', {request_href}, {expected_raw_href});
+            }}
+        }})()"#
+    )
+}
+
+fn complete_parser_stylesheet_script(link_nid: u32, event_type: &str) -> String {
+    debug_assert!(matches!(event_type, "load" | "error"));
+    format!(
+        r#"(function() {{
+            var link = globalThis._wrap && globalThis._wrap({link_nid});
+            if (link && typeof globalThis.__obscura_completeLinkedStylesheet === 'function') {{
+                globalThis.__obscura_completeLinkedStylesheet(link, '{event_type}');
+            }}
         }})()"#
     )
 }
@@ -974,8 +1156,8 @@ fn materialize_linked_stylesheet_script(link_index: usize, css: &str) -> String 
 /// warmup fetches those links through the same frame-aware page transport,
 /// which naturally handles arbitrary import graphs one depth at a time while
 /// keeping every response attributable to the child frame.
-fn queue_stylesheet_imports_script(
-    link_index: usize,
+fn queue_stylesheet_imports_for_owner_script(
+    owner_expression: &str,
     imports: &[StylesheetImport],
     response_url: &Url,
     next_depth: u8,
@@ -994,8 +1176,7 @@ fn queue_stylesheet_imports_script(
     let imports = serde_json::to_string(&imports).unwrap_or_else(|_| "[]".to_string());
     format!(
         r#"(function() {{
-            var links = document.querySelectorAll('link[rel~="stylesheet"]');
-            var owner = links[{link_index}];
+            var owner = {owner_expression};
             if (!owner || !owner.parentNode) throw new Error('stylesheet owner disappeared');
             var inherited = (owner.getAttribute('media') || '').trim();
             var imports = {imports};
@@ -1013,6 +1194,23 @@ fn queue_stylesheet_imports_script(
                 owner.parentNode.insertBefore(pending, owner);
             }}
         }})()"#,
+    )
+}
+
+/// Queue imports for a stylesheet discovered after parser execution. Archive
+/// warmup re-scans the live document on each pass, so its current selector
+/// index intentionally identifies the owner in that same pass.
+fn queue_stylesheet_imports_script(
+    link_index: usize,
+    imports: &[StylesheetImport],
+    response_url: &Url,
+    next_depth: u8,
+) -> String {
+    queue_stylesheet_imports_for_owner_script(
+        &format!("document.querySelectorAll('link[rel~=\"stylesheet\"]')[{link_index}]"),
+        imports,
+        response_url,
+        next_depth,
     )
 }
 
@@ -1077,20 +1275,11 @@ fn queue_inline_stylesheet_imports_script(
 /// `<style>`. Imported rules precede the importing sheet in the author cascade,
 /// and inherit the source sheet's own media condition in addition to the
 /// import rule's media wrapper.
-fn materialize_inline_import_script(style_index: usize, css: &str) -> String {
+fn materialize_inline_import_script(style_nid: u32, css: &str) -> String {
     let escaped_css = escape_for_js_template_literal(css);
     format!(
         r#"(function() {{
-            var styles = document.querySelectorAll('style');
-            var source = null;
-            var authorIndex = -1;
-            for (var i = 0; i < styles.length; i++) {{
-                var candidate = styles[i];
-                if (candidate.hasAttribute('data-obscura-external-stylesheets')
-                    || candidate.hasAttribute('data-obscura-inline-import')) continue;
-                authorIndex++;
-                if (authorIndex === {style_index}) {{ source = candidate; break; }}
-            }}
+            var source = globalThis._wrap && globalThis._wrap({style_nid});
             if (!source || !source.parentNode) return;
             source.setAttribute('data-obscura-imports-materialized', '');
             var imported = document.createElement('style');
@@ -1103,11 +1292,108 @@ fn materialize_inline_import_script(style_index: usize, css: &str) -> String {
     )
 }
 
+/// Parser stylesheet requests with stable owner ids and encounter order. Page
+/// freezes these before new-document preload code can insert, move, or rewrite
+/// live style/link nodes in the already-parsed backing tree.
+fn parser_stylesheet_requests(
+    dom: &DomTree,
+    document_url: &Url,
+) -> (
+    Vec<ParserStylesheetLinkSnapshot>,
+    Vec<ParserInlineImportSnapshot>,
+    Option<usize>,
+) {
+    let mut order = std::collections::HashMap::new();
+    let mut bases_at_node = std::collections::HashMap::new();
+    let mut active_base = document_url.clone();
+    let mut found_base = false;
+    let mut body_parser_order = None;
+    for (parser_order, nid) in dom.descendants(dom.document()).into_iter().enumerate() {
+        order.insert(nid.raw(), parser_order);
+        let Some(node) = dom.get_node(nid) else {
+            continue;
+        };
+        let Some(name) = node.as_element() else {
+            continue;
+        };
+        let local_name = name.local.as_ref();
+        if local_name == "base" && !found_base {
+            if let Some(href) = node.get_attribute("href") {
+                found_base = true;
+                if let Ok(resolved) = active_base.join(href) {
+                    active_base = resolved;
+                }
+            }
+            continue;
+        }
+        if local_name == "body" && body_parser_order.is_none() {
+            body_parser_order = Some(parser_order);
+        }
+        if matches!(local_name, "link" | "style") {
+            bases_at_node.insert(nid.raw(), active_base.clone());
+        }
+    }
+
+    let mut links = Vec::new();
+    for lid in dom
+        .query_selector_all("link[rel~=\"stylesheet\"]")
+        .unwrap_or_default()
+    {
+        let Some(node) = dom.get_node(lid) else {
+            continue;
+        };
+        if node.get_attribute("disabled").is_some() {
+            continue;
+        }
+        if let Some(href) = node.get_attribute("href") {
+            links.push(ParserStylesheetLinkSnapshot {
+                nid: lid.raw(),
+                parser_order: order.get(&lid.raw()).copied().unwrap_or(usize::MAX),
+                raw_href: href.to_string(),
+                base_url: bases_at_node
+                    .get(&lid.raw())
+                    .cloned()
+                    .unwrap_or_else(|| document_url.clone()),
+            });
+        }
+    }
+
+    let mut inline_imports = Vec::new();
+    for style_id in dom.query_selector_all("style").unwrap_or_default() {
+        let Some(node) = dom.get_node(style_id) else {
+            continue;
+        };
+        if node
+            .get_attribute("data-obscura-external-stylesheets")
+            .is_some()
+            || node.get_attribute("data-obscura-inline-import").is_some()
+        {
+            continue;
+        }
+        let (style_imports, _) = split_css_imports(&dom.text_content(style_id));
+        let base_url = bases_at_node
+            .get(&style_id.raw())
+            .cloned()
+            .unwrap_or_else(|| document_url.clone());
+        inline_imports.extend(
+            style_imports
+                .into_iter()
+                .map(|import| ParserInlineImportSnapshot {
+                    nid: style_id.raw(),
+                    import,
+                    base_url: base_url.clone(),
+                }),
+        );
+    }
+    (links, inline_imports, body_parser_order)
+}
+
 /// Discover linked author sheets in document order.
 ///
 /// Media queries control whether a loaded sheet participates in the cascade;
 /// they do not suppress its fetch or `load` event. Keep the index among all
 /// stylesheet links so the materialization script addresses the same node.
+#[cfg(test)]
 fn linked_stylesheet_requests(dom: &DomTree) -> Vec<(usize, String)> {
     let link_ids = dom
         .query_selector_all("link[rel~=\"stylesheet\"]")
@@ -1126,35 +1412,6 @@ fn linked_stylesheet_requests(dom: &DomTree) -> Vec<(usize, String)> {
         }
     }
     links
-}
-
-/// Discover fetchable `@import` rules in inline author sheets. The source
-/// index excludes Obscura's own materialized sheets so it remains stable while
-/// imports are inserted before their source nodes.
-fn inline_stylesheet_import_requests(dom: &DomTree) -> Vec<(usize, StylesheetImport)> {
-    let style_ids = dom.query_selector_all("style").unwrap_or_default();
-    let mut imports = Vec::new();
-    let mut author_index = 0usize;
-    for style_id in style_ids {
-        let Some(node) = dom.get_node(style_id) else {
-            continue;
-        };
-        if node
-            .get_attribute("data-obscura-external-stylesheets")
-            .is_some()
-            || node.get_attribute("data-obscura-inline-import").is_some()
-        {
-            continue;
-        }
-        let (style_imports, _) = split_css_imports(&dom.text_content(style_id));
-        imports.extend(
-            style_imports
-                .into_iter()
-                .map(|import| (author_index, import)),
-        );
-        author_index += 1;
-    }
-    imports
 }
 
 impl Page {
@@ -1190,6 +1447,7 @@ impl Page {
             frames: Vec::new(),
             js: None,
             lifecycle: LifecycleState::Idle,
+            top_load_pending: false,
             http_client,
             context,
             title: String::new(),
@@ -1215,6 +1473,7 @@ impl Page {
             intercept_tx: None,
             preload_scripts: Vec::new(),
             preload_bindings: Vec::new(),
+            pending_parser_stylesheet_events: std::collections::BTreeMap::new(),
             suspended_started_script_ids: Vec::new(),
             callbacks: Arc::new(CallbackRegistry::new()),
             resource_capture: None,
@@ -1239,10 +1498,13 @@ impl Page {
     }
 
     fn mark_resource_archive_incomplete(&mut self, reason: impl Into<String>) {
-        self.resource_archive_incomplete_reasons.insert(reason.into());
+        self.resource_archive_incomplete_reasons
+            .insert(reason.into());
     }
 
     fn begin_top_document(&mut self) {
+        self.top_load_pending = false;
+        self.pending_parser_stylesheet_events.clear();
         self.resource_archive_incomplete_reasons.clear();
         let document_generation = self.callbacks.begin_document();
         if let Some(capture) = &self.resource_capture {
@@ -1277,15 +1539,37 @@ impl Page {
     /// event loop turns. Reports whether anything was attached, so a caller can
     /// settle and come back for frames that these frames created.
     async fn attach_pending_frames(&mut self) -> bool {
-        let pending = match self.js.as_ref() {
-            Some(js) => js.take_pending_frames(),
+        let mut pending = match self.js.as_ref() {
+            Some(js) => js.take_pending_frame_drain(),
             None => return false,
         };
         if pending.is_empty() {
             return false;
         }
 
-        for frame in pending {
+        while let Some(frame) = pending.next() {
+            // The queue was moved into this cancellation-safe drain before we
+            // started attaching it. An earlier child can synchronously remove
+            // a later iframe while its PendingFrame is already in the drain,
+            // beyond the reach of op_cancel_frame_document. Revalidate the
+            // owner id and composed-tree connection at the attachment boundary.
+            match self.frame_owner_is_live(frame.parent_frame_id, frame.frame_id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.forget_frame_references(frame.frame_id, frame.parent_frame_id);
+                    pending.finish_current();
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "could not verify owner liveness for frame {}: {error}",
+                        frame.frame_id
+                    );
+                    self.top_load_pending = false;
+                    self.lifecycle = LifecycleState::Failed;
+                    return false;
+                }
+            }
             // A realm is a live v8::Context plus a DOM tree, and the page realm
             // holds its window and document, so nothing here can be collected
             // while the document lives. Frames are released when the document
@@ -1302,11 +1586,13 @@ impl Page {
                 self.mark_resource_archive_incomplete(format!(
                     "live frame cap reached ({cap} realms)"
                 ));
+                self.dispatch_frame_owner_load(frame.parent_frame_id, frame.frame_id);
                 self.forget_frame_references(frame.frame_id, frame.parent_frame_id);
+                pending.finish_current();
                 continue;
             }
             let realm = match self.js.as_mut().and_then(|js| {
-                FrameRealm::new_with_inherited_context(
+                FrameRealm::new_staged_with_inherited_context(
                     js,
                     frame.frame_id,
                     frame.parent_frame_id,
@@ -1323,7 +1609,9 @@ impl Page {
                         "frame realm creation failed: {}",
                         frame.url,
                     ));
+                    self.dispatch_frame_owner_load(frame.parent_frame_id, frame.frame_id);
                     self.forget_frame_references(frame.frame_id, frame.parent_frame_id);
+                    pending.finish_current();
                     continue;
                 }
             };
@@ -1340,55 +1628,58 @@ impl Page {
                     .unwrap_or_else(|| initiator.clone()),
                 None => initiator.clone(),
             };
-            let inline_stylesheets = match self.js.as_mut() {
-                Some(js) => realm.inline_stylesheet_sources(js),
-                None => Ok(Vec::new()),
-            };
-            match inline_stylesheets {
-                Ok(inline_stylesheets) => {
-                    for (style_index, css, _) in inline_stylesheets {
-                        let (imports, rules) = split_css_imports(&css);
-                        if imports.is_empty() {
-                            continue;
-                        }
-                        for import in &imports {
-                            if style_base.join(&import.url).is_err() {
-                                self.mark_resource_archive_incomplete(format!(
-                                    "frame {} inline stylesheet import URL could not be resolved: {}",
-                                    realm.frame_id(), import.url,
-                                ));
-                            }
-                        }
-                        let queued = match self.js.as_mut() {
-                            Some(js) => realm.execute_script(
-                                js,
-                                &queue_inline_stylesheet_imports_script(
-                                    style_index,
-                                    &rules,
-                                    &imports,
-                                    &style_base,
-                                    1,
-                                ),
-                            ),
-                            None => Err("frame JavaScript runtime disappeared".to_string()),
-                        };
-                        if let Err(error) = queued {
-                            self.mark_resource_archive_incomplete(format!(
-                                "frame {} inline stylesheet import setup failed: {}",
-                                realm.frame_id(), error,
-                            ));
-                        }
+            let inline_stylesheets = realm.parser_inline_stylesheet_sources();
+            for (style_index, css, _, base_url) in inline_stylesheets {
+                let style_encounter_base =
+                    Url::parse(&base_url).unwrap_or_else(|_| style_base.clone());
+                let (imports, rules) = split_css_imports(&css);
+                if imports.is_empty() {
+                    continue;
+                }
+                for import in &imports {
+                    if style_encounter_base.join(&import.url).is_err() {
+                        self.mark_resource_archive_incomplete(format!(
+                            "frame {} inline stylesheet import URL could not be resolved: {}",
+                            realm.frame_id(),
+                            import.url,
+                        ));
                     }
                 }
-                Err(error) => self.mark_resource_archive_incomplete(format!(
-                    "frame {} inline stylesheet scan failed: {}",
-                    realm.frame_id(), error,
-                )),
+                let queued = match self.js.as_mut() {
+                    Some(js) => realm.execute_script(
+                        js,
+                        &queue_inline_stylesheet_imports_script(
+                            style_index,
+                            &rules,
+                            &imports,
+                            &style_encounter_base,
+                            1,
+                        ),
+                    ),
+                    None => Err("frame JavaScript runtime disappeared".to_string()),
+                };
+                if let Err(error) = queued {
+                    self.mark_resource_archive_incomplete(format!(
+                        "frame {} inline stylesheet import setup failed: {}",
+                        realm.frame_id(),
+                        error,
+                    ));
+                }
             }
-            let wanted_stylesheets = match self.js.as_mut() {
-                Some(js) => realm.external_stylesheet_urls(js),
-                None => Vec::new(),
-            };
+            let mut wanted_stylesheets = realm
+                .parser_stylesheet_urls()
+                .into_iter()
+                .map(|(link_index, link_nid, url, import_depth, raw_href)| {
+                    (link_index, link_nid, url, import_depth, Some(raw_href))
+                })
+                .collect::<Vec<_>>();
+            if let Some(js) = self.js.as_mut() {
+                wanted_stylesheets.extend(realm.external_stylesheet_urls(js).into_iter().map(
+                    |(link_index, link_nid, url, import_depth)| {
+                        (link_index, link_nid, url, import_depth, None)
+                    },
+                ));
+            }
             let inline_style_sources = match self.js.as_mut() {
                 Some(js) => realm.style_sources(js),
                 None => Vec::new(),
@@ -1403,14 +1694,67 @@ impl Page {
                     }
                 }
             }
-            let mut stylesheets = Vec::new();
-            for (link_index, url, import_depth) in wanted_stylesheets {
+            // Fetch the complete parser stylesheet graph before any owner
+            // completion is queued. A linked sheet is not ready when only its
+            // root response has arrived: every leading @import must reach a
+            // terminal response first, and the root link's load/error event
+            // must remain at its parser position after that work completes.
+            let mut stylesheet_roots = Vec::new();
+            let mut stylesheet_sheets = std::collections::HashMap::new();
+            let mut stylesheet_aliases = std::collections::HashMap::new();
+            let mut scheduled_stylesheets = std::collections::HashSet::new();
+            let mut pending_stylesheets = Vec::new();
+            let mut failed_stylesheet_links = Vec::new();
+            for (link_index, link_nid, url, import_depth, raw_href) in wanted_stylesheets {
+                // Non-zero depths identify synthetic links created above for
+                // inline @import rules. Fetch those through this same graph,
+                // but materialize them directly later: unlike depth-zero
+                // parser links, they are not in the frame's parser snapshot.
+                let is_parser_owner = raw_href.is_some();
                 let Ok(parsed) = Url::parse(&url) else {
+                    failed_stylesheet_links.push((
+                        link_index,
+                        link_nid,
+                        is_parser_owner,
+                        raw_href,
+                        None,
+                    ));
                     continue;
                 };
-                if self.should_block_url(&url) {
+                if self.should_block_url(&url)
+                    || !subresource_allowed(Some(&initiator), parsed.as_str())
+                {
+                    failed_stylesheet_links.push((
+                        link_index,
+                        link_nid,
+                        is_parser_owner,
+                        raw_href,
+                        Some(url),
+                    ));
                     continue;
                 }
+                let (key, parsed) = canonical_stylesheet_url(parsed);
+                stylesheet_roots.push((
+                    link_index,
+                    link_nid,
+                    key.clone(),
+                    is_parser_owner,
+                    raw_href,
+                    url,
+                ));
+                if scheduled_stylesheets.insert(key.clone()) {
+                    if scheduled_stylesheets.len() <= MAX_STYLESHEET_RESOURCES {
+                        pending_stylesheets.push((key, parsed, import_depth));
+                    } else {
+                        self.mark_resource_archive_incomplete(format!(
+                            "frame {} stylesheet resource cap reached ({MAX_STYLESHEET_RESOURCES} resources)",
+                            realm.frame_id(),
+                        ));
+                    }
+                }
+            }
+
+            while let Some((key, parsed, import_depth)) = pending_stylesheets.pop() {
                 let request = ResourceRequest::subresource(ResourceType::Stylesheet, &initiator)
                     .in_frame(realm.frame_id());
                 match self.do_fetch_resource(&parsed, request).await {
@@ -1427,14 +1771,14 @@ impl Page {
                         if !(200..300).contains(&response.status) {
                             self.mark_resource_archive_incomplete(format!(
                                 "frame {} stylesheet {} returned HTTP {}",
-                                realm.frame_id(), url, response.status,
+                                realm.frame_id(),
+                                parsed,
+                                response.status,
                             ));
                             continue;
                         }
-                        let css = obscura_net::decode_non_html(
-                            &response.body,
-                            response.content_type(),
-                        );
+                        let css =
+                            obscura_net::decode_non_html(&response.body, response.content_type());
                         for resource_url in css_resource_urls(&css, &response.url) {
                             if let Ok(parsed) = Url::parse(&resource_url) {
                                 stylesheet_assets
@@ -1442,28 +1786,119 @@ impl Page {
                                     .or_insert_with(|| render_resource_type(&parsed));
                             }
                         }
-                        let (imports, rules) = split_css_imports(&css);
-                        if import_depth >= MAX_STYLESHEET_IMPORT_DEPTH && !imports.is_empty() {
+                        let (response_key, response_url) =
+                            canonical_stylesheet_url(response.url.clone());
+                        if let Some(existing) = stylesheet_aliases.get(&response_key).cloned() {
+                            stylesheet_aliases.insert(key, existing);
+                            continue;
+                        }
+                        let (discovered_imports, rules) = split_css_imports(&css);
+                        if import_depth >= MAX_STYLESHEET_IMPORT_DEPTH
+                            && !discovered_imports.is_empty()
+                        {
                             self.mark_resource_archive_incomplete(format!(
                                 "frame {} stylesheet import depth cap reached ({MAX_STYLESHEET_IMPORT_DEPTH}): {}",
-                                realm.frame_id(), response.url,
+                                realm.frame_id(), response_url,
                             ));
                         }
-                        stylesheets.push((
-                            link_index,
-                            rebase_css_urls(&rules, &response.url),
-                            imports,
-                            import_depth,
-                            response.url,
-                        ));
+                        let imports = if import_depth < MAX_STYLESHEET_IMPORT_DEPTH {
+                            discovered_imports
+                        } else {
+                            Vec::new()
+                        };
+                        stylesheet_aliases.insert(key.clone(), key.clone());
+                        stylesheet_aliases.insert(response_key, key.clone());
+                        stylesheet_sheets.insert(
+                            key,
+                            LoadedStylesheet {
+                                response_url: response_url.clone(),
+                                imports: imports.clone(),
+                                rules,
+                            },
+                        );
+
+                        if import_depth >= MAX_STYLESHEET_IMPORT_DEPTH {
+                            continue;
+                        }
+                        // Reverse before pushing onto the LIFO worklist so
+                        // network observation remains in CSS source order.
+                        for import in imports.into_iter().rev() {
+                            let Ok(import_url) = response_url.join(&import.url) else {
+                                self.mark_resource_archive_incomplete(format!(
+                                    "frame {} stylesheet import URL could not be resolved: {}",
+                                    realm.frame_id(),
+                                    import.url,
+                                ));
+                                continue;
+                            };
+                            let (import_key, import_url) = canonical_stylesheet_url(import_url);
+                            if stylesheet_aliases.contains_key(&import_key)
+                                || scheduled_stylesheets.contains(&import_key)
+                            {
+                                continue;
+                            }
+                            if self.should_block_url(import_url.as_str())
+                                || !subresource_allowed(Some(&initiator), import_url.as_str())
+                            {
+                                self.mark_resource_archive_incomplete(format!(
+                                    "frame {} stylesheet import was blocked: {}",
+                                    realm.frame_id(),
+                                    import_url,
+                                ));
+                                continue;
+                            }
+                            if scheduled_stylesheets.len() >= MAX_STYLESHEET_RESOURCES {
+                                self.mark_resource_archive_incomplete(format!(
+                                    "frame {} stylesheet resource cap reached ({MAX_STYLESHEET_RESOURCES} resources)",
+                                    realm.frame_id(),
+                                ));
+                                continue;
+                            }
+                            scheduled_stylesheets.insert(import_key.clone());
+                            pending_stylesheets.push((
+                                import_key,
+                                import_url,
+                                import_depth.saturating_add(1),
+                            ));
+                        }
                     }
                     Err(error) => {
-                        tracing::warn!("frame stylesheet {} failed: {}", url, error);
+                        tracing::warn!("frame stylesheet {} failed: {}", parsed, error);
                         self.mark_resource_archive_incomplete(format!(
                             "frame {} stylesheet fetch failed: {}: {}",
-                            realm.frame_id(), url, error,
+                            realm.frame_id(),
+                            parsed,
+                            error,
                         ));
                     }
+                }
+            }
+
+            let mut stylesheets = Vec::new();
+            for (link_index, link_nid, key, is_parser_owner, raw_href, request_href) in
+                stylesheet_roots
+            {
+                match materialize_stylesheet_graph(
+                    &key,
+                    &stylesheet_sheets,
+                    &stylesheet_aliases,
+                    &mut std::collections::HashSet::new(),
+                ) {
+                    Some(css) => stylesheets.push((
+                        link_index,
+                        link_nid,
+                        css,
+                        is_parser_owner,
+                        raw_href,
+                        request_href,
+                    )),
+                    None => failed_stylesheet_links.push((
+                        link_index,
+                        link_nid,
+                        is_parser_owner,
+                        raw_href,
+                        Some(request_href),
+                    )),
                 }
             }
 
@@ -1502,7 +1937,9 @@ impl Page {
                         if !(200..300).contains(&response.status) {
                             self.mark_resource_archive_incomplete(format!(
                                 "frame {} stylesheet resource {} returned HTTP {}",
-                                realm.frame_id(), response.url, response.status,
+                                realm.frame_id(),
+                                response.url,
+                                response.status,
                             ));
                         }
                     }
@@ -1510,7 +1947,9 @@ impl Page {
                         tracing::warn!("frame stylesheet resource {} failed: {}", url, error);
                         self.mark_resource_archive_incomplete(format!(
                             "frame {} stylesheet resource fetch failed: {}: {}",
-                            realm.frame_id(), url, error,
+                            realm.frame_id(),
+                            url,
+                            error,
                         ));
                     }
                 }
@@ -1528,14 +1967,16 @@ impl Page {
                 let Ok(parsed) = Url::parse(&url) else {
                     self.mark_resource_archive_incomplete(format!(
                         "frame {} classic script URL could not be resolved: {}",
-                        realm.frame_id(), url,
+                        realm.frame_id(),
+                        url,
                     ));
                     continue;
                 };
                 if self.should_block_url(&url) {
                     self.mark_resource_archive_incomplete(format!(
                         "frame {} classic script was blocked: {}",
-                        realm.frame_id(), url,
+                        realm.frame_id(),
+                        url,
                     ));
                     continue;
                 }
@@ -1544,14 +1985,14 @@ impl Page {
                 match self.do_fetch_resource(&parsed, request).await {
                     Ok(response) => {
                         if script_response_is_executable(response.status) {
-                            sources.insert(
-                                url,
-                                String::from_utf8_lossy(&response.body).into_owned(),
-                            );
+                            sources
+                                .insert(url, String::from_utf8_lossy(&response.body).into_owned());
                         } else {
                             self.mark_resource_archive_incomplete(format!(
                                 "frame {} classic script {} returned HTTP {}",
-                                realm.frame_id(), response.url, response.status,
+                                realm.frame_id(),
+                                response.url,
+                                response.status,
                             ));
                         }
                     }
@@ -1559,67 +2000,23 @@ impl Page {
                         tracing::warn!("frame script {} failed: {}", url, error);
                         self.mark_resource_archive_incomplete(format!(
                             "frame {} classic script fetch failed: {}: {}",
-                            realm.frame_id(), url, error,
+                            realm.frame_id(),
+                            url,
+                            error,
                         ));
                     }
                 }
             }
 
-            if let Some(js) = self.js.as_mut() {
-                if let Err(error) = realm.set_viewport(
-                    js,
-                    frame.viewport_width as f64,
-                    frame.viewport_height as f64,
-                ) {
-                    tracing::debug!("frame {} viewport setup failed: {error}", frame.url);
-                }
-                if !stylesheets.is_empty() {
-                    let combined_css = stylesheets
-                        .iter()
-                        .map(|(_, css, _, _, _)| css.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let code = format!(
-                        "globalThis.__obscura_css = `{}`;",
-                        escape_for_js_template_literal(&combined_css),
-                    );
-                    if let Err(error) = realm.execute_script(js, &code) {
-                        tracing::debug!("frame {} CSS setup failed: {error}", frame.url);
-                    }
-                    for (link_index, css, _, _, _) in &stylesheets {
-                        let code = materialize_linked_stylesheet_script(*link_index, css);
-                        if let Err(error) = realm.execute_script(js, &code) {
-                            tracing::debug!(
-                                "frame {} linked stylesheet setup failed: {error}",
-                                frame.url,
-                            );
-                        }
-                    }
-                    let mut imported = stylesheets
-                        .iter()
-                        .filter(|(_, _, imports, depth, _)| {
-                            !imports.is_empty() && *depth < MAX_STYLESHEET_IMPORT_DEPTH
-                        })
-                        .collect::<Vec<_>>();
-                    imported.sort_by(|left, right| right.0.cmp(&left.0));
-                    for (link_index, _, imports, depth, response_url) in imported {
-                        let code = queue_stylesheet_imports_script(
-                            *link_index,
-                            imports,
-                            response_url,
-                            depth.saturating_add(1),
-                        );
-                        if let Err(error) = realm.execute_script(js, &code) {
-                            tracing::debug!(
-                                "frame {} stylesheet import setup failed: {error}",
-                                frame.url,
-                            );
-                        }
-                    }
-                }
-                // Page.addScriptToEvaluateOnNewDocument applies to every new
-                // document, including child frames. Debug hooks and browser
-                // automation setup must be present before frame scripts run.
+            let lifecycle_watchdog = self.js.as_mut().map(|js| {
+                js.arm_watchdog(std::time::Duration::from_millis(
+                    LIFECYCLE_CALLBACK_WATCHDOG_MS,
+                ))
+            });
+            let lifecycle_result = if let Some(js) = self.js.as_mut() {
+                // Page.addScriptToEvaluateOnNewDocument applies before any
+                // page-authored callback in a child document, including the
+                // load/error owner event of a parser stylesheet.
                 for name in &self.preload_bindings {
                     if let Err(error) = realm.install_cdp_binding(js, name) {
                         tracing::debug!(
@@ -1634,17 +2031,128 @@ impl Page {
                         tracing::debug!("frame {} preload failed: {error}", frame.url);
                     }
                 }
-                for problem in realm.run_document_scripts(js, |url| sources.get(url).cloned()) {
+                let mut parser_stylesheet_events = std::collections::BTreeMap::new();
+                failed_stylesheet_links.sort_unstable();
+                failed_stylesheet_links.dedup();
+                for (_, link_nid, is_parser_owner, raw_href, request_href) in
+                    failed_stylesheet_links
+                {
+                    let completion = if let Some(raw_href) = raw_href.as_deref() {
+                        complete_parser_stylesheet_script_with_token(
+                            link_nid,
+                            "error",
+                            request_href.as_deref(),
+                            raw_href,
+                        )
+                    } else {
+                        complete_parser_stylesheet_script(link_nid, "error")
+                    };
+                    if is_parser_owner {
+                        parser_stylesheet_events.insert(link_nid, completion);
+                    } else if let Err(error) = realm.execute_script(js, &completion) {
+                        tracing::debug!(
+                            "frame {} inline import owner error dispatch failed: {error}",
+                            frame.url,
+                        );
+                    }
+                }
+                if let Err(error) = realm.set_viewport(
+                    js,
+                    frame.viewport_width as f64,
+                    frame.viewport_height as f64,
+                ) {
+                    tracing::debug!("frame {} viewport setup failed: {error}", frame.url);
+                }
+                if !stylesheets.is_empty() {
+                    let combined_css = stylesheets
+                        .iter()
+                        .map(|(_, _, css, _, _, _)| css.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let code = format!(
+                        "globalThis.__obscura_css = `{}`;",
+                        escape_for_js_template_literal(&combined_css),
+                    );
+                    if let Err(error) = realm.execute_script(js, &code) {
+                        tracing::debug!("frame {} CSS setup failed: {error}", frame.url);
+                    }
+                    for (_, link_nid, css, is_parser_owner, raw_href, request_href) in &stylesheets
+                    {
+                        let completion = if let Some(raw_href) = raw_href.as_deref() {
+                            materialize_parser_stylesheet_script_with_token(
+                                *link_nid,
+                                css,
+                                request_href,
+                                raw_href,
+                            )
+                        } else {
+                            materialize_parser_stylesheet_script(*link_nid, css)
+                        };
+                        if *is_parser_owner {
+                            parser_stylesheet_events.insert(*link_nid, completion);
+                        } else if let Err(error) = realm.execute_script(js, &completion) {
+                            tracing::debug!(
+                                "frame {} inline import materialization failed: {error}",
+                                frame.url,
+                            );
+                        }
+                    }
+                }
+                for problem in realm.run_document_scripts_with_stylesheet_events(
+                    js,
+                    |url| sources.get(url).cloned(),
+                    parser_stylesheet_events,
+                ) {
                     tracing::debug!("frame {}: {}", frame.url, problem);
                 }
-                // The frame's scripts have run, so its document is loaded. Say
-                // so: everything a widget defers to DOMContentLoaded or load
-                // hangs on this, which is most of its interface.
-                if let Err(error) = realm.dispatch_load_events(js) {
-                    tracing::debug!("frame {} load events failed: {error}", frame.url);
+                // Parsing and parser scripts are complete, but descendant
+                // frames and load-delaying dynamic resources still gate load.
+                realm.dispatch_dom_content_loaded(js)
+            } else {
+                Err("JavaScript runtime disappeared".to_string())
+            };
+            let watchdog_fired = match (self.js.as_mut(), lifecycle_watchdog) {
+                (Some(js), Some(watchdog)) => js.disarm_watchdog(watchdog),
+                _ => false,
+            };
+            if watchdog_fired || lifecycle_result.is_err() {
+                tracing::warn!(
+                    "frame {} parser lifecycle failed: {}",
+                    frame.url,
+                    lifecycle_result
+                        .err()
+                        .unwrap_or_else(|| "lifecycle task budget exceeded".to_string()),
+                );
+                realm.mark_load_failed();
+                self.top_load_pending = false;
+                self.lifecycle = LifecycleState::Failed;
+            }
+            let publish_watchdog = self.js.as_mut().map(|js| {
+                js.arm_watchdog(std::time::Duration::from_millis(
+                    LIFECYCLE_CALLBACK_WATCHDOG_MS,
+                ))
+            });
+            let published = self
+                .js
+                .as_mut()
+                .is_some_and(|js| realm.publish_to_owners(js));
+            let publish_watchdog_fired = match (self.js.as_mut(), publish_watchdog) {
+                (Some(js), Some(watchdog)) => js.disarm_watchdog(watchdog),
+                _ => false,
+            };
+            if publish_watchdog_fired || !published {
+                tracing::warn!("frame {} realm publication failed", frame.url);
+                if let Some(js) = self.js.as_ref() {
+                    js.cancel_frame_documents_owned_by(&[realm.frame_id()]);
                 }
+                self.forget_frame_references(realm.frame_id(), realm.parent_frame_id());
+                self.top_load_pending = false;
+                self.lifecycle = LifecycleState::Failed;
+                pending.finish_current();
+                continue;
             }
             self.frames.push(realm);
+            pending.finish_current();
         }
         true
     }
@@ -1663,17 +2171,34 @@ impl Page {
             return false;
         }
 
+        let mut retry = Vec::new();
         for message in pending {
             let escaped_data = serde_json::to_string(&message.data_json).unwrap_or_default();
             let escaped_origin = serde_json::to_string(&message.origin).unwrap_or_default();
             if message.target_frame_id == 0 {
+                let watchdog = self.js.as_mut().map(|js| {
+                    js.arm_watchdog(std::time::Duration::from_millis(
+                        LIFECYCLE_CALLBACK_WATCHDOG_MS,
+                    ))
+                });
                 let Some(js) = self.js.as_mut() else { continue };
                 let script = format!(
                     "globalThis.__obscura_deliverMessage({escaped_data}, {escaped_origin}, {});",
                     message.source_frame_id,
                 );
-                if let Err(error) = js.execute_script("<frame-message>", &script) {
+                let result = js.execute_script("<frame-message>", &script);
+                let watchdog_fired = match (self.js.as_mut(), watchdog) {
+                    (Some(js), Some(watchdog)) => js.disarm_watchdog(watchdog),
+                    _ => false,
+                };
+                if watchdog_fired || result.is_err() {
+                    let error = result
+                        .err()
+                        .unwrap_or_else(|| "message handler task budget exceeded".to_string());
                     tracing::debug!("message to the page failed: {error}");
+                    self.top_load_pending = false;
+                    self.lifecycle = LifecycleState::Failed;
+                    break;
                 }
                 continue;
             }
@@ -1683,18 +2208,58 @@ impl Page {
                 .iter()
                 .position(|frame| frame.frame_id() == message.target_frame_id)
             else {
-                // The frame was torn down between the send and the drain.
-                tracing::debug!("message for frame {} which is gone", message.target_frame_id);
+                // A parent parser script can post to a child it just created.
+                // Its fetched document is queued during this same attachment
+                // pass and receives a realm on the next pass; retain that
+                // message rather than mistaking the not-yet-attached target
+                // for a browsing context which was torn down.
+                if self
+                    .js
+                    .as_ref()
+                    .is_some_and(|js| js.frame_document_is_pending(message.target_frame_id))
+                {
+                    retry.push(message);
+                } else {
+                    tracing::debug!(
+                        "message for frame {} which is gone",
+                        message.target_frame_id
+                    );
+                }
                 continue;
             };
+            let watchdog = self.js.as_mut().map(|js| {
+                js.arm_watchdog(std::time::Duration::from_millis(
+                    LIFECYCLE_CALLBACK_WATCHDOG_MS,
+                ))
+            });
             let Some(js) = self.js.as_mut() else { continue };
-            if let Err(error) = self.frames[index].deliver_message(
+            let result = self.frames[index].deliver_message(
                 js,
                 &message.data_json,
                 &message.origin,
                 message.source_frame_id,
-            ) {
-                tracing::debug!("message to frame {} failed: {error}", message.target_frame_id);
+            );
+            let watchdog_fired = match (self.js.as_mut(), watchdog) {
+                (Some(js), Some(watchdog)) => js.disarm_watchdog(watchdog),
+                _ => false,
+            };
+            if watchdog_fired || result.is_err() {
+                let error = result
+                    .err()
+                    .unwrap_or_else(|| "message handler task budget exceeded".to_string());
+                tracing::debug!(
+                    "message to frame {} failed: {error}",
+                    message.target_frame_id
+                );
+                self.frames[index].mark_load_failed();
+                self.top_load_pending = false;
+                self.lifecycle = LifecycleState::Failed;
+                break;
+            }
+        }
+        if !retry.is_empty() {
+            if let Some(js) = self.js.as_ref() {
+                js.restore_pending_frame_messages(retry);
             }
         }
         true
@@ -1704,22 +2269,25 @@ impl Page {
     /// page's same-origin frame table. This also covers a frame rejected before
     /// a `FrameRealm` exists, so the normal drop path cannot be skipped.
     fn forget_frame_references(&mut self, frame_id: u32, parent_frame_id: u32) {
-        let script = format!(
-            "if (globalThis.__obscura_frameElements[{frame_id}] &&\
-             globalThis.__obscura_frameElements[{frame_id}]._frameId === {frame_id}) {{\
-               globalThis.__obscura_frameElements[{frame_id}]._frameId = 0;\
-               if (globalThis.__obscura_frameElements[{frame_id}]._iframeWin)\
-                 globalThis.__obscura_frameElements[{frame_id}]._iframeWin._frameId = 0;\
-             }}\
-             delete globalThis.__obscura_frameObjects[{frame_id}];\
-             delete globalThis.__obscura_frameWindows[{frame_id}];\
-             delete globalThis.__obscura_frameElements[{frame_id}];"
-        );
-        self.execute_frame_owner_script(parent_frame_id, &script);
+        let script = format!("globalThis.__obscura_forgetFrame({frame_id});");
+        let watchdog = self.js.as_mut().map(|js| {
+            js.arm_watchdog(std::time::Duration::from_millis(
+                LIFECYCLE_CALLBACK_WATCHDOG_MS,
+            ))
+        });
+        let owner_result = self.execute_frame_owner_script(parent_frame_id, &script);
+        let watchdog_fired = match (self.js.as_mut(), watchdog) {
+            (Some(js), Some(watchdog)) => js.disarm_watchdog(watchdog),
+            _ => false,
+        };
+        if watchdog_fired {
+            self.top_load_pending = false;
+            self.lifecycle = LifecycleState::Failed;
+        } else if let Err(error) = owner_result {
+            tracing::debug!("releasing owner references for frame {frame_id} failed: {error}");
+        }
         if parent_frame_id != 0 {
-            let page_script = format!(
-                "delete globalThis.__obscura_frameObjects[{frame_id}];"
-            );
+            let page_script = format!("globalThis.__obscura_forgetFrame({frame_id});");
             if let Some(js) = self.js.as_mut() {
                 if let Err(error) = js.execute_script("<frame-detach>", &page_script) {
                     tracing::debug!("releasing page frame reference failed: {error}");
@@ -1730,14 +2298,17 @@ impl Page {
 
     /// Executes cleanup in the realm that owns the iframe element. Nested
     /// iframe registries live in their parent frame, not in the page realm.
-    fn execute_frame_owner_script(&mut self, parent_frame_id: u32, script: &str) {
+    fn execute_frame_owner_script(
+        &mut self,
+        parent_frame_id: u32,
+        script: &str,
+    ) -> Result<(), String> {
         if parent_frame_id == 0 {
-            if let Some(js) = self.js.as_mut() {
-                if let Err(error) = js.execute_script("<frame-detach>", script) {
-                    tracing::debug!("releasing frame references failed: {error}");
-                }
-            }
-            return;
+            return self
+                .js
+                .as_mut()
+                .ok_or_else(|| "JavaScript runtime disappeared".to_string())?
+                .execute_script("<frame-owner>", script);
         }
 
         let Some(index) = self
@@ -1745,11 +2316,130 @@ impl Page {
             .iter()
             .position(|frame| frame.frame_id() == parent_frame_id)
         else {
-            return;
+            return Err(format!("frame owner realm {parent_frame_id} disappeared"));
         };
-        let Some(js) = self.js.as_mut() else { return };
-        if let Err(error) = self.frames[index].execute_script(js, script) {
-            tracing::debug!("releasing nested frame references failed: {error}");
+        let js = self
+            .js
+            .as_mut()
+            .ok_or_else(|| "JavaScript runtime disappeared".to_string())?;
+        self.frames[index].execute_script(js, script)
+    }
+
+    fn evaluate_lifecycle_probe(
+        &mut self,
+        realm_frame_id: Option<u32>,
+        expression: &str,
+    ) -> Result<serde_json::Value, String> {
+        if self.js.is_none() {
+            return Err("JavaScript runtime disappeared".to_string());
+        }
+        let realm_index = match realm_frame_id {
+            Some(frame_id) => Some(
+                self.frames
+                    .iter()
+                    .position(|frame| frame.frame_id() == frame_id)
+                    .ok_or_else(|| format!("frame owner realm {frame_id} disappeared"))?,
+            ),
+            None => None,
+        };
+        let watchdog = self
+            .js
+            .as_mut()
+            .unwrap()
+            .arm_watchdog(std::time::Duration::from_millis(
+                LIFECYCLE_CALLBACK_WATCHDOG_MS,
+            ));
+        let result = if let Some(index) = realm_index {
+            self.frames[index].evaluate(self.js.as_mut().unwrap(), expression)
+        } else {
+            self.js.as_mut().unwrap().evaluate_host_probe(expression)
+        };
+        let fired = self
+            .js
+            .as_mut()
+            .is_some_and(|js| js.disarm_watchdog(watchdog));
+        if fired {
+            self.top_load_pending = false;
+            self.lifecycle = LifecycleState::Failed;
+            return Err("lifecycle probe task budget exceeded".to_string());
+        }
+        result
+    }
+
+    fn direct_frame_owner_is_live(
+        &mut self,
+        parent_frame_id: u32,
+        frame_id: u32,
+    ) -> Result<bool, String> {
+        let expression = format!("globalThis.__obscura_frameOwnerIsLive({frame_id})");
+        let value = self.evaluate_lifecycle_probe(
+            (parent_frame_id != 0).then_some(parent_frame_id),
+            &expression,
+        )?;
+        value.as_bool().ok_or_else(|| {
+            format!("frame owner liveness probe in realm {parent_frame_id} returned a non-boolean")
+        })
+    }
+
+    fn frame_owner_is_live(
+        &mut self,
+        mut parent_frame_id: u32,
+        mut frame_id: u32,
+    ) -> Result<bool, String> {
+        loop {
+            if !self.direct_frame_owner_is_live(parent_frame_id, frame_id)? {
+                return Ok(false);
+            }
+            if parent_frame_id == 0 {
+                return Ok(true);
+            }
+            let Some(parent) = self
+                .frames
+                .iter()
+                .find(|frame| frame.frame_id() == parent_frame_id)
+            else {
+                return Ok(false);
+            };
+            frame_id = parent_frame_id;
+            parent_frame_id = parent.parent_frame_id();
+        }
+    }
+
+    fn dispatch_frame_owner_load(&mut self, parent_frame_id: u32, frame_id: u32) {
+        let watchdog = self.js.as_mut().map(|js| {
+            js.arm_watchdog(std::time::Duration::from_millis(
+                LIFECYCLE_CALLBACK_WATCHDOG_MS,
+            ))
+        });
+        let dispatch_result = self.execute_frame_owner_script(
+            parent_frame_id,
+            &format!(
+                "if (typeof globalThis.__obscura_dispatchFrameOwnerLoad === 'function') \
+                 globalThis.__obscura_dispatchFrameOwnerLoad({frame_id});"
+            ),
+        );
+        let watchdog_fired = match (self.js.as_mut(), watchdog) {
+            (Some(js), Some(watchdog)) => js.disarm_watchdog(watchdog),
+            _ => false,
+        };
+        if watchdog_fired || dispatch_result.is_err() {
+            tracing::warn!(
+                "iframe owner load dispatch failed: {}",
+                dispatch_result
+                    .err()
+                    .unwrap_or_else(|| "lifecycle task budget exceeded".to_string()),
+            );
+            if parent_frame_id != 0 {
+                if let Some(parent) = self
+                    .frames
+                    .iter()
+                    .find(|frame| frame.frame_id() == parent_frame_id)
+                {
+                    parent.mark_load_failed();
+                }
+            }
+            self.top_load_pending = false;
+            self.lifecycle = LifecycleState::Failed;
         }
     }
 
@@ -1762,43 +2452,78 @@ impl Page {
     /// object, so a page that replaces an iframe repeatedly would otherwise
     /// accumulate contexts and DOM trees for the life of the document.
     ///
-    /// A frame nested inside a discarded frame is reached on a later pass,
-    /// once its own parent is gone.
-    fn release_detached_frames(&mut self) {
+    /// A detached parent discards its complete browsing-context subtree in the
+    /// same pass, before a descendant can be mistaken for a load candidate.
+    fn release_detached_frames(&mut self) -> bool {
+        self.release_detached_frames_with_probe("__obscura_liveFrameIds()")
+    }
+
+    fn release_detached_frames_with_probe(&mut self, live_frame_ids_probe: &str) -> bool {
         if self.frames.is_empty() {
-            return;
+            return false;
         }
         // Each realm reports its own frames whose element is still connected.
         // Liveness is asked of the element rather than of a document query,
         // because an iframe inside a shadow root is absent from
         // `document.querySelectorAll('iframe')` — the shape a challenge widget
         // uses — and treating it as detached tears down a live frame.
-        const LIVE_FRAME_IDS: &str = "__obscura_liveFrameIds()";
-
         let mut live: Vec<u32> = Vec::new();
-        let Some(js) = self.js.as_mut() else { return };
-        match js.evaluate(LIVE_FRAME_IDS) {
-            Ok(value) => live.extend(serde_json::from_value::<Vec<u32>>(value).unwrap_or_default()),
-            // A query that did not run says nothing about which frames are
-            // gone, and an empty answer here reads as "all of them". Holding
-            // them is bounded by the live-frame cap; discarding a live frame
-            // is not recoverable, so leave the tree alone.
+        match self.evaluate_lifecycle_probe(None, live_frame_ids_probe) {
+            Ok(value) => match serde_json::from_value::<Vec<u32>>(value) {
+                Ok(ids) => live.extend(ids),
+                Err(error) => {
+                    tracing::warn!("page live-frame probe returned an invalid value: {error}");
+                    self.top_load_pending = false;
+                    self.lifecycle = LifecycleState::Failed;
+                    return false;
+                }
+            },
             Err(error) => {
-                tracing::debug!("could not list the page's live frames: {error}");
-                return;
+                tracing::warn!("could not list the page's live frames: {error}");
+                self.top_load_pending = false;
+                self.lifecycle = LifecycleState::Failed;
+                return false;
             }
         }
         // A frame's own children are in that frame's document, not the page's.
         for index in 0..self.frames.len() {
-            let Some(js) = self.js.as_mut() else { return };
-            match self.frames[index].evaluate(js, LIVE_FRAME_IDS) {
-                Ok(value) => {
-                    live.extend(serde_json::from_value::<Vec<u32>>(value).unwrap_or_default())
-                }
+            let frame_id = self.frames[index].frame_id();
+            match self.evaluate_lifecycle_probe(Some(frame_id), live_frame_ids_probe) {
+                Ok(value) => match serde_json::from_value::<Vec<u32>>(value) {
+                    Ok(ids) => live.extend(ids),
+                    Err(error) => {
+                        tracing::warn!(
+                            "frame {frame_id} live-frame probe returned an invalid value: {error}"
+                        );
+                        self.frames[index].mark_load_failed();
+                        self.top_load_pending = false;
+                        self.lifecycle = LifecycleState::Failed;
+                        return false;
+                    }
+                },
                 Err(error) => {
-                    tracing::debug!("could not list a frame's live frames: {error}");
-                    return;
+                    tracing::warn!("could not list frame {frame_id}'s live frames: {error}");
+                    self.frames[index].mark_load_failed();
+                    self.top_load_pending = false;
+                    self.lifecycle = LifecycleState::Failed;
+                    return false;
                 }
+            }
+        }
+
+        let reported_live = live.into_iter().collect::<std::collections::HashSet<_>>();
+        let mut retained = std::collections::HashSet::new();
+        loop {
+            let before = retained.len();
+            for frame in &self.frames {
+                if reported_live.contains(&frame.frame_id())
+                    && (frame.parent_frame_id() == 0 || retained.contains(&frame.parent_frame_id()))
+                {
+                    retained.insert(frame.frame_id());
+                }
+            }
+            if retained.len() == before {
+                break;
             }
         }
 
@@ -1806,10 +2531,18 @@ impl Page {
             .frames
             .iter()
             .map(|frame| (frame.frame_id(), frame.parent_frame_id()))
-            .filter(|(id, _)| !live.contains(id))
+            .filter(|(id, _)| !retained.contains(id))
             .collect();
         if discarded.is_empty() {
-            return;
+            return false;
+        }
+
+        let discarded_ids = discarded
+            .iter()
+            .map(|(frame_id, _)| *frame_id)
+            .collect::<Vec<_>>();
+        if let Some(js) = self.js.as_ref() {
+            js.cancel_frame_documents_owned_by(&discarded_ids);
         }
 
         // Clean owner realms before dropping any parent. This matters for a
@@ -1818,8 +2551,196 @@ impl Page {
         for &(frame_id, parent_frame_id) in &discarded {
             self.forget_frame_references(frame_id, parent_frame_id);
         }
-        self.frames.retain(|frame| live.contains(&frame.frame_id()));
+        self.frames
+            .retain(|frame| retained.contains(&frame.frame_id()));
         tracing::debug!("discarded {} detached frame realm(s)", discarded.len());
+        true
+    }
+
+    /// Complete child documents from the leaves upward. A frame's Window load
+    /// precedes the load event on its owner iframe element, and an ancestor
+    /// remains blocked while any direct descendant or queued child document is
+    /// unfinished.
+    fn complete_ready_frames(&mut self) -> bool {
+        let mut progressed = false;
+        loop {
+            let blockers = self
+                .js
+                .as_ref()
+                .map(ObscuraJsRuntime::frame_document_load_blockers_by_parent)
+                .unwrap_or_default();
+            let candidates = self
+                .frames
+                .iter()
+                .filter(|frame| {
+                    frame.lifecycle_state() == FrameLifecycleState::DomContentLoaded
+                        && blockers.get(&frame.frame_id()).copied().unwrap_or(0) == 0
+                        && !self.frames.iter().any(|child| {
+                            child.parent_frame_id() == frame.frame_id() && !child.is_load_complete()
+                        })
+                })
+                .map(|frame| frame.frame_id())
+                .collect::<Vec<_>>();
+            if candidates.is_empty() {
+                break;
+            }
+
+            let mut completed_this_pass = false;
+            for frame_id in candidates {
+                let Some(index) = self
+                    .frames
+                    .iter()
+                    .position(|frame| frame.frame_id() == frame_id)
+                else {
+                    continue;
+                };
+                let parent_frame_id = self.frames[index].parent_frame_id();
+                match self.frame_owner_is_live(parent_frame_id, frame_id) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.release_detached_frames();
+                        completed_this_pass = true;
+                        progressed = true;
+                        continue;
+                    }
+                    Err(error) => {
+                        self.frames[index].mark_load_failed();
+                        self.top_load_pending = false;
+                        self.lifecycle = LifecycleState::Failed;
+                        tracing::warn!(
+                            "could not verify owner liveness for frame {frame_id}: {error}"
+                        );
+                        return true;
+                    }
+                }
+                let pending_resources = match self.js.as_mut() {
+                    Some(js) => self.frames[index].has_pending_load_delaying_resources(js),
+                    None => true,
+                };
+                if pending_resources {
+                    continue;
+                }
+                let watchdog = self.js.as_mut().map(|js| {
+                    js.arm_watchdog(std::time::Duration::from_millis(
+                        LIFECYCLE_CALLBACK_WATCHDOG_MS,
+                    ))
+                });
+                let result = match self.js.as_mut() {
+                    Some(js) => self.frames[index].dispatch_load(js),
+                    None => Err("JavaScript runtime disappeared".to_string()),
+                };
+                let watchdog_fired = match (self.js.as_mut(), watchdog) {
+                    (Some(js), Some(watchdog)) => js.disarm_watchdog(watchdog),
+                    _ => false,
+                };
+                if watchdog_fired {
+                    self.frames[index].mark_load_failed();
+                    self.top_load_pending = false;
+                    self.lifecycle = LifecycleState::Failed;
+                    tracing::warn!(
+                        "frame {frame_id} load handler exceeded the lifecycle task budget"
+                    );
+                    return true;
+                }
+                if let Err(error) = result {
+                    self.frames[index].mark_load_failed();
+                    self.top_load_pending = false;
+                    self.lifecycle = LifecycleState::Failed;
+                    tracing::warn!("frame {frame_id} load events failed: {error}");
+                    return true;
+                }
+
+                // A frame's own Window.load can synchronously remove its
+                // iframe, an ancestor owner, or a later sibling. Do not follow
+                // it with a stale owner-element load dispatch.
+                match self.frame_owner_is_live(parent_frame_id, frame_id) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.release_detached_frames();
+                        completed_this_pass = true;
+                        progressed = true;
+                        continue;
+                    }
+                    Err(error) => {
+                        self.frames[index].mark_load_failed();
+                        self.top_load_pending = false;
+                        self.lifecycle = LifecycleState::Failed;
+                        tracing::warn!(
+                            "could not revalidate owner liveness for frame {frame_id}: {error}"
+                        );
+                        return true;
+                    }
+                }
+                self.dispatch_frame_owner_load(parent_frame_id, frame_id);
+                completed_this_pass = true;
+                progressed = true;
+            }
+            if !completed_this_pass {
+                break;
+            }
+        }
+        progressed
+    }
+
+    fn try_dispatch_top_load(&mut self) -> bool {
+        if !self.top_load_pending {
+            return false;
+        }
+        let frame_blocked = self.js.as_ref().is_some_and(|js| {
+            js.frame_document_load_blockers_by_parent()
+                .get(&0)
+                .copied()
+                .unwrap_or(0)
+                != 0
+        });
+        if frame_blocked
+            || self
+                .frames
+                .iter()
+                .any(|frame| frame.parent_frame_id() == 0 && !frame.is_load_complete())
+        {
+            return false;
+        }
+        let resource_blocked = self
+            .js
+            .as_mut()
+            .is_some_and(ObscuraJsRuntime::has_pending_load_delaying_resources);
+        if resource_blocked {
+            return false;
+        }
+
+        let watchdog = self.js.as_mut().map(|js| {
+            js.arm_watchdog(std::time::Duration::from_millis(
+                LIFECYCLE_CALLBACK_WATCHDOG_MS,
+            ))
+        });
+        let result = self.js.as_mut().map(|js| {
+            js.execute_script(
+                "<load-event>",
+                "globalThis.__documentReadyState__ = 'complete';\
+                 try { globalThis.__obscura_dispatchDocumentLifecycleEvent('readystatechange'); } catch (_) {}\
+                 try { globalThis.__obscura_dispatchWindowLoad(); } catch (_) {}",
+            )
+        });
+        let watchdog_fired = match (self.js.as_mut(), watchdog) {
+            (Some(js), Some(watchdog)) => js.disarm_watchdog(watchdog),
+            _ => false,
+        };
+        if watchdog_fired {
+            tracing::warn!("top-level load handler exceeded the lifecycle task budget");
+            self.top_load_pending = false;
+            self.lifecycle = LifecycleState::Failed;
+            return true;
+        }
+        if !matches!(result, Some(Ok(()))) {
+            tracing::warn!("top document load event dispatch failed: {result:?}");
+            self.top_load_pending = false;
+            self.lifecycle = LifecycleState::Failed;
+            return true;
+        }
+        self.top_load_pending = false;
+        self.lifecycle = LifecycleState::Loaded;
+        true
     }
 
     /// Moves the frame tree forward by one step: give any fetched frame
@@ -1829,10 +2750,18 @@ impl Page {
     /// frame runs scripts that can post, and a message usually causes a reply,
     /// so neither queue is finished until both are quiet.
     async fn advance_frames(&mut self) -> bool {
+        // A timer or earlier browser task may have removed a complete parent
+        // browsing-context subtree. Release it before taking the pending
+        // document snapshot, so queued descendants cannot execute in a realm
+        // whose direct owner still looks connected only inside that detached
+        // parent's private document.
+        let released_before = self.release_detached_frames();
         let attached = self.attach_pending_frames().await;
         let delivered = self.deliver_frame_messages();
-        self.release_detached_frames();
-        attached || delivered
+        let released_after = self.release_detached_frames();
+        let completed = self.complete_ready_frames();
+        let top_loaded = self.try_dispatch_top_load();
+        released_before || attached || delivered || released_after || completed || top_loaded
     }
 
     /// URLs of the page's live child frames, in creation order.
@@ -1877,15 +2806,15 @@ impl Page {
                                 || unsupported_stylesheet_imports > 0
                                 || pending_navigation_url.is_some()
                                 || probe.pending_dynamic_scripts)
-                            .then(|| FrameResourceDiagnostic {
-                                frame_id: frame.frame_id(),
-                                url: frame.url().to_string(),
-                                unsupported_module_scripts: probe.unsupported_module_scripts,
-                                unsupported_stylesheet_imports,
-                                pending_navigation_url,
-                                pending_dynamic_scripts: probe.pending_dynamic_scripts,
-                                diagnostic_error: None,
-                            })
+                                .then(|| FrameResourceDiagnostic {
+                                    frame_id: frame.frame_id(),
+                                    url: frame.url().to_string(),
+                                    unsupported_module_scripts: probe.unsupported_module_scripts,
+                                    unsupported_stylesheet_imports,
+                                    pending_navigation_url,
+                                    pending_dynamic_scripts: probe.pending_dynamic_scripts,
+                                    diagnostic_error: None,
+                                })
                         }
                         Err(error) => Some(FrameResourceDiagnostic {
                             frame_id: frame.frame_id(),
@@ -1985,17 +2914,13 @@ impl Page {
             if diagnostic.unsupported_module_scripts != 0 {
                 reasons.insert(format!(
                     "frame {} ({}) has {} unsupported module scripts",
-                    diagnostic.frame_id,
-                    diagnostic.url,
-                    diagnostic.unsupported_module_scripts,
+                    diagnostic.frame_id, diagnostic.url, diagnostic.unsupported_module_scripts,
                 ));
             }
             if diagnostic.unsupported_stylesheet_imports != 0 {
                 reasons.insert(format!(
                     "frame {} ({}) has {} unsupported stylesheet imports",
-                    diagnostic.frame_id,
-                    diagnostic.url,
-                    diagnostic.unsupported_stylesheet_imports,
+                    diagnostic.frame_id, diagnostic.url, diagnostic.unsupported_stylesheet_imports,
                 ));
             }
             if let Some(target) = diagnostic.pending_navigation_url {
@@ -2043,6 +2968,10 @@ impl Page {
                 .js
                 .as_ref()
                 .is_some_and(|js| js.pending_frame_message_queue().0 != 0)
+            || self
+                .js
+                .as_ref()
+                .is_some_and(|js| js.pending_frame_document_queue().0 != 0)
         {
             return true;
         }
@@ -2169,7 +3098,8 @@ impl Page {
     }
 
     async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
-        self.do_fetch_resource(url, ResourceRequest::navigation()).await
+        self.do_fetch_resource(url, ResourceRequest::navigation())
+            .await
     }
 
     async fn do_fetch_resource(
@@ -2316,21 +3246,224 @@ impl Page {
         }
     }
 
-    async fn fetch_stylesheets(&mut self) -> Vec<(AuthorStylesheetTarget, String)> {
-        let (all_links, inline_imports) = match &self.js {
-            Some(js) => js
-                .with_dom(|dom| {
-                    (
-                        linked_stylesheet_requests(dom),
-                        inline_stylesheet_import_requests(dom),
-                    )
-                })
-                .unwrap_or_default(),
-            None => {
-                tracing::info!("fetch_stylesheets: no js runtime");
-                return Vec::new();
+    /// Freeze the parser-owned script list before any new-document preload can
+    /// see the fully parsed backing tree. Preloads may create their own scripts
+    /// or move nodes which already belong to the parser; neither operation may
+    /// enroll new parser work or execute an original parser script twice.
+    fn snapshot_parser_scripts(&self) -> Option<Vec<ScriptInfo>> {
+        let js = self.js.as_ref()?;
+        let document_url = self.url_string();
+        js.with_dom(|dom| {
+            let script_ids = dom.query_selector_all("script").unwrap_or_default();
+            let mut bases_at_script = std::collections::HashMap::new();
+            let mut parser_order_at_script = std::collections::HashMap::new();
+            let mut active_base = url::Url::parse(&document_url).ok();
+            let mut found_base = false;
+            for (parser_order, nid) in dom.descendants(dom.document()).into_iter().enumerate() {
+                let Some(node) = dom.get_node(nid) else {
+                    continue;
+                };
+                let Some(name) = node.as_element() else {
+                    continue;
+                };
+                if name.local.as_ref() == "base" && !found_base {
+                    if let Some(href) = node.get_attribute("href") {
+                        found_base = true;
+                        if let Some(resolved) =
+                            active_base.as_ref().and_then(|base| base.join(href).ok())
+                        {
+                            active_base = Some(resolved);
+                        }
+                    }
+                } else if name.local.as_ref() == "script" {
+                    parser_order_at_script.insert(nid.raw(), parser_order);
+                    bases_at_script.insert(
+                        nid.raw(),
+                        active_base
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| document_url.clone()),
+                    );
+                }
             }
+            let body_descendants = dom
+                .query_selector("body")
+                .ok()
+                .flatten()
+                .map(|body| {
+                    dom.descendants(body)
+                        .into_iter()
+                        .map(|nid| nid.raw())
+                        .collect::<std::collections::HashSet<_>>()
+                })
+                .unwrap_or_default();
+
+            script_ids
+                .into_iter()
+                .filter_map(|sid| {
+                    let node = dom.get_node(sid)?;
+                    let src = node.get_attribute("src").map(str::to_string);
+                    let script_type = node
+                        .get_attribute("type")
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_lowercase();
+                    let kind = match script_type.as_str() {
+                        "module" => ScriptKind::Module,
+                        "importmap" => ScriptKind::ImportMap,
+                        "" | "text/javascript" | "application/javascript" => ScriptKind::Classic,
+                        _ => return None,
+                    };
+                    let inline = if src.is_none() {
+                        dom.text_content(sid)
+                    } else {
+                        String::new()
+                    };
+                    if !matches!(kind, ScriptKind::ImportMap)
+                        && src.is_none()
+                        && inline.trim().is_empty()
+                    {
+                        return None;
+                    }
+                    Some(ScriptInfo {
+                        src,
+                        inline,
+                        is_defer: node.get_attribute("defer").is_some(),
+                        is_async: node.get_attribute("async").is_some(),
+                        kind,
+                        nid: sid.raw(),
+                        after_body_start: body_descendants.contains(&sid.raw()),
+                        base_url: bases_at_script
+                            .get(&sid.raw())
+                            .cloned()
+                            .unwrap_or_else(|| document_url.clone()),
+                        parser_order: parser_order_at_script
+                            .get(&sid.raw())
+                            .copied()
+                            .unwrap_or(usize::MAX),
+                    })
+                })
+                .collect()
+        })
+    }
+
+    #[cfg(test)]
+    fn snapshot_parser_body_order(&self) -> Option<usize> {
+        self.js
+            .as_ref()?
+            .with_dom(|dom| {
+                let body = dom.query_selector("body").ok().flatten()?;
+                dom.descendants(dom.document())
+                    .into_iter()
+                    .position(|nid| nid == body)
+            })
+            .flatten()
+    }
+
+    fn install_parsed_body_load_handler(&mut self) {
+        if let Some(js) = self.js.as_mut() {
+            let _ = js.execute_script(
+                "<body-load-handler>",
+                "globalThis.__obscura_installParsedBodyLoadHandler?.();",
+            );
+        }
+    }
+
+    fn mark_parser_scripts_started(&mut self, scripts: &[ScriptInfo]) {
+        let Some(js) = self.js.as_mut() else {
+            return;
         };
+        let ids = scripts
+            .iter()
+            .map(|script| script.nid.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let _ = js.execute_script(
+            "<parser-scripts>",
+            &format!("globalThis.__markParserScripts([{}]);", ids),
+        );
+    }
+
+    fn snapshot_parser_stylesheets(&self) -> Option<ParserStylesheetSnapshot> {
+        let document_url = self.url.clone()?;
+        let (links, inline_imports, body_parser_order) = self
+            .js
+            .as_ref()?
+            .with_dom(|dom| parser_stylesheet_requests(dom, &document_url))
+            .unwrap_or_default();
+        Some(ParserStylesheetSnapshot {
+            links,
+            inline_imports,
+            body_parser_order,
+        })
+    }
+
+    fn mark_parser_stylesheets_pending(&mut self, snapshot: &ParserStylesheetSnapshot) {
+        let Some(js) = self.js.as_mut() else {
+            return;
+        };
+        let tokens = snapshot
+            .links
+            .iter()
+            .map(|link| {
+                serde_json::json!({
+                    "nid": link.nid,
+                    "rawHref": link.raw_href,
+                    "requestHref": link
+                        .base_url
+                        .join(&link.raw_href)
+                        .ok()
+                        .map(|url| url.to_string()),
+                })
+            })
+            .collect::<Vec<_>>();
+        let tokens = serde_json::to_string(&tokens).unwrap_or_else(|_| "[]".to_string());
+        let _ = js.execute_script(
+            "<parser-stylesheets>",
+            &format!("globalThis.__markParserStylesheets({tokens});"),
+        );
+    }
+
+    fn execute_top_lifecycle_script(&mut self, name: &str, source: &str) -> Result<(), String> {
+        let Some(js) = self.js.as_mut() else {
+            return Err("JavaScript runtime disappeared".to_string());
+        };
+        let watchdog = js.arm_watchdog(std::time::Duration::from_millis(
+            LIFECYCLE_CALLBACK_WATCHDOG_MS,
+        ));
+        let result = js.execute_script(name, source);
+        let watchdog_fired = js.disarm_watchdog(watchdog);
+        if watchdog_fired || result.is_err() {
+            self.top_load_pending = false;
+            self.lifecycle = LifecycleState::Failed;
+            return Err(result
+                .err()
+                .unwrap_or_else(|| "lifecycle task budget exceeded".to_string()));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn fetch_stylesheets(&mut self) -> FetchedStylesheets {
+        let Some(snapshot) = self.snapshot_parser_stylesheets() else {
+            tracing::info!("fetch_stylesheets: no js runtime");
+            return FetchedStylesheets {
+                materialized: Vec::new(),
+                failed_links: Vec::new(),
+            };
+        };
+        self.fetch_stylesheets_from_snapshot(snapshot).await
+    }
+
+    async fn fetch_stylesheets_from_snapshot(
+        &mut self,
+        snapshot: ParserStylesheetSnapshot,
+    ) -> FetchedStylesheets {
+        let ParserStylesheetSnapshot {
+            links: all_links,
+            inline_imports,
+            body_parser_order: _,
+        } = snapshot;
 
         tracing::info!(
             "fetch_stylesheets: found {} stylesheet links and {} inline imports",
@@ -2339,18 +3472,21 @@ impl Page {
         );
 
         let Some(document_url) = self.url.clone() else {
-            return Vec::new();
+            return FetchedStylesheets {
+                materialized: Vec::new(),
+                failed_links: Vec::new(),
+            };
         };
-        let document_base = self
-            .resolve_base_url()
-            .unwrap_or_else(|| document_url.clone());
         let mut roots = Vec::new();
+        let mut failed_links = Vec::new();
         let mut scheduled = std::collections::HashSet::new();
         let mut pending = Vec::new();
-        for (link_index, href) in all_links {
-            let Ok(resolved) = document_base.join(&href) else {
+        for link in all_links {
+            let Ok(resolved) = link.base_url.join(&link.raw_href) else {
+                failed_links.push((link.nid, link.parser_order, link.raw_href, None));
                 continue;
             };
+            let request_href = resolved.to_string();
             let (key, resolved) = canonical_stylesheet_url(resolved);
             if !subresource_allowed(Some(&document_url), resolved.as_str()) {
                 tracing::warn!(
@@ -2358,13 +3494,34 @@ impl Page {
                     self.url_string(),
                     resolved,
                 );
+                failed_links.push((
+                    link.nid,
+                    link.parser_order,
+                    link.raw_href,
+                    Some(request_href),
+                ));
                 continue;
             }
             if self.should_block_url(resolved.as_str()) {
                 tracing::info!("Blocked stylesheet by interception: {}", resolved);
+                failed_links.push((
+                    link.nid,
+                    link.parser_order,
+                    link.raw_href,
+                    Some(request_href),
+                ));
                 continue;
             }
-            roots.push((AuthorStylesheetTarget::Linked(link_index), key.clone(), None));
+            roots.push((
+                AuthorStylesheetTarget::Linked {
+                    nid: link.nid,
+                    parser_order: link.parser_order,
+                    raw_href: link.raw_href,
+                    request_href,
+                },
+                key.clone(),
+                None,
+            ));
             if scheduled.insert(key.clone()) {
                 if scheduled.len() <= MAX_STYLESHEET_RESOURCES {
                     pending.push((key, resolved, 0u8));
@@ -2375,8 +3532,8 @@ impl Page {
                 }
             }
         }
-        for (style_index, import) in inline_imports {
-            let Ok(resolved) = document_base.join(&import.url) else {
+        for inline_import in inline_imports {
+            let Ok(resolved) = inline_import.base_url.join(&inline_import.import.url) else {
                 continue;
             };
             let (key, resolved) = canonical_stylesheet_url(resolved);
@@ -2387,9 +3544,11 @@ impl Page {
                 continue;
             }
             roots.push((
-                AuthorStylesheetTarget::InlineImport(style_index),
+                AuthorStylesheetTarget::InlineImport {
+                    nid: inline_import.nid,
+                },
                 key.clone(),
-                import.media,
+                inline_import.import.media,
             ));
             if scheduled.insert(key.clone()) {
                 if scheduled.len() <= MAX_STYLESHEET_RESOURCES {
@@ -2476,6 +3635,13 @@ impl Page {
                     &response.body,
                     false,
                 );
+                if !(200..300).contains(&response.status) {
+                    self.mark_resource_archive_incomplete(format!(
+                        "top-level stylesheet {requested_url} returned HTTP {}",
+                        response.status,
+                    ));
+                    continue;
+                }
 
                 let (response_key, response_url) = canonical_stylesheet_url(response_url);
                 if let Some(existing) = aliases.get(&response_key).cloned() {
@@ -2538,26 +3704,43 @@ impl Page {
             }
         }
 
-        roots
-            .into_iter()
-            .filter_map(|(target, key, media)| {
-                materialize_stylesheet_graph(
-                    &key,
-                    &sheets,
-                    &aliases,
-                    &mut std::collections::HashSet::new(),
-                )
-                .map(|css| {
+        let mut materialized = Vec::new();
+        for (target, key, media) in roots {
+            match materialize_stylesheet_graph(
+                &key,
+                &sheets,
+                &aliases,
+                &mut std::collections::HashSet::new(),
+            ) {
+                Some(css) => {
                     let css = match media {
                         Some(media) => format!("@media {media} {{\n{css}\n}}\n"),
                         None => css,
                     };
-                    (target, css)
-                })
-            })
-            .collect()
+                    materialized.push((target, css));
+                }
+                None => {
+                    if let AuthorStylesheetTarget::Linked {
+                        nid,
+                        parser_order,
+                        raw_href,
+                        request_href,
+                    } = target
+                    {
+                        failed_links.push((nid, parser_order, raw_href, Some(request_href)));
+                    }
+                }
+            }
+        }
+        failed_links.sort_unstable();
+        failed_links.dedup();
+        FetchedStylesheets {
+            materialized,
+            failed_links,
+        }
     }
 
+    #[cfg(test)]
     async fn execute_scripts(&mut self) {
         self.execute_scripts_with_module_budget(None).await;
     }
@@ -2567,11 +3750,12 @@ impl Page {
     /// separate from arbitrary post-load imports, timers, and enhancement
     /// scripts; navigation readiness must not turn those into an implicit
     /// multi-second settle.
+    #[cfg(test)]
     async fn drive_load_delaying_scripts(
         js: &mut ObscuraJsRuntime,
         deadline: tokio::time::Instant,
     ) -> bool {
-        while js.has_pending_load_delaying_scripts() {
+        while js.has_pending_load_delaying_resources() {
             let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
             else {
                 return false;
@@ -2580,14 +3764,9 @@ impl Page {
                 return false;
             }
             let poll_budget = remaining.min(tokio::time::Duration::from_millis(25));
-            match tokio::time::timeout(
-                poll_budget,
-                js.run_load_delaying_event_loop_tick(),
-            )
-            .await
-            {
+            match tokio::time::timeout(poll_budget, js.run_load_delaying_event_loop_tick()).await {
                 Ok(Ok(_idle)) => {
-                    if js.has_pending_load_delaying_scripts() {
+                    if js.has_pending_load_delaying_resources() {
                         tokio::task::yield_now().await;
                     }
                 }
@@ -2604,7 +3783,76 @@ impl Page {
         true
     }
 
+    /// Alternate JavaScript tasks with native frame attachment until the top
+    /// document's complete/readystatechange/load transition can run.
+    async fn drive_document_load(&mut self, deadline: tokio::time::Instant) -> bool {
+        loop {
+            self.advance_frames().await;
+            if self.lifecycle == LifecycleState::Failed {
+                return false;
+            }
+            if !self.top_load_pending {
+                return true;
+            }
+            let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
+            else {
+                return false;
+            };
+            if remaining.is_zero() {
+                return false;
+            }
+            let poll_budget = remaining.min(tokio::time::Duration::from_millis(25));
+            let Some(js) = self.js.as_mut() else {
+                return false;
+            };
+            match tokio::time::timeout(poll_budget, js.run_load_delaying_event_loop_tick()).await {
+                Ok(Ok(_)) => tokio::task::yield_now().await,
+                Ok(Err(error)) => {
+                    tracing::warn!("document load event loop failed: {error}");
+                    return false;
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    #[cfg(test)]
     async fn execute_scripts_with_module_budget(&mut self, module_budget_override: Option<u64>) {
+        // Unit fixtures construct a fully parsed document directly instead of
+        // entering through navigate_single(). Match the real navigation
+        // boundary so scripts inserted by parser code join the load-delay set
+        // and the lifecycle driver actually pumps their fetches.
+        if let Some(js) = self.js.as_mut() {
+            let _ = js.execute_script(
+                "<ready-state>",
+                "globalThis.__documentReadyState__ = 'loading';",
+            );
+        }
+        let parser_body_order = self.snapshot_parser_body_order();
+        let Some(phase) = self
+            .execute_scripts_to_dom_content_loaded(module_budget_override, None, parser_body_order)
+            .await
+        else {
+            return;
+        };
+        self.top_load_pending = true;
+        if !self.drive_document_load(phase.deadline).await {
+            tracing::warn!("document load deadline reached with blockers still pending");
+        }
+        if let (Some(js), Some(watchdog)) = (self.js.as_mut(), phase.watchdog) {
+            if js.disarm_watchdog(watchdog) {
+                self.top_load_pending = false;
+                self.lifecycle = LifecycleState::Failed;
+            }
+        }
+    }
+
+    async fn execute_scripts_to_dom_content_loaded(
+        &mut self,
+        module_budget_override: Option<u64>,
+        parser_scripts: Option<Vec<ScriptInfo>>,
+        parser_body_order: Option<usize>,
+    ) -> Option<ScriptLoadPhase> {
         let scripts_started = std::time::Instant::now();
         tracing::info!(
             "execute_scripts called, js runtime exists: {}",
@@ -2641,25 +3889,6 @@ impl Page {
             .as_mut()
             .map(|js| js.arm_watchdog(std::time::Duration::from_millis(script_deadline_ms + 1000)));
 
-        #[derive(Debug, Clone, Copy)]
-        enum ScriptKind {
-            Classic,
-            Module,
-            ImportMap,
-        }
-
-        #[derive(Debug)]
-        struct ScriptInfo {
-            src: Option<String>,
-            inline: String,
-            is_defer: bool,
-            is_async: bool,
-            kind: ScriptKind,
-            nid: u32,
-            /// Document base URL at this element's parser encounter point.
-            base_url: String,
-        }
-
         let external_module_url = |script: &ScriptInfo| {
             let src = script.src.as_ref()?;
             Some(
@@ -2678,108 +3907,16 @@ impl Page {
             )
         };
 
-        let all_scripts = match &self.js {
-            Some(js) => {
-                let document_url = self.url_string();
-                js.with_dom(|dom| {
-                    let script_ids = dom.query_selector_all("script").unwrap_or_default();
-                    let mut bases_at_script = std::collections::HashMap::new();
-                    let mut active_base = url::Url::parse(&document_url).ok();
-                    let mut found_base = false;
-                    for nid in dom.descendants(dom.document()) {
-                        let Some(node) = dom.get_node(nid) else {
-                            continue;
-                        };
-                        let Some(name) = node.as_element() else {
-                            continue;
-                        };
-                        if name.local.as_ref() == "base" && !found_base {
-                            if let Some(href) = node.get_attribute("href") {
-                                found_base = true;
-                                if let Some(resolved) =
-                                    active_base.as_ref().and_then(|base| base.join(href).ok())
-                                {
-                                    active_base = Some(resolved);
-                                }
-                            }
-                        } else if name.local.as_ref() == "script" {
-                            bases_at_script.insert(
-                                nid.raw(),
-                                active_base
-                                    .as_ref()
-                                    .map(ToString::to_string)
-                                    .unwrap_or_else(|| document_url.clone()),
-                            );
-                        }
-                    }
-                    let mut scripts = Vec::new();
-
-                    for sid in script_ids {
-                        if let Some(node) = dom.get_node(sid) {
-                            let src = node.get_attribute("src").map(|s| s.to_string());
-                            let script_type = node
-                                .get_attribute("type")
-                                .unwrap_or("")
-                                .trim()
-                                .to_ascii_lowercase();
-                            let is_defer = node.get_attribute("defer").is_some();
-                            let is_async = node.get_attribute("async").is_some();
-                            let kind = match script_type.as_str() {
-                                "module" => ScriptKind::Module,
-                                "importmap" => ScriptKind::ImportMap,
-                                "" | "text/javascript" | "application/javascript" => {
-                                    ScriptKind::Classic
-                                }
-                                _ => continue,
-                            };
-
-                            let inline_code = if src.is_none() {
-                                dom.text_content(sid)
-                            } else {
-                                String::new()
-                            };
-
-                            if matches!(kind, ScriptKind::ImportMap)
-                                || src.is_some()
-                                || !inline_code.trim().is_empty()
-                            {
-                                scripts.push(ScriptInfo {
-                                    src,
-                                    inline: inline_code,
-                                    is_defer,
-                                    is_async,
-                                    kind,
-                                    nid: sid.raw(),
-                                    base_url: bases_at_script
-                                        .get(&sid.raw())
-                                        .cloned()
-                                        .unwrap_or_else(|| document_url.clone()),
-                                });
-                            }
-                        }
-                    }
-                    scripts
-                })
-                .unwrap_or_default()
-            }
-            None => return,
+        let all_scripts = match parser_scripts {
+            Some(scripts) => scripts,
+            None => self.snapshot_parser_scripts()?,
         };
 
         // HTML scripts have an "already started" flag. Mark every
         // parser-discovered script before running page code so React/Next
         // hydration can move or hoist those nodes without appendChild
         // executing them a second time.
-        if let Some(js) = &mut self.js {
-            let ids = all_scripts
-                .iter()
-                .map(|script| script.nid.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            let _ = js.execute_script(
-                "<parser-scripts>",
-                &format!("globalThis.__markParserScripts([{}]);", ids),
-            );
-        }
+        self.mark_parser_scripts_started(&all_scripts);
 
         tracing::info!("Found {} parser-discovered scripts", all_scripts.len());
         let mut fetch_tasks: Vec<(usize, String)> = Vec::new();
@@ -2927,30 +4064,6 @@ impl Page {
             }
         }
 
-        // Spec: readyState is "loading" while parser-discovered scripts execute.
-        // Scripts that check readyState === 'loading' will register DOMContentLoaded
-        // listeners instead of calling their callback immediately.
-        if let Some(js) = &mut self.js {
-            let _ = js.execute_script(
-                "<ready-state>",
-                "globalThis.__documentReadyState__ = 'loading';",
-            );
-        }
-
-        // CDP `Page.addScriptToEvaluateOnNewDocument` contract: preload
-        // sources must run BEFORE any of the page's own scripts. This is
-        // also where puppeteer's `exposeFunction` wrapper installs itself —
-        // if preload runs after page scripts, every early binding call
-        // hits an undefined function and silently no-ops.
-        let preload_sources = self.preload_scripts.clone();
-        if let Some(js) = &mut self.js {
-            for source in &preload_sources {
-                if let Err(e) = js.execute_script_guarded("<preload>", source.as_str()) {
-                    tracing::debug!("Preload script error: {}", e);
-                }
-            }
-        }
-
         // Per-module budget. Modules on an already-rendered page are
         // enhancement, not the app: give them a short budget so one slow
         // non-essential module (e.g. YC's bookface, whose top-level eval
@@ -3003,6 +4116,7 @@ impl Page {
             Module {
                 prepared: obscura_js::runtime::PreparedModule,
                 url: Option<String>,
+                nid: u32,
                 remaining_active_ms: u64,
                 graph_elapsed_ms: u64,
                 queued_at: std::time::Instant,
@@ -3032,6 +4146,24 @@ impl Page {
                 .saturating_add(module_hostcall_grace_ms)
                 .min(remaining_page_ms);
             (budget != 0).then_some(budget)
+        };
+
+        // Parser-discovered scripts are prepared by the Rust-side HTML script
+        // runner rather than bootstrap's dynamic-script queue, so completion
+        // must be reflected back through the element's EventTarget explicitly.
+        // Dispatching (instead of calling `onload` / `onerror` directly) keeps
+        // IDL/content-attribute handlers and addEventListener listeners on the
+        // same single event path.
+        let dispatch_script_event = |page: &mut Self, nid: u32, event_type: &'static str| {
+            debug_assert!(matches!(event_type, "load" | "error"));
+            if let Some(js) = &mut page.js {
+                let _ = js.execute_script(
+                    "<parser-script-event>",
+                    &format!(
+                        "globalThis.__obscura_dispatchParserScriptEvent({nid}, '{event_type}')"
+                    ),
+                );
+            }
         };
 
         let execute_classic =
@@ -3064,6 +4196,12 @@ impl Page {
                                 "globalThis.__currentScriptNid=0;",
                             );
                         }
+                        // A successfully fetched classic script fires load even
+                        // when evaluating its source reports a JS exception.
+                        // Fetch/HTTP failures take the error path below.
+                        dispatch_script_event(page, script.nid, "load");
+                    } else {
+                        dispatch_script_event(page, script.nid, "error");
                     }
                 } else if !script.inline.is_empty() {
                     if let Some(js) = &mut page.js {
@@ -3083,11 +4221,50 @@ impl Page {
             };
 
         let mut post_parse = Vec::new();
+        let mut body_load_handler_installed = false;
+        let mut parser_stylesheet_events =
+            std::mem::take(&mut self.pending_parser_stylesheet_events)
+                .into_values()
+                .collect::<Vec<_>>();
+        parser_stylesheet_events.sort_by_key(|(order, _)| *order);
+        let mut parser_stylesheet_events =
+            std::collections::VecDeque::from(parser_stylesheet_events);
+        let mut parser_stylesheet_failed = false;
 
         // Process parser-discovered scripts in encounter order. Import maps
         // register at their exact position; module graphs start there too, but
         // evaluation of non-async modules remains post-parse.
         for (index, script) in all_scripts.iter().enumerate() {
+            while parser_stylesheet_events
+                .front()
+                .is_some_and(|(order, _)| *order < script.parser_order)
+            {
+                let (order, source) = parser_stylesheet_events.pop_front().unwrap();
+                if !body_load_handler_installed
+                    && parser_body_order.is_some_and(|body_order| body_order < order)
+                {
+                    self.install_parsed_body_load_handler();
+                    body_load_handler_installed = true;
+                }
+                if let Err(error) =
+                    self.execute_top_lifecycle_script("<parser-stylesheet-event>", &source)
+                {
+                    tracing::warn!("parser stylesheet owner event failed: {error}");
+                    parser_stylesheet_failed = true;
+                    break;
+                }
+            }
+            if parser_stylesheet_failed {
+                break;
+            }
+            if !body_load_handler_installed
+                && parser_body_order
+                    .map(|body_order| body_order < script.parser_order)
+                    .unwrap_or(script.after_body_start)
+            {
+                self.install_parsed_body_load_handler();
+                body_load_handler_installed = true;
+            }
             if tokio::time::Instant::now() >= script_deadline {
                 tracing::warn!(
                     "execute_scripts: deadline reached, skipping {} remaining scripts",
@@ -3100,6 +4277,9 @@ impl Page {
                                 "top-level module was not processed before the script deadline: {url}"
                             ));
                         }
+                    }
+                    if skipped.src.is_some() || matches!(skipped.kind, ScriptKind::Module) {
+                        dispatch_script_event(self, skipped.nid, "error");
                     }
                 }
                 break;
@@ -3137,6 +4317,7 @@ impl Page {
                                 "top-level module page budget exhausted before graph preparation: {url}"
                             ));
                         }
+                        dispatch_script_event(self, script.nid, "error");
                         continue;
                     };
                     let prepare_budget_ms = module_budget_ms.min(remaining_page_ms);
@@ -3149,6 +4330,7 @@ impl Page {
                                 self.mark_resource_archive_incomplete(format!(
                                     "top-level module graph preparation could not start: {full_url}"
                                 ));
+                                dispatch_script_event(self, script.nid, "error");
                                 continue;
                             }
                         };
@@ -3167,6 +4349,7 @@ impl Page {
                                 self.mark_resource_archive_incomplete(format!(
                                     "top-level module graph preparation failed: {full_url}"
                                 ));
+                                dispatch_script_event(self, script.nid, "error");
                                 continue;
                             }
                         }
@@ -3180,7 +4363,10 @@ impl Page {
                                 )
                                 .await
                             }
-                            None => continue,
+                            None => {
+                                dispatch_script_event(self, script.nid, "error");
+                                continue;
+                            }
                         };
                         tracing::debug!(
                             phase = "module-graph",
@@ -3194,6 +4380,7 @@ impl Page {
                             Ok(prepared) => (prepared, None),
                             Err(error) => {
                                 tracing::warn!("Inline ES module error: {}", error);
+                                dispatch_script_event(self, script.nid, "error");
                                 continue;
                             }
                         }
@@ -3212,11 +4399,13 @@ impl Page {
                                 "top-level module active budget exhausted during graph preparation: {url}"
                             ));
                         }
+                        dispatch_script_event(self, script.nid, "error");
                         continue;
                     }
                     let scheduled = ScheduledScript::Module {
                         prepared,
                         url: module_url,
+                        nid: script.nid,
                         remaining_active_ms,
                         graph_elapsed_ms,
                         queued_at: std::time::Instant::now(),
@@ -3225,6 +4414,7 @@ impl Page {
                         let ScheduledScript::Module {
                             prepared,
                             url,
+                            nid,
                             remaining_active_ms,
                             graph_elapsed_ms,
                             queued_at,
@@ -3245,6 +4435,7 @@ impl Page {
                                     "top-level module page budget exhausted before evaluation: {url}"
                                 ));
                             }
+                            dispatch_script_event(self, nid, "error");
                             continue;
                         };
                         let queue_wait_ms = queued_at.elapsed().as_millis();
@@ -3260,6 +4451,7 @@ impl Page {
                                         "top-level module evaluation could not start: {url}"
                                     ));
                                 }
+                                dispatch_script_event(self, nid, "error");
                                 continue;
                             }
                         };
@@ -3281,6 +4473,7 @@ impl Page {
                                     "top-level module evaluation failed: {url}"
                                 ));
                             }
+                            dispatch_script_event(self, nid, "error");
                         } else if let Some(url) = url {
                             tracing::info!("ES module loaded: {}", url);
                             self.record_network_event(
@@ -3291,6 +4484,9 @@ impl Page {
                                 &std::collections::HashMap::new(),
                                 0,
                             );
+                            dispatch_script_event(self, nid, "load");
+                        } else {
+                            dispatch_script_event(self, nid, "load");
                         }
                     } else {
                         post_parse.push(scheduled);
@@ -3299,23 +4495,52 @@ impl Page {
             }
         }
 
+        while let Some((order, source)) = parser_stylesheet_events.pop_front() {
+            if !body_load_handler_installed
+                && parser_body_order.is_some_and(|body_order| body_order < order)
+            {
+                self.install_parsed_body_load_handler();
+                body_load_handler_installed = true;
+            }
+            if let Err(error) =
+                self.execute_top_lifecycle_script("<parser-stylesheet-event>", &source)
+            {
+                tracing::warn!("parser stylesheet owner event failed: {error}");
+                break;
+            }
+        }
+
+        if !body_load_handler_installed {
+            self.install_parsed_body_load_handler();
+        }
+
         // Parsing has finished before defer scripts and non-async modules run.
         // They still gate DOMContentLoaded, but observe the browser's
         // `interactive` readyState while they execute.
         if let Some(js) = &mut self.js {
             let _ = js.execute_script(
                 "<ready-state-interactive>",
-                "globalThis.__documentReadyState__ = 'interactive';",
+                "globalThis.__documentReadyState__ = 'interactive';\
+                 try { globalThis.__obscura_dispatchDocumentLifecycleEvent('readystatechange'); } catch (_) {}",
             );
         }
 
         for scheduled in post_parse {
             if tokio::time::Instant::now() >= script_deadline {
                 tracing::warn!("execute_scripts: deadline reached during post-parse scripts");
-                if let ScheduledScript::Module { url: Some(url), .. } = &scheduled {
-                    self.mark_resource_archive_incomplete(format!(
-                        "top-level module was not evaluated before the script deadline: {url}"
-                    ));
+                match &scheduled {
+                    ScheduledScript::Classic(index) => {
+                        let script = &all_scripts[*index];
+                        dispatch_script_event(self, script.nid, "error");
+                    }
+                    ScheduledScript::Module { url, nid, .. } => {
+                        if let Some(url) = url {
+                            self.mark_resource_archive_incomplete(format!(
+                                "top-level module was not evaluated before the script deadline: {url}"
+                            ));
+                        }
+                        dispatch_script_event(self, *nid, "error");
+                    }
                 }
                 continue;
             }
@@ -3328,6 +4553,7 @@ impl Page {
                 ScheduledScript::Module {
                     prepared,
                     url,
+                    nid,
                     remaining_active_ms,
                     graph_elapsed_ms,
                     queued_at,
@@ -3345,6 +4571,7 @@ impl Page {
                                 "top-level module page budget exhausted before post-parse evaluation: {url}"
                             ));
                         }
+                        dispatch_script_event(self, nid, "error");
                         continue;
                     };
                     let queue_wait_ms = queued_at.elapsed().as_millis();
@@ -3360,6 +4587,7 @@ impl Page {
                                     "top-level module post-parse evaluation could not start: {url}"
                                 ));
                             }
+                            dispatch_script_event(self, nid, "error");
                             continue;
                         }
                     };
@@ -3381,6 +4609,7 @@ impl Page {
                                 "top-level module evaluation failed: {url}"
                             ));
                         }
+                        dispatch_script_event(self, nid, "error");
                     } else if let Some(url) = url {
                         tracing::info!("ES module loaded: {}", url);
                         self.record_network_event(
@@ -3391,6 +4620,9 @@ impl Page {
                             &std::collections::HashMap::new(),
                             0,
                         );
+                        dispatch_script_event(self, nid, "load");
+                    } else {
+                        dispatch_script_event(self, nid, "load");
                     }
                 }
             }
@@ -3403,32 +4635,8 @@ impl Page {
             // a DOMContentLoaded listener.
             let _ = js.execute_script(
                 "<dom-content-loaded>",
-                "try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
-                 try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}",
+                "try { globalThis.__obscura_dispatchDocumentLifecycleEvent('DOMContentLoaded'); } catch(e) {}",
             );
-
-            let load_blockers_finished =
-                Self::drive_load_delaying_scripts(js, script_deadline).await;
-            if !load_blockers_finished {
-                tracing::warn!(
-                    "script deadline reached with load-delaying dynamic scripts still pending"
-                );
-            }
-
-            // readyState becomes complete before the load event. A script
-            // inserted by an onload handler is therefore post-load work and
-            // remains pending until an explicit caller settle/wait.
-            let _ = js.execute_script(
-                "<load-event>",
-                "globalThis.__documentReadyState__ = 'complete';\n\
-                 if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
-                 try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}",
-            );
-        }
-        if let Some(token) = exec_wd {
-            if let Some(js) = self.js.as_mut() {
-                js.disarm_watchdog(token);
-            }
         }
         tracing::debug!(
             phase = "script-execution-total",
@@ -3436,6 +4644,10 @@ impl Page {
             budget_ms = script_deadline_ms,
             "script execution phase complete",
         );
+        Some(ScriptLoadPhase {
+            deadline: script_deadline,
+            watchdog: exec_wd,
+        })
     }
 
     pub async fn navigate(&mut self, url_str: &str) -> Result<(), PageError> {
@@ -3503,6 +4715,8 @@ impl Page {
             return;
         }
         let settle_started = std::time::Instant::now();
+        let settle_deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_millis(max_ms);
         // Pump, then give any frame document that finished fetching a realm of
         // its own. Attaching one runs its scripts, which can start timers,
         // fetches and further frames, so keep alternating until no new frame
@@ -3514,7 +4728,12 @@ impl Page {
             }
             if let Some(js) = &mut self.js {
                 if std::env::var_os("OBSCURA_STRICT_SETTLE").is_some() {
-                    Self::settle_runtime_for_duration(js, remaining).await;
+                    if let Err(error) = Self::settle_runtime_for_duration(js, remaining).await {
+                        tracing::warn!("strict settle JavaScript task failed: {error}");
+                        self.top_load_pending = false;
+                        self.lifecycle = LifecycleState::Failed;
+                        break;
+                    }
                 } else {
                     // A deno_core event loop remains "busy" for any future timer,
                     // including analytics intervals and animation loops which do
@@ -3522,10 +4741,20 @@ impl Page {
                     // observable document/network/script activity instead. The
                     // absolute caller budget and V8 watchdog still bound both
                     // asynchronous work and synchronous microtask storms.
-                    let _ = js.run_event_loop_until_quiescent(remaining, 150).await;
+                    if let Err(error) = js.run_event_loop_until_quiescent(remaining, 150).await {
+                        tracing::warn!("adaptive settle JavaScript task failed: {error}");
+                        self.top_load_pending = false;
+                        self.lifecycle = LifecycleState::Failed;
+                        break;
+                    }
                 }
             }
-            if !self.advance_frames().await {
+            let advanced =
+                match tokio::time::timeout_at(settle_deadline, self.advance_frames()).await {
+                    Ok(advanced) => advanced,
+                    Err(_) => break,
+                };
+            if !advanced {
                 break;
             }
         }
@@ -3539,11 +4768,8 @@ impl Page {
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(1_000);
-            let remaining_ms = remaining_settle_resource_warmup_ms(
-                max_ms,
-                settle_started.elapsed(),
-                warmup_ms,
-            );
+            let remaining_ms =
+                remaining_settle_resource_warmup_ms(max_ms, settle_started.elapsed(), warmup_ms);
             if remaining_ms != 0 {
                 let _ = self.prepare_screenshot_resources(remaining_ms).await;
             }
@@ -3566,19 +4792,30 @@ impl Page {
         // the parent sends configuration, then the child starts image loads.
         const FRAME_PUMP_SLICE_MS: u64 = 50;
         let started = std::time::Instant::now();
+        let deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_millis(duration_ms);
         loop {
-            let remaining = duration_ms
-                .saturating_sub(started.elapsed().as_millis() as u64);
+            let remaining = duration_ms.saturating_sub(started.elapsed().as_millis() as u64);
             if remaining == 0 {
                 break;
             }
             let slice = remaining.min(FRAME_PUMP_SLICE_MS);
             if let Some(js) = &mut self.js {
-                Self::settle_runtime_for_duration(js, slice).await;
+                if let Err(error) = Self::settle_runtime_for_duration(js, slice).await {
+                    tracing::warn!("fixed settle JavaScript task failed: {error}");
+                    self.top_load_pending = false;
+                    self.lifecycle = LifecycleState::Failed;
+                    break;
+                }
             } else {
                 tokio::time::sleep(tokio::time::Duration::from_millis(slice)).await;
             }
-            self.advance_frames().await;
+            if tokio::time::timeout_at(deadline, self.advance_frames())
+                .await
+                .is_err()
+            {
+                break;
+            }
         }
     }
 
@@ -3592,21 +4829,33 @@ impl Page {
     ) -> Result<(), PageError> {
         const BROWSER_PUMP_SLICE_MS: u64 = 50;
         let started = std::time::Instant::now();
+        let deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_millis(duration_ms);
         loop {
             while self.process_pending_navigation().await? {}
 
-            let remaining = duration_ms
-                .saturating_sub(started.elapsed().as_millis() as u64);
+            let remaining = duration_ms.saturating_sub(started.elapsed().as_millis() as u64);
             if remaining == 0 {
                 break;
             }
             let slice = remaining.min(BROWSER_PUMP_SLICE_MS);
             if let Some(js) = &mut self.js {
-                Self::settle_runtime_for_duration(js, slice).await;
+                if let Err(error) = Self::settle_runtime_for_duration(js, slice).await {
+                    self.top_load_pending = false;
+                    self.lifecycle = LifecycleState::Failed;
+                    return Err(PageError::NetworkError(format!(
+                        "fixed settle JavaScript task failed: {error}"
+                    )));
+                }
             } else {
                 tokio::time::sleep(tokio::time::Duration::from_millis(slice)).await;
             }
-            self.advance_frames().await;
+            if tokio::time::timeout_at(deadline, self.advance_frames())
+                .await
+                .is_err()
+            {
+                break;
+            }
         }
         Ok(())
     }
@@ -3617,10 +4866,23 @@ impl Page {
     /// higher-priority automation commands.
     #[doc(hidden)]
     pub async fn run_autonomous_event_loop_turn(&mut self) -> Result<bool, String> {
-        let reached_idle = match self.js.as_mut() {
+        let turn = match self.js.as_mut() {
             Some(js) => js.run_autonomous_event_loop_turn().await,
             None => Ok(true),
-        }?;
+        };
+        let reached_idle = match turn {
+            Ok(reached_idle) => reached_idle,
+            Err(error) => {
+                // A bounded JS task failure is terminal for this document's
+                // lifecycle. In particular, a non-returning dynamic resource
+                // load/error handler may leave its JS-side delay counter set;
+                // retaining DomContentLoaded+pending would make Window.load
+                // appear capable of completing even though the pump stopped.
+                self.top_load_pending = false;
+                self.lifecycle = LifecycleState::Failed;
+                return Err(error);
+            }
+        };
         // Dynamic iframe fetches finish on the page event loop, but their
         // realms must be built by Page between turns. Keep the autonomous CDP
         // pump on the same generic frame path as settle(), so a client that
@@ -3629,14 +4891,18 @@ impl Page {
         Ok(reached_idle && !frame_work)
     }
 
-    async fn settle_runtime_for_duration(js: &mut ObscuraJsRuntime, duration_ms: u64) {
+    async fn settle_runtime_for_duration(
+        js: &mut ObscuraJsRuntime,
+        duration_ms: u64,
+    ) -> Result<(), String> {
         let started = tokio::time::Instant::now();
-        let _ = js.run_event_loop_for_duration(duration_ms).await;
+        let result = js.run_event_loop_for_duration(duration_ms).await;
         let requested = tokio::time::Duration::from_millis(duration_ms);
         let elapsed = started.elapsed();
         if elapsed < requested {
             tokio::time::sleep(requested - elapsed).await;
         }
+        result
     }
 
     /// Append the current URL to the history stack, truncating any forward
@@ -3870,39 +5136,138 @@ impl Page {
 
         self.dom = Some(dom);
         self.init_js();
-        let author_stylesheets = self.fetch_stylesheets().await;
+
+        // Freeze parser-owned resources, their encounter order, and their URL
+        // bases before CDP new-document code sees the fully parsed backing
+        // tree. Preloads may append, move, or rewrite nodes; that must neither
+        // enroll new parser work nor change the request base of existing work.
+        // Marking original scripts started here also prevents a preload which
+        // moves one from triggering it through the dynamic-script path.
+        let parser_scripts = self
+            .snapshot_parser_scripts()
+            .ok_or_else(|| PageError::ParseError("JavaScript runtime disappeared".to_string()))?;
+        self.mark_parser_scripts_started(&parser_scripts);
+        let parser_stylesheets = self
+            .snapshot_parser_stylesheets()
+            .ok_or_else(|| PageError::ParseError("JavaScript runtime disappeared".to_string()))?;
+        let parser_body_order = parser_stylesheets.body_parser_order;
+        self.mark_parser_stylesheets_pending(&parser_stylesheets);
+
+        // Static stylesheet owner events are the first page-authored
+        // callbacks this realm can dispatch. Establish parser readiness and
+        // install CDP new-document sources before starting their frozen
+        // network requests, so load/error handlers observe `loading` and the
+        // preload state.
+        if let Some(js) = &mut self.js {
+            let _ = js.execute_script(
+                "<ready-state>",
+                "globalThis.__documentReadyState__ = 'loading';",
+            );
+        }
+        let preload_sources = self.preload_scripts.clone();
+        let preload_watchdog = self.js.as_mut().map(|js| {
+            js.arm_watchdog(std::time::Duration::from_millis(
+                LIFECYCLE_CALLBACK_WATCHDOG_MS,
+            ))
+        });
+        if let Some(js) = &mut self.js {
+            for source in &preload_sources {
+                if let Err(error) = js.execute_script_guarded("<preload>", source) {
+                    tracing::debug!("Preload script error: {error}");
+                }
+            }
+        }
+        let preload_watchdog_fired = match (self.js.as_mut(), preload_watchdog) {
+            (Some(js), Some(watchdog)) => js.disarm_watchdog(watchdog),
+            _ => false,
+        };
+        if preload_watchdog_fired {
+            self.top_load_pending = false;
+            self.lifecycle = LifecycleState::Failed;
+            return Err(PageError::NetworkError(
+                "new-document preload exceeded its execution budget".to_string(),
+            ));
+        }
+        let fetched_stylesheets = self
+            .fetch_stylesheets_from_snapshot(parser_stylesheets)
+            .await;
+        let author_stylesheets = fetched_stylesheets.materialized;
+        if self.lifecycle == LifecycleState::Failed {
+            return Err(PageError::NetworkError(
+                "parser stylesheet lifecycle callback failed".to_string(),
+            ));
+        }
 
         // Inject CSS as a global so getComputedStyle and any CSS-aware shim
         // can read it. Has to happen before scripts run, regardless of
         // waitUntil, so handlers that read window.__obscura_css see it.
         if !author_stylesheets.is_empty() {
+            let combined_css = author_stylesheets
+                .iter()
+                .map(|(_, css)| css.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            // Use the thorough template-literal escape that covers U+2028 /
+            // U+2029 and other controls, so CSS cannot escape this assignment.
+            let escaped = escape_for_js_template_literal(&combined_css);
+            let code = format!("globalThis.__obscura_css = `{}`;", escaped);
             if let Some(js) = &mut self.js {
-                let combined_css = author_stylesheets
-                    .iter()
-                    .map(|(_, css)| css.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                // Use the thorough template-literal escape that
-                // covers U+2028 / U+2029 and other control chars.
-                // The previous escaper only handled `, \, and ${,
-                // letting attacker-controlled CSS containing a raw
-                // U+2028 break out of the template literal and run
-                // arbitrary JS in the page's V8 realm.
-                let escaped = escape_for_js_template_literal(&combined_css);
-                let code = format!("globalThis.__obscura_css = `{}`;", escaped);
                 let _ = js.execute_script("<css>", &code);
-                for (target, css) in &author_stylesheets {
-                    let code = match target {
-                        AuthorStylesheetTarget::Linked(link_index) => {
-                            materialize_linked_stylesheet_script(*link_index, css)
-                        }
-                        AuthorStylesheetTarget::InlineImport(style_index) => {
-                            materialize_inline_import_script(*style_index, css)
-                        }
-                    };
-                    let _ = js.execute_script("<fetch_stylesheets>", &code);
+            }
+            for (target, css) in &author_stylesheets {
+                let result = match target {
+                    AuthorStylesheetTarget::Linked {
+                        nid,
+                        parser_order,
+                        raw_href,
+                        request_href,
+                    } => {
+                        self.pending_parser_stylesheet_events.insert(
+                            *nid,
+                            (
+                                *parser_order,
+                                materialize_parser_stylesheet_script_with_token(
+                                    *nid,
+                                    css,
+                                    request_href,
+                                    raw_href,
+                                ),
+                            ),
+                        );
+                        Ok(())
+                    }
+                    AuthorStylesheetTarget::InlineImport { nid } => self.js.as_mut().map_or_else(
+                        || Err("JavaScript runtime disappeared".to_string()),
+                        |js| {
+                            js.execute_script(
+                                "<fetch_stylesheets>",
+                                &materialize_inline_import_script(*nid, css),
+                            )
+                        },
+                    ),
+                };
+                if let Err(error) = result {
+                    self.top_load_pending = false;
+                    self.lifecycle = LifecycleState::Failed;
+                    return Err(PageError::NetworkError(format!(
+                        "parser stylesheet lifecycle callback failed: {error}"
+                    )));
                 }
             }
+        }
+        for (nid, parser_order, raw_href, request_href) in fetched_stylesheets.failed_links {
+            self.pending_parser_stylesheet_events.insert(
+                nid,
+                (
+                    parser_order,
+                    complete_parser_stylesheet_script_with_token(
+                        nid,
+                        "error",
+                        request_href.as_deref(),
+                        &raw_href,
+                    ),
+                ),
+            );
         }
         self.document_timeline_origin = std::time::Instant::now();
         #[cfg(feature = "render")]
@@ -3935,9 +5300,22 @@ impl Page {
         // not before. Skipping execute_scripts() on the DCL path meant
         // every inline <script> in the page was silently dropped: form
         // listeners never registered, frameworks never bootstrapped,
-        // page.click() handlers were no-ops. Now scripts run regardless
-        // of waitUntil and DCL means "DOM parsed AND scripts executed".
-        self.execute_scripts().await;
+        // page.click() handlers were no-ops. Run through DOMContentLoaded here;
+        // the separate load gate below waits for frames and resources.
+        let script_phase = self
+            .execute_scripts_to_dom_content_loaded(None, Some(parser_scripts), parser_body_order)
+            .await
+            .ok_or_else(|| PageError::ParseError("JavaScript runtime disappeared".to_string()))?;
+        if self.lifecycle == LifecycleState::Failed {
+            if let (Some(js), Some(watchdog)) = (self.js.as_mut(), script_phase.watchdog) {
+                let _ = js.disarm_watchdog(watchdog);
+            }
+            self.top_load_pending = false;
+            return Err(PageError::NetworkError(
+                "parser stylesheet lifecycle callback failed".to_string(),
+            ));
+        }
+        let script_deadline = script_phase.deadline;
 
         #[cfg(feature = "render")]
         {
@@ -3955,6 +5333,11 @@ impl Page {
         }
 
         self.lifecycle = LifecycleState::DomContentLoaded;
+        // Establish the browser-side load gate before frame attachment or any
+        // other cancellable await. A caller timing out does not cancel the
+        // underlying document load in browsers; autonomous turns may still
+        // complete it and dispatch the pending lifecycle events.
+        self.top_load_pending = true;
 
         // Before any `wait_until` can return, because the frames belong to the
         // document rather than to one readiness level. Puppeteer and Playwright
@@ -3964,7 +5347,34 @@ impl Page {
         self.build_document_frames().await;
 
         if wait_until == crate::lifecycle::WaitUntil::DomContentLoaded {
+            let watchdog_fired = match (self.js.as_mut(), script_phase.watchdog) {
+                (Some(js), Some(watchdog)) => js.disarm_watchdog(watchdog),
+                _ => false,
+            };
+            if watchdog_fired || self.lifecycle == LifecycleState::Failed {
+                self.top_load_pending = false;
+                self.lifecycle = LifecycleState::Failed;
+                return Err(PageError::NetworkError(
+                    "document lifecycle callback exceeded its execution budget".to_string(),
+                ));
+            }
             return Ok(());
+        }
+
+        let document_loaded = self.drive_document_load(script_deadline).await;
+        let watchdog_fired = match (self.js.as_mut(), script_phase.watchdog) {
+            (Some(js), Some(watchdog)) => js.disarm_watchdog(watchdog),
+            _ => false,
+        };
+        if watchdog_fired {
+            self.top_load_pending = false;
+            self.lifecycle = LifecycleState::Failed;
+        }
+        if !document_loaded || self.lifecycle == LifecycleState::Failed {
+            self.lifecycle = LifecycleState::Failed;
+            return Err(PageError::NetworkError(
+                "document load event remained blocked at the script deadline".to_string(),
+            ));
         }
 
         if let Some(js) = &mut self.js {
@@ -3974,8 +5384,6 @@ impl Page {
                 }
             }
         }
-
-        self.lifecycle = LifecycleState::Loaded;
 
         if matches!(
             wait_until,
@@ -3996,6 +5404,7 @@ impl Page {
                 .map(|js| js.arm_watchdog(std::time::Duration::from_millis(5500)));
             let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
             let mut idle_since: Option<tokio::time::Instant> = None;
+            let mut event_loop_failed = false;
 
             loop {
                 let active = self.http_client.active_requests();
@@ -4023,20 +5432,37 @@ impl Page {
                 }
 
                 if let Some(js) = &mut self.js {
-                    let _ = tokio::time::timeout(
-                        tokio::time::Duration::from_millis(50),
-                        js.run_event_loop(),
-                    )
-                    .await;
+                    if matches!(
+                        tokio::time::timeout(
+                            tokio::time::Duration::from_millis(50),
+                            js.run_event_loop(),
+                        )
+                        .await,
+                        Ok(Err(_))
+                    ) {
+                        event_loop_failed = true;
+                        break;
+                    }
                 } else {
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
             }
 
-            if let Some(token) = netidle_wd {
+            let watchdog_fired = if let Some(token) = netidle_wd {
                 if let Some(js) = self.js.as_mut() {
-                    js.disarm_watchdog(token);
+                    js.disarm_watchdog(token)
+                } else {
+                    false
                 }
+            } else {
+                false
+            };
+            if event_loop_failed || watchdog_fired {
+                self.top_load_pending = false;
+                self.lifecycle = LifecycleState::Failed;
+                return Err(PageError::NetworkError(
+                    "JavaScript execution failed while waiting for network idle".to_string(),
+                ));
             }
             self.lifecycle = LifecycleState::NetworkIdle;
         }
@@ -4065,7 +5491,11 @@ impl Page {
         let has_iframe = self
             .with_dom(|dom| dom.query_selector("iframe").ok().flatten().is_some())
             .unwrap_or(false);
-        if !has_iframe {
+        let has_pending_frame = self
+            .js
+            .as_ref()
+            .is_some_and(|js| js.pending_frame_document_queue().0 != 0);
+        if !has_iframe && !has_pending_frame {
             return;
         }
 
@@ -4077,7 +5507,12 @@ impl Page {
                 )
                 .await;
             }
-            if !self.advance_frames().await {
+            let advanced = self.advance_frames().await;
+            let pending = self
+                .js
+                .as_ref()
+                .is_some_and(|js| js.pending_frame_document_queue().0 != 0);
+            if !advanced && !pending {
                 break;
             }
         }
@@ -4092,6 +5527,7 @@ impl Page {
         ));
         self.title = String::new();
         self.lifecycle = LifecycleState::Loaded;
+        self.top_load_pending = false;
         self.document_timeline_origin = std::time::Instant::now();
     }
 
@@ -4197,9 +5633,8 @@ impl Page {
                         }
                     }
                 }
-                Err(error) => top_inline_import_problems.push(format!(
-                    "top-level inline stylesheet scan failed: {error}",
-                )),
+                Err(error) => top_inline_import_problems
+                    .push(format!("top-level inline stylesheet scan failed: {error}",)),
             }
             for (raw, profile) in js.pending_render_image_urls() {
                 if let Ok(mut url) = url::Url::parse(&raw) {
@@ -4270,9 +5705,8 @@ impl Page {
                             });
                     }
                 }
-                Err(error) => top_inline_import_problems.push(format!(
-                    "top-level linked stylesheet scan failed: {error}",
-                )),
+                Err(error) => top_inline_import_problems
+                    .push(format!("top-level linked stylesheet scan failed: {error}",)),
             }
         }
         for problem in top_inline_import_problems {
@@ -4371,7 +5805,7 @@ impl Page {
                     }
                 }
 
-                for (link_index, raw, import_depth) in frame.external_stylesheet_urls(js) {
+                for (link_index, _, raw, import_depth) in frame.external_stylesheet_urls(js) {
                     let Ok(mut url) = Url::parse(&raw) else {
                         continue;
                     };
@@ -4430,13 +5864,11 @@ impl Page {
             let stealth_client = stealth_client.clone();
             let callbacks = callbacks.clone();
             async move {
-                let parsed = url::Url::parse(&candidate.raw)
-                    .expect("validated render resource URL");
-                let mut request = ResourceRequest::subresource(
-                    candidate.kind,
-                    &candidate.initiator,
-                )
-                .in_frame(candidate.frame_id);
+                let parsed =
+                    url::Url::parse(&candidate.raw).expect("validated render resource URL");
+                let mut request =
+                    ResourceRequest::subresource(candidate.kind, &candidate.initiator)
+                        .in_frame(candidate.frame_id);
                 match candidate.profile {
                     Some(obscura_js::ImageRequestProfile::CorsSameOrigin) => {
                         request.mode = obscura_net::RequestMode::Cors;
@@ -4572,8 +6004,8 @@ impl Page {
                 }
                 Ok(None) => break,
                 Err(_) => {
-                    timed_out = attempted
-                        .saturating_sub(loaded + failed + fetched_stylesheets.len());
+                    timed_out =
+                        attempted.saturating_sub(loaded + failed + fetched_stylesheets.len());
                     break;
                 }
             }
@@ -4601,14 +6033,17 @@ impl Page {
             let rules = rebase_css_urls(&rules, &response.url);
             let materialized = if candidate.frame_id == 0 {
                 match self.js.as_mut() {
-                    Some(js) => candidate.stylesheet_links.iter().try_for_each(
-                        |(link_index, _)| {
-                            js.execute_script(
-                                "<archive:stylesheet>",
-                                &materialize_linked_stylesheet_script(*link_index, &rules),
-                            )
-                        },
-                    ),
+                    Some(js) => {
+                        candidate
+                            .stylesheet_links
+                            .iter()
+                            .try_for_each(|(link_index, _)| {
+                                js.execute_script(
+                                    "<archive:stylesheet>",
+                                    &materialize_linked_stylesheet_script(*link_index, &rules),
+                                )
+                            })
+                    }
                     None => Err("top-level JavaScript runtime disappeared".to_string()),
                 }
             } else {
@@ -4814,7 +6249,7 @@ impl Page {
                 self.capture_surface_color(),
             )
         })
-            .flatten()
+        .flatten()
     }
 
     /// Rasterize an immutable document-space rectangle from the page's retained
@@ -4922,7 +6357,8 @@ impl Page {
     /// Absolute URLs pulled in through fetch/XHR or Image by the page and its
     /// child frames (issue #301). Empty when no live realm fetched a resource.
     pub fn fetched_urls(&self) -> Vec<String> {
-        let mut urls = self.js
+        let mut urls = self
+            .js
             .as_ref()
             .map(|js| js.fetched_urls())
             .unwrap_or_default();
@@ -5033,9 +6469,9 @@ impl Page {
         return_by_value: bool,
         await_promise: bool,
     ) -> obscura_js::runtime::RemoteObjectInfo {
-        if let Some(js) = &mut self.js {
-            match js
-                .evaluate_for_cdp(expression, return_by_value, await_promise)
+        if self.js.is_some() {
+            match self
+                .evaluate_for_cdp_with_timeout(expression, return_by_value, await_promise, 30_000)
                 .await
             {
                 Ok(info) => info,
@@ -5076,17 +6512,70 @@ impl Page {
         await_promise: bool,
         await_timeout_ms: u64,
     ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
-        if let Some(js) = &mut self.js {
-            js.evaluate_for_cdp_with_timeout(
-                expression,
-                return_by_value,
-                await_promise,
-                await_timeout_ms,
-            )
-            .await
-        } else {
+        let deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_millis(await_timeout_ms);
+        self.evaluate_for_cdp_until(
+            expression,
+            return_by_value,
+            await_promise,
+            deadline,
+            await_timeout_ms,
+        )
+        .await
+    }
+
+    fn remaining_cdp_budget(
+        deadline: tokio::time::Instant,
+        operation: &str,
+        timeout_ms: u64,
+    ) -> Result<std::time::Duration, String> {
+        deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| format!("{operation} exceeded its {timeout_ms}ms command budget"))
+    }
+
+    fn cdp_budget_millis(remaining: std::time::Duration) -> u64 {
+        u64::try_from(remaining.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1)
+    }
+
+    fn cleanup_cdp_await_sentinel(&mut self, await_key_json: &str) {
+        if let Some(js) = self.js.as_mut() {
+            // Cleanup is deliberately bounded on its own. It must run even when
+            // the caller's deadline has just expired, otherwise every ordinary
+            // CDP timeout leaks a page-global result cell and its continuation.
+            let _ = js.evaluate_with_timeout(
+                &format!("delete globalThis[{await_key_json}]"),
+                std::time::Duration::from_millis(100),
+            );
+        }
+    }
+
+    fn remaining_cdp_await_budget(
+        &mut self,
+        deadline: tokio::time::Instant,
+        timeout_ms: u64,
+        await_key_json: &str,
+    ) -> Result<std::time::Duration, String> {
+        Self::remaining_cdp_budget(deadline, "Runtime.evaluate", timeout_ms).map_err(|error| {
+            self.cleanup_cdp_await_sentinel(await_key_json);
+            error
+        })
+    }
+
+    async fn evaluate_for_cdp_until(
+        &mut self,
+        expression: &str,
+        return_by_value: bool,
+        await_promise: bool,
+        deadline: tokio::time::Instant,
+        await_timeout_ms: u64,
+    ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
+        if self.js.is_none() {
             let value = self.evaluate(expression);
-            Ok(obscura_js::runtime::RemoteObjectInfo {
+            return Ok(obscura_js::runtime::RemoteObjectInfo {
                 js_type: match &value {
                     serde_json::Value::String(_) => "string".into(),
                     serde_json::Value::Number(_) => "number".into(),
@@ -5098,8 +6587,203 @@ impl Page {
                 description: String::new(),
                 object_id: None,
                 value: Some(value),
-            })
+            });
         }
+        if !await_promise {
+            let remaining =
+                Self::remaining_cdp_budget(deadline, "Runtime.evaluate", await_timeout_ms)?;
+            let js = self.js.as_mut().expect("runtime checked above");
+            let watchdog = js.arm_watchdog(remaining);
+            let result = js
+                .evaluate_for_cdp_with_timeout(
+                    expression,
+                    return_by_value,
+                    false,
+                    Self::cdp_budget_millis(remaining),
+                )
+                .await;
+            let watchdog_fired = js.disarm_watchdog(watchdog);
+            if watchdog_fired {
+                return Err(format!(
+                    "Runtime.evaluate exceeded its {await_timeout_ms}ms command budget"
+                ));
+            }
+            return result;
+        }
+
+        // An awaited expression may depend on iframe.onload. Child realms are
+        // attached by Page, between runtime turns, rather than from a JS op.
+        // Letting ObscuraJsRuntime own the complete await would therefore
+        // deadlock: the promise waits for the owner event while Page cannot
+        // attach and complete the child until the await returns. Store the
+        // result behind a unique page-global sentinel, then alternate one
+        // runtime task with the ordinary frame lifecycle driver.
+        let await_id = NEXT_CDP_PAGE_AWAIT_ID.fetch_add(1, Ordering::Relaxed);
+        let await_key = format!("__obscura_page_await_{await_id}");
+        let await_key_json = serde_json::to_string(&await_key)
+            .map_err(|error| format!("could not encode CDP await key: {error}"))?;
+        let cleaned_expression = expression
+            .trim()
+            .trim_end_matches(|character: char| character == ';' || character.is_whitespace());
+        let start_script = format!(
+            "(function() {{\n\
+                const key = {await_key_json};\n\
+                globalThis[key] = {{ done: false, rejected: false, value: undefined }};\n\
+                (async function() {{\n\
+                    try {{\n\
+                        globalThis[key].value = await (\n{cleaned_expression}\n);\n\
+                    }} catch (error) {{\n\
+                        globalThis[key].rejected = true;\n\
+                        globalThis[key].value = error;\n\
+                    }} finally {{\n\
+                        globalThis[key].done = true;\n\
+                    }}\n\
+                }})();\n\
+                return key;\n\
+            }})()"
+        );
+        let start_result =
+            match self.remaining_cdp_await_budget(deadline, await_timeout_ms, &await_key_json) {
+                Ok(remaining) => self
+                    .js
+                    .as_mut()
+                    .expect("runtime checked above")
+                    .evaluate_with_timeout(&start_script, remaining),
+                Err(error) => Err(error),
+            };
+        if let Err(error) = start_result {
+            self.cleanup_cdp_await_sentinel(&await_key_json);
+            return Err(format!("Runtime.evaluate could not start: {error}"));
+        }
+
+        let done_script = format!("globalThis[{await_key_json}]?.done === true");
+        loop {
+            let remaining =
+                match Self::remaining_cdp_budget(deadline, "Runtime.evaluate", await_timeout_ms) {
+                    Ok(remaining) => remaining,
+                    Err(_) => {
+                        self.cleanup_cdp_await_sentinel(&await_key_json);
+                        return Err(format!(
+                            "Runtime.evaluate promise did not settle within {await_timeout_ms}ms"
+                        ));
+                    }
+                };
+            let done = match self
+                .js
+                .as_mut()
+                .ok_or_else(|| "JavaScript runtime disappeared".to_string())?
+                .evaluate_with_timeout(&done_script, remaining)
+            {
+                Ok(value) => value.as_bool().unwrap_or(false),
+                Err(error) => {
+                    self.cleanup_cdp_await_sentinel(&await_key_json);
+                    return Err(format!("Runtime.evaluate completion probe failed: {error}"));
+                }
+            };
+            if done {
+                break;
+            }
+
+            let remaining =
+                self.remaining_cdp_await_budget(deadline, await_timeout_ms, &await_key_json)?;
+            // Tokio can cancel a parked network/timer/frame future at the
+            // absolute command deadline. The V8 watchdog covers the part where
+            // one callback or microtask keeps this thread inside V8 and Tokio
+            // cannot observe that deadline.
+            let turn_watchdog = self
+                .js
+                .as_mut()
+                .ok_or_else(|| "JavaScript runtime disappeared".to_string())?
+                .arm_watchdog(remaining);
+            let turn =
+                tokio::time::timeout_at(deadline, self.run_autonomous_event_loop_turn()).await;
+            let turn_watchdog_fired = self
+                .js
+                .as_mut()
+                .is_some_and(|js| js.disarm_watchdog(turn_watchdog));
+            let reached_idle = match turn {
+                Ok(Ok(reached_idle)) if !turn_watchdog_fired => reached_idle,
+                Ok(Err(error)) if !turn_watchdog_fired => {
+                    self.cleanup_cdp_await_sentinel(&await_key_json);
+                    return Err(error);
+                }
+                Ok(_) | Err(_) => {
+                    self.cleanup_cdp_await_sentinel(&await_key_json);
+                    return Err(format!(
+                        "Runtime.evaluate promise did not settle within {await_timeout_ms}ms"
+                    ));
+                }
+            };
+            if self.lifecycle == LifecycleState::Failed {
+                self.cleanup_cdp_await_sentinel(&await_key_json);
+                return Err("page lifecycle failed while awaiting Runtime.evaluate".to_string());
+            }
+            if reached_idle {
+                let remaining =
+                    self.remaining_cdp_await_budget(deadline, await_timeout_ms, &await_key_json)?;
+                tokio::time::sleep(remaining.min(tokio::time::Duration::from_millis(1))).await;
+            }
+        }
+
+        let rejected_script = format!("globalThis[{await_key_json}].rejected === true");
+        let remaining =
+            self.remaining_cdp_await_budget(deadline, await_timeout_ms, &await_key_json)?;
+        let rejected = match self
+            .js
+            .as_mut()
+            .ok_or_else(|| "JavaScript runtime disappeared".to_string())?
+            .evaluate_with_timeout(&rejected_script, remaining)
+        {
+            Ok(value) => value.as_bool().unwrap_or(false),
+            Err(error) => {
+                self.cleanup_cdp_await_sentinel(&await_key_json);
+                return Err(format!("Runtime.evaluate rejection probe failed: {error}"));
+            }
+        };
+        if rejected {
+            let error_script = format!(
+                "String(globalThis[{await_key_json}].value && \
+                 (globalThis[{await_key_json}].value.message || \
+                  globalThis[{await_key_json}].value))"
+            );
+            let remaining =
+                self.remaining_cdp_await_budget(deadline, await_timeout_ms, &await_key_json)?;
+            let message = self
+                .js
+                .as_mut()
+                .ok_or_else(|| "JavaScript runtime disappeared".to_string())?
+                .evaluate_with_timeout(&error_script, remaining)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_default();
+            self.cleanup_cdp_await_sentinel(&await_key_json);
+            return Err(format!("Promise rejected: {message}"));
+        }
+
+        let result_expression = format!("globalThis[{await_key_json}].value");
+        let remaining =
+            self.remaining_cdp_await_budget(deadline, await_timeout_ms, &await_key_json)?;
+        let js = self
+            .js
+            .as_mut()
+            .ok_or_else(|| "JavaScript runtime disappeared".to_string())?;
+        let result_watchdog = js.arm_watchdog(remaining);
+        let info = js
+            .evaluate_for_cdp_with_timeout(
+                &result_expression,
+                return_by_value,
+                false,
+                Self::cdp_budget_millis(remaining),
+            )
+            .await;
+        let result_watchdog_fired = js.disarm_watchdog(result_watchdog);
+        self.cleanup_cdp_await_sentinel(&await_key_json);
+        if result_watchdog_fired {
+            return Err(format!(
+                "Runtime.evaluate exceeded its {await_timeout_ms}ms command budget"
+            ));
+        }
+        info
     }
 
     pub async fn call_function_on_for_cdp(
@@ -5110,14 +6794,15 @@ impl Page {
         return_by_value: bool,
         await_promise: bool,
     ) -> obscura_js::runtime::RemoteObjectInfo {
-        if let Some(js) = &mut self.js {
-            match js
-                .call_function_on_for_cdp(
+        if self.js.is_some() {
+            match self
+                .call_function_on_for_cdp_with_timeout(
                     function_declaration,
                     object_id,
                     args,
                     return_by_value,
                     await_promise,
+                    30_000,
                 )
                 .await
             {
@@ -5155,16 +6840,89 @@ impl Page {
         await_promise: bool,
         await_timeout_ms: u64,
     ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
+        let deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_millis(await_timeout_ms);
+        if !await_promise {
+            let remaining =
+                Self::remaining_cdp_budget(deadline, "Runtime.callFunctionOn", await_timeout_ms)?;
+            let js = self.js.as_mut().ok_or("JavaScript runtime unavailable")?;
+            let watchdog = js.arm_watchdog(remaining);
+            let result = js
+                .call_function_on_for_cdp_with_timeout(
+                    function_declaration,
+                    object_id,
+                    args,
+                    return_by_value,
+                    false,
+                    Self::cdp_budget_millis(remaining),
+                )
+                .await;
+            let watchdog_fired = js.disarm_watchdog(watchdog);
+            if watchdog_fired {
+                return Err(format!(
+                    "Runtime.callFunctionOn exceeded its {await_timeout_ms}ms command budget"
+                ));
+            }
+            return result;
+        }
+
+        // Start the function synchronously and retain its raw return value as
+        // an ordinary remote object. Await that value through Page's generic
+        // promise driver, which alternates runtime turns with `advance_frames`.
+        // This is the callFunctionOn counterpart of Runtime.evaluate's iframe
+        // interleave and prevents a Promise waiting on iframe.onload from
+        // deadlocking the native frame queue.
+        let remaining =
+            Self::remaining_cdp_budget(deadline, "Runtime.callFunctionOn", await_timeout_ms)?;
         let js = self.js.as_mut().ok_or("JavaScript runtime unavailable")?;
-        js.call_function_on_for_cdp_with_timeout(
-            function_declaration,
-            object_id,
-            args,
-            return_by_value,
-            await_promise,
-            await_timeout_ms,
-        )
-        .await
+        let watchdog = js.arm_watchdog(remaining);
+        let pending = js
+            .call_function_on_for_cdp_with_timeout(
+                function_declaration,
+                object_id,
+                args,
+                false,
+                false,
+                Self::cdp_budget_millis(remaining),
+            )
+            .await;
+        let watchdog_fired = js.disarm_watchdog(watchdog);
+        if watchdog_fired {
+            return Err(format!(
+                "Runtime.callFunctionOn exceeded its {await_timeout_ms}ms command budget"
+            ));
+        }
+        let pending = pending?;
+        let pending_object_id = pending
+            .object_id
+            .ok_or_else(|| "Runtime.callFunctionOn did not retain its return value".to_string())?;
+        let pending_expression = match self
+            .js
+            .as_ref()
+            .and_then(|js| js.object_expression_for_cdp(&pending_object_id))
+        {
+            Some(expression) => expression,
+            None => {
+                if let Some(js) = self.js.as_mut() {
+                    js.release_object(&pending_object_id);
+                }
+                return Err("Runtime.callFunctionOn return object disappeared".to_string());
+            }
+        };
+
+        let result = self
+            .evaluate_for_cdp_until(
+                &pending_expression,
+                return_by_value,
+                true,
+                deadline,
+                await_timeout_ms,
+            )
+            .await;
+        if let Some(js) = self.js.as_mut() {
+            js.release_object(&pending_object_id);
+        }
+        result
     }
 
     pub fn set_blocked_urls(&mut self, patterns: Vec<String>) {
@@ -5432,7 +7190,10 @@ impl Page {
         self.preload_bindings.retain(|item| item != name);
         if let Some(js) = &mut self.js {
             let encoded = serde_json::to_string(name).unwrap_or_else(|_| "\"\"".to_string());
-            let _ = js.execute_script("<remove-binding>", &format!("delete globalThis[{encoded}];"));
+            let _ = js.execute_script(
+                "<remove-binding>",
+                &format!("delete globalThis[{encoded}];"),
+            );
         }
     }
 
@@ -5504,44 +7265,38 @@ impl Page {
 
         let generation = self.callbacks.document_generation();
         let state = Arc::new(std::sync::Mutex::new(ResourceCaptureState::new(
-            limits,
-            generation,
+            limits, generation,
         )));
         let observed = Arc::clone(&state);
-        let callback_id = self.callbacks.add_response(Arc::new(move |request, response| {
-            observed
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .record(request, response);
-        }));
+        let callback_id = self
+            .callbacks
+            .add_response(Arc::new(move |request, response| {
+                observed
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .record(request, response);
+            }));
         self.resource_capture = Some(state);
         self.resource_capture_callback_id = Some(callback_id);
     }
 
-    fn retain_final_resource_scope(
-        &mut self,
-        mut capture: ResourceCapture,
-    ) -> ResourceCapture {
+    fn retain_final_resource_scope(&mut self, mut capture: ResourceCapture) -> ResourceCapture {
         // A frame can remove itself in its final script turn, after its
         // responses have already been captured. Refresh realm liveness at the
         // archive boundary so those superseded browsing contexts do not leak
         // into a snapshot of the final page.
         self.release_detached_frames();
-        let live_frame_ids: std::collections::HashSet<u32> = self
-            .frames
-            .iter()
-            .map(|frame| frame.frame_id())
-            .collect();
+        let live_frame_ids: std::collections::HashSet<u32> =
+            self.frames.iter().map(|frame| frame.frame_id()).collect();
         let document_generation = self.callbacks.document_generation();
         capture.resources.retain(|resource| {
             resource.document_generation == document_generation
                 && (resource.frame_id == 0 || live_frame_ids.contains(&resource.frame_id))
         });
         capture.document_generation = document_generation;
-        capture.total_bytes = capture
-            .resources
-            .iter()
-            .fold(0usize, |total, resource| total.saturating_add(resource.body.len()));
+        capture.total_bytes = capture.resources.iter().fold(0usize, |total, resource| {
+            total.saturating_add(resource.body.len())
+        });
         capture
     }
 
@@ -5665,15 +7420,16 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        css_resource_urls, linked_stylesheet_requests, materialize_linked_stylesheet_script,
-        materialize_stylesheet_graph, navigation_referrer, navigation_timeout_from_env_value,
-        parse_import_url, rebase_css_urls, script_response_is_executable, split_css_imports,
-        truncate_on_char_boundary, url_matches_cdp_pattern, LoadedStylesheet, StylesheetImport,
-        MAX_STYLESHEET_RESOURCES,
-    };
     #[cfg(feature = "render")]
     use super::remaining_settle_resource_warmup_ms;
+    use super::{
+        css_resource_urls, linked_stylesheet_requests, materialize_linked_stylesheet_script,
+        materialize_parser_stylesheet_script_with_token, materialize_stylesheet_graph,
+        navigation_referrer, navigation_timeout_from_env_value, parse_import_url,
+        parser_stylesheet_requests, rebase_css_urls, script_response_is_executable,
+        split_css_imports, truncate_on_char_boundary, url_matches_cdp_pattern, LoadedStylesheet,
+        StylesheetImport, MAX_STYLESHEET_RESOURCES,
+    };
     use base64::Engine as _;
     use obscura_dom::parse_html;
 
@@ -5695,6 +7451,44 @@ mod tests {
             navigation_timeout_from_env_value(Some("42000")),
             std::time::Duration::from_secs(42)
         );
+    }
+
+    #[test]
+    fn parser_stylesheets_keep_the_base_at_each_encounter_point() {
+        let dom = parse_html(
+            r#"<!doctype html><html><head>
+               <link rel="stylesheet" href="before.css">
+               <style>@import "before-import.css";</style>
+               <base href="/shifted/">
+               <link rel="stylesheet" href="after.css">
+               <style>@import "after-import.css";</style>
+               <base href="/ignored/">
+               </head><body></body></html>"#,
+        );
+        let document_url = url::Url::parse("https://example.test/original/page.html").unwrap();
+        let (links, inline_imports, body_order) = parser_stylesheet_requests(&dom, &document_url);
+
+        assert_eq!(
+            links
+                .iter()
+                .map(|link| link.base_url.join(&link.raw_href).unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "https://example.test/original/before.css".to_string(),
+                "https://example.test/shifted/after.css".to_string(),
+            ]
+        );
+        assert_eq!(
+            inline_imports
+                .iter()
+                .map(|item| item.base_url.join(&item.import.url).unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "https://example.test/original/before-import.css".to_string(),
+                "https://example.test/shifted/after-import.css".to_string(),
+            ]
+        );
+        assert!(body_order.is_some());
     }
 
     #[test]
@@ -5734,7 +7528,10 @@ mod tests {
             let css = if depth == 5 {
                 ".leaf { color: green }".to_string()
             } else {
-                format!("@import '{}.css'; .depth-{depth} {{ color: green }}", depth + 1)
+                format!(
+                    "@import '{}.css'; .depth-{depth} {{ color: green }}",
+                    depth + 1
+                )
             };
             std::fs::write(directory.join(format!("{depth}.css")), css).unwrap();
         }
@@ -6519,14 +8316,11 @@ mod tests {
                              </script></body></html>",
                         )
                     } else if request.starts_with("GET /frame-dynamic.js ") {
-                        (
-                            "application/javascript",
-                            "window.__dynamicFrameLoads += 1;",
-                        )
+                        ("application/javascript", "window.__dynamicFrameLoads += 1;")
                     } else {
                         (
                             "text/html",
-                        "<html><body><div id=\"host\"></div><script>\
+                            "<html><body><div id=\"host\"></div><script>\
                          var r = document.getElementById('host').attachShadow({mode:'closed'});\
                          var f = document.createElement('iframe');\
                          f.src = '/child.html';\
@@ -6887,7 +8681,9 @@ mod tests {
         ));
         let mut page = super::Page::new("srcdoc-frame-lifecycle".to_string(), context);
         page.enable_resource_capture(super::ResourceCaptureLimits::default());
-        page.navigate(&format!("{origin}/parser.html")).await.unwrap();
+        page.navigate(&format!("{origin}/parser.html"))
+            .await
+            .unwrap();
         page.settle_for_duration(50).await;
         for _ in 0..3 {
             let report = page.prepare_screenshot_resources_with_report(1_000).await;
@@ -6924,10 +8720,16 @@ mod tests {
             );
         }
 
-        page.navigate(&format!("{origin}/dynamic.html")).await.unwrap();
+        page.navigate(&format!("{origin}/dynamic.html"))
+            .await
+            .unwrap();
         page.settle_for_duration(50).await;
         let first = page.frame_snapshots();
-        assert_eq!(first.len(), 1, "stale queued srcdoc realm survived: {first:?}");
+        assert_eq!(
+            first.len(),
+            1,
+            "stale queued srcdoc realm survived: {first:?}"
+        );
         assert_eq!(first[0].url, "about:srcdoc");
         let first_id = first[0].frame_id;
         page.evaluate(
@@ -6953,7 +8755,9 @@ mod tests {
         assert_eq!(fallback[0].url, format!("{origin}/fallback.html"));
 
         page.set_blocked_urls(vec!["*parser.js".to_string()]);
-        page.navigate(&format!("{origin}/parser.html")).await.unwrap();
+        page.navigate(&format!("{origin}/parser.html"))
+            .await
+            .unwrap();
         page.settle_for_duration(50).await;
         assert!(page
             .resource_archive_incomplete_reasons()
@@ -6984,9 +8788,7 @@ mod tests {
         page.settle_for_duration(100).await;
 
         for _ in 0..5 {
-            let report = page
-                .prepare_screenshot_resources_with_report(1_000)
-                .await;
+            let report = page.prepare_screenshot_resources_with_report(1_000).await;
             assert_eq!(report.failed, 0, "frame warmup failed: {report:?}");
             assert_eq!(report.timed_out, 0, "frame warmup timed out: {report:?}");
         }
@@ -6998,7 +8800,11 @@ mod tests {
             .iter()
             .filter(|resource| resource.frame_id == frame.frame_id)
             .collect::<Vec<_>>();
-        assert_eq!(frame_resources.len(), 18, "unexpected frame capture: {frame_resources:#?}");
+        assert_eq!(
+            frame_resources.len(),
+            18,
+            "unexpected frame capture: {frame_resources:#?}"
+        );
 
         let document_resources = frame_resources
             .iter()
@@ -7080,7 +8886,10 @@ mod tests {
         for (resource, (path, resource_type, body)) in subresources.into_iter().zip(expected) {
             assert_eq!(resource.requested_url.as_str(), format!("{origin}{path}"));
             assert_eq!(resource.final_url.as_str(), format!("{origin}{path}"));
-            assert_eq!(resource.resource_type, resource_type, "wrong type for {path}");
+            assert_eq!(
+                resource.resource_type, resource_type,
+                "wrong type for {path}"
+            );
             assert_eq!(resource.body, body, "wrong response bytes for {path}");
             assert_eq!(resource.method, "GET");
             assert_eq!(resource.status, 200);
@@ -7114,9 +8923,7 @@ mod tests {
         page.settle_for_duration(100).await;
 
         for _ in 0..4 {
-            let report = page
-                .prepare_screenshot_resources_with_report(1_000)
-                .await;
+            let report = page.prepare_screenshot_resources_with_report(1_000).await;
             assert_eq!(report.failed, 0, "top warmup failed: {report:?}");
             assert_eq!(report.timed_out, 0, "top warmup timed out: {report:?}");
         }
@@ -7144,15 +8951,12 @@ mod tests {
             );
         }
         let document_url = format!("{origin}/top-dynamic.html");
-        assert!(
-            resources
-                .iter()
-                .filter(|resource| resource.final_url.as_str() != document_url)
-                .all(|resource| {
-                    resource.initiator.as_ref().map(url::Url::as_str)
-                        == Some(document_url.as_str())
-                })
-        );
+        assert!(resources
+            .iter()
+            .filter(|resource| resource.final_url.as_str() != document_url)
+            .all(|resource| {
+                resource.initiator.as_ref().map(url::Url::as_str) == Some(document_url.as_str())
+            }));
         assert!(page.resource_archive_incomplete_reasons().is_empty());
     }
 
@@ -7174,9 +8978,7 @@ mod tests {
             .unwrap();
         page.settle_for_duration(100).await;
 
-        let report = page
-            .prepare_screenshot_resources_with_report(1_000)
-            .await;
+        let report = page.prepare_screenshot_resources_with_report(1_000).await;
         assert_eq!(report.failed, 1, "unexpected top warmup: {report:?}");
         assert!(page
             .resource_archive_incomplete_reasons()
@@ -7200,10 +9002,8 @@ mod tests {
             None,
             true,
         ));
-        let mut page = super::Page::new(
-            "closed-shadow-render-resource-warmup".to_string(),
-            context,
-        );
+        let mut page =
+            super::Page::new("closed-shadow-render-resource-warmup".to_string(), context);
         page.enable_resource_capture(super::ResourceCaptureLimits::default());
         page.navigate(&format!("{origin}/shadow-parent.html"))
             .await
@@ -7211,9 +9011,7 @@ mod tests {
         page.settle_for_duration(500).await;
 
         for _ in 0..3 {
-            let report = page
-                .prepare_screenshot_resources_with_report(1_000)
-                .await;
+            let report = page.prepare_screenshot_resources_with_report(1_000).await;
             assert_eq!(report.failed, 0, "shadow warmup failed: {report:?}");
             assert_eq!(report.timed_out, 0, "shadow warmup timed out: {report:?}");
         }
@@ -7307,9 +9105,7 @@ mod tests {
             .unwrap();
         page.settle_for_duration(50).await;
 
-        let report = page
-            .prepare_screenshot_resources_with_report(1_000)
-            .await;
+        let report = page.prepare_screenshot_resources_with_report(1_000).await;
         assert_eq!(report.failed, 1, "unexpected frame warmup: {report:?}");
         assert!(page
             .resource_archive_incomplete_reasons()
@@ -7448,9 +9244,7 @@ mod tests {
         assert!(page
             .resource_archive_incomplete_reasons()
             .iter()
-            .any(|reason| {
-                reason.contains("unsupported.css") && reason.contains("HTTP 404")
-            }));
+            .any(|reason| { reason.contains("unsupported.css") && reason.contains("HTTP 404") }));
     }
 
     /// A `FrameRealm` owns a `v8::Global` into the runtime's isolate, which is
@@ -7505,6 +9299,103 @@ mod tests {
     }
 
     #[test]
+    fn rewritten_parser_stylesheet_rejects_the_stale_frozen_response() {
+        let mut page = frame_page("parser-stylesheet-frozen-href-token");
+        page.url = Some(url::Url::parse("https://example.test/original/page.html").unwrap());
+        page.dom = Some(parse_html(
+            r#"<!doctype html><html><head>
+               <link id="sheet" rel="stylesheet" href="old.css">
+               </head><body></body></html>"#,
+        ));
+        page.init_js();
+
+        let snapshot = page.snapshot_parser_stylesheets().unwrap();
+        let link = snapshot.links[0].clone();
+        let request_href = link.base_url.join(&link.raw_href).unwrap().to_string();
+        page.mark_parser_stylesheets_pending(&snapshot);
+        page.js
+            .as_mut()
+            .unwrap()
+            .execute_script(
+                "<preload-rewrite>",
+                "document.getElementById('sheet').setAttribute('href', 'data:text/css,html%7B--new-sheet:1%7D');",
+            )
+            .unwrap();
+
+        let materialize = materialize_parser_stylesheet_script_with_token(
+            link.nid,
+            "html { --stale-parser-sheet: 1; }",
+            &request_href,
+            &link.raw_href,
+        );
+        page.js
+            .as_mut()
+            .unwrap()
+            .execute_script("<stale-parser-sheet>", &materialize)
+            .unwrap();
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    "[...document.querySelectorAll('style')].some(style => style.textContent.includes('--stale-parser-sheet'))",
+                )
+                .unwrap(),
+            serde_json::json!(false),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn removed_and_restored_parser_stylesheet_rejects_the_old_response() {
+        let mut page = frame_page("parser-stylesheet-invalidated-epoch");
+        page.url = Some(url::Url::parse("https://example.test/original/page.html").unwrap());
+        page.dom = Some(parse_html(
+            r#"<!doctype html><html><head>
+               <link id="sheet" rel="stylesheet" href="old.css">
+               </head><body></body></html>"#,
+        ));
+        page.init_js();
+
+        let snapshot = page.snapshot_parser_stylesheets().unwrap();
+        let link = snapshot.links[0].clone();
+        let request_href = link.base_url.join(&link.raw_href).unwrap().to_string();
+        page.mark_parser_stylesheets_pending(&snapshot);
+        page.js
+            .as_mut()
+            .unwrap()
+            .execute_script(
+                "<preload-remove-reset>",
+                "var link = document.getElementById('sheet');\
+                 link.removeAttribute('href');\
+                 link.setAttribute('href', 'old.css');",
+            )
+            .unwrap();
+
+        let materialize = materialize_parser_stylesheet_script_with_token(
+            link.nid,
+            "html { --stale-parser-sheet: 1; }",
+            &request_href,
+            &link.raw_href,
+        );
+        page.js
+            .as_mut()
+            .unwrap()
+            .execute_script("<stale-parser-sheet>", &materialize)
+            .unwrap();
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    "[globalThis.__obscura_isParserStylesheetPending(document.getElementById('sheet')),\
+                     [...document.querySelectorAll('style')].some(style => style.textContent.includes('--stale-parser-sheet'))]",
+                )
+                .unwrap(),
+            serde_json::json!([false, false]),
+        );
+    }
+
+    #[test]
     fn frame_diagnostic_evaluation_failure_is_incomplete_and_navigation_resets_it() {
         let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
         runtime.set_dom(parse_html("<html><body>parent</body></html>"));
@@ -7519,10 +9410,7 @@ mod tests {
         )
         .unwrap();
         frame
-            .execute_script(
-                &mut runtime,
-                "document.querySelectorAll = undefined;",
-            )
+            .execute_script(&mut runtime, "document.querySelectorAll = undefined;")
             .unwrap();
 
         let mut page = frame_page("frame-diagnostic-failure");
@@ -7535,8 +9423,7 @@ mod tests {
         assert_eq!(
             page.resource_archive_incomplete_reasons(),
             vec![
-                "frame resource diagnostic failed for frame 7 (https://frame.example/)"
-                    .to_string()
+                "frame resource diagnostic failed for frame 7 (https://frame.example/)".to_string()
             ],
         );
         assert_eq!(
@@ -7547,6 +9434,48 @@ mod tests {
 
         page.navigate_blank();
         assert!(page.resource_archive_incomplete_reasons().is_empty());
+    }
+
+    #[test]
+    fn invalid_live_frame_probe_fails_lifecycle_without_discarding_frames() {
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html("<html><body>parent</body></html>"));
+        runtime.set_url("https://parent.example/");
+        runtime.run_page_init();
+        let frame = obscura_js::frame::FrameRealm::new(
+            &mut runtime,
+            7,
+            0,
+            "https://parent.example/frame",
+            "<html><body></body></html>",
+        )
+        .unwrap();
+
+        let mut page = frame_page("invalid-live-frame-probe");
+        page.frames.push(frame);
+        page.js = Some(runtime);
+        page.top_load_pending = true;
+        page.lifecycle = crate::LifecycleState::DomContentLoaded;
+
+        assert!(!page.release_detached_frames_with_probe(
+            "(JSON.stringify = () => '[]', globalThis.__obscura_frameId === 0 ? [7] : [])"
+        ));
+        assert_eq!(page.lifecycle, crate::LifecycleState::DomContentLoaded);
+        assert!(page.top_load_pending);
+        assert_eq!(
+            page.frames.len(),
+            1,
+            "author JSON.stringify must not forge the top-realm live-id list"
+        );
+
+        assert!(!page.release_detached_frames_with_probe("({ forged: true })"));
+        assert_eq!(page.lifecycle, crate::LifecycleState::Failed);
+        assert!(!page.top_load_pending);
+        assert_eq!(
+            page.frames.len(),
+            1,
+            "a malformed liveness probe must not irreversibly discard a frame"
+        );
     }
 
     #[test]
@@ -7599,17 +9528,44 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn queued_srcdoc_frame_is_pending_resource_work_until_attachment_completes() {
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html("<html><body></body></html>"));
+        runtime.set_url("https://parent.example/");
+        runtime.run_page_init();
+        runtime
+            .evaluate(
+                r#"(() => {
+                  const frame = document.createElement('iframe');
+                  frame.srcdoc = '<!doctype html><script>globalThis.__childRan = true;<\/script>';
+                  document.body.appendChild(frame);
+                  return frame._frameId;
+                })()"#,
+            )
+            .unwrap();
+
+        let mut page = frame_page("pending-srcdoc-resource-work");
+        page.js = Some(runtime);
+        assert!(
+            page.has_pending_resource_work(),
+            "a queued frame can still execute scripts and request resources",
+        );
+        for _ in 0..4 {
+            if !page.advance_frames().await {
+                break;
+            }
+        }
+        assert_eq!(page.frame_urls(), vec!["about:srcdoc"]);
+        assert!(!page.has_pending_resource_work());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn blank_navigation_advances_generation_once_and_resets_capture_state() {
         let mut page = frame_page("blank-navigation-generation");
         page.enable_resource_capture(super::ResourceCaptureLimits::default());
         page.mark_resource_archive_incomplete("old document diagnostic");
         {
-            let mut state = page
-                .resource_capture
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap();
+            let mut state = page.resource_capture.as_ref().unwrap().lock().unwrap();
             state.capture.omitted_resources = 1;
             state.capture.omitted_bytes = 42;
         }
@@ -7620,12 +9576,7 @@ mod tests {
         assert_eq!(direct_generation, initial_generation + 1);
         assert!(page.resource_archive_incomplete_reasons().is_empty());
         {
-            let state = page
-                .resource_capture
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap();
+            let state = page.resource_capture.as_ref().unwrap().lock().unwrap();
             assert_eq!(state.capture.document_generation, direct_generation);
             assert_eq!(state.capture.omitted_resources, 0);
             assert_eq!(state.capture.omitted_bytes, 0);
@@ -7669,7 +9620,171 @@ mod tests {
             .unwrap()
             .evaluate("Object.keys(globalThis.__obscura_frameObjects).length")
             .unwrap();
-        assert_eq!(published.as_f64(), Some(1.0), "the page cannot reach the frame");
+        assert_eq!(
+            published.as_f64(),
+            Some(1.0),
+            "the page cannot reach the frame"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_preload_runs_before_parser_stylesheet_owner_error() {
+        const TOP_HTML: &str = r#"<!doctype html><html><body><script>
+            const frame = document.createElement('iframe');
+            frame.srcdoc = '<!doctype html><link rel="stylesheet" href="file:///obscura-frame-blocked.css" onerror="globalThis.__preloadAtStyleError = globalThis.__preloaded === true; globalThis.__styleErrorReadyState = document.readyState">';
+            document.body.appendChild(frame);
+        </script></body></html>"#;
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(TOP_HTML);
+        let url = format!("data:text/html;base64,{encoded}");
+        let mut page = frame_page("frame-preload-before-style-error");
+        page.set_preload_scripts(vec!["globalThis.__preloaded = true;".to_string()]);
+        page.navigate_with_wait(&url, crate::WaitUntil::Load)
+            .await
+            .expect("frame navigation");
+
+        assert_eq!(page.frame_urls(), vec!["about:srcdoc".to_string()]);
+        assert_eq!(
+            page.evaluate_in_frame(0, "globalThis.__preloadAtStyleError")
+                .unwrap(),
+            serde_json::json!(true),
+        );
+        assert_eq!(
+            page.evaluate_in_frame(0, "globalThis.__styleErrorReadyState")
+                .unwrap(),
+            serde_json::json!("loading"),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn new_document_preload_dynamic_inline_script_executes_exactly_once() {
+        const HTML: &str = "<!doctype html><html><head></head><body></body></html>";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(HTML);
+        let mut page = frame_page("preload-dynamic-inline-exactly-once");
+        page.set_preload_scripts(vec![r#"
+            globalThis.__preloadDynamicInlineRuns = 0;
+            const script = document.createElement('script');
+            script.textContent = 'globalThis.__preloadDynamicInlineRuns += 1;';
+            document.head.appendChild(script);
+        "#
+        .to_string()]);
+
+        page.navigate_with_wait(
+            &format!("data:text/html;base64,{encoded}"),
+            crate::WaitUntil::Load,
+        )
+        .await
+        .expect("preload dynamic script navigation");
+
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__preloadDynamicInlineRuns")
+                .unwrap(),
+            serde_json::json!(1.0),
+            "a preload-created script is dynamic work, not a parser script to run again",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn new_document_preload_dynamic_stylesheet_fetches_and_loads_exactly_once() {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let stylesheet_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed_requests = stylesheet_requests.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let observed_requests = observed_requests.clone();
+                std::thread::spawn(move || {
+                    let mut request = [0u8; 2048];
+                    let length = stream.read(&mut request).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&request[..length]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_ascii_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let (content_type, body) = if path == "/preload.css" {
+                        observed_requests.fetch_add(1, Ordering::SeqCst);
+                        ("text/css", "html { --preload-style: loaded; }")
+                    } else {
+                        (
+                            "text/html",
+                            "<!doctype html><html><head></head><body></body></html>",
+                        )
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                });
+            }
+        });
+
+        let mut page = frame_page("preload-dynamic-stylesheet-exactly-once");
+        page.set_preload_scripts(vec![r#"
+            globalThis.__preloadStyleLoads = 0;
+            const link = document.createElement('link');
+            link.setAttribute('rel', 'stylesheet');
+            link.setAttribute('href', '/preload.css');
+            link.addEventListener('load', () => globalThis.__preloadStyleLoads += 1);
+            document.head.appendChild(link);
+        "#
+        .to_string()]);
+
+        // This regression isolates parser-resource enrollment. Render builds
+        // also run a separate pre-script archive warmup which intentionally
+        // scans the live DOM; that transport/JS-loader race is independent of
+        // whether preload-created links leak into the frozen parser snapshot.
+        #[cfg(feature = "render")]
+        let previous_warmup = [
+            (
+                "OBSCURA_RENDER_RESOURCE_WARMUP_MS",
+                std::env::var_os("OBSCURA_RENDER_RESOURCE_WARMUP_MS"),
+            ),
+            (
+                "OBSCURA_RENDER_RESOURCE_POST_SCRIPT_WARMUP_MS",
+                std::env::var_os("OBSCURA_RENDER_RESOURCE_POST_SCRIPT_WARMUP_MS"),
+            ),
+        ];
+        #[cfg(feature = "render")]
+        for (name, _) in &previous_warmup {
+            std::env::set_var(name, "0");
+        }
+        let page_url = format!("http://{address}/index.html");
+        let navigation = page.navigate_with_wait(&page_url, crate::WaitUntil::Load);
+        let navigation = navigation.await;
+        #[cfg(feature = "render")]
+        for (name, value) in previous_warmup {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        navigation.expect("preload dynamic stylesheet navigation");
+
+        assert_eq!(
+            stylesheet_requests.load(Ordering::SeqCst),
+            1,
+            "a preload-created link is dynamic work, not a parser stylesheet to fetch again",
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__preloadStyleLoads")
+                .unwrap(),
+            serde_json::json!(1.0),
+            "the dynamic stylesheet owner must receive one completion",
+        );
     }
 
     /// An explicit CLI `--wait` uses `settle_for_duration`. The fixed wait
@@ -7681,7 +9796,9 @@ mod tests {
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
         let base = spawn_shadow_frame_server().await;
         let mut page = frame_page("fixed-settle-frame-work");
-        page.navigate(&format!("{base}fixed-wait.html")).await.unwrap();
+        page.navigate(&format!("{base}fixed-wait.html"))
+            .await
+            .unwrap();
 
         page.settle_for_duration(1_000).await;
 
@@ -7700,6 +9817,356 @@ mod tests {
             page.fetched_urls()
                 .contains(&format!("{base}frame-resource.txt")),
             "a fetch made by the child realm was absent from page assets",
+        );
+    }
+
+    #[test]
+    fn autonomous_pump_bounds_a_timer_created_frame_dcl_handler() {
+        const TOP_HTML: &str = r#"<!doctype html><html><body><script>
+            setTimeout(function () {
+                const frame = document.createElement('iframe');
+                frame.srcdoc = "<script>document.addEventListener('DOMContentLoaded', function () { while (true) {} });<\/script>";
+                document.body.appendChild(frame);
+            }, 0);
+        </script></body></html>"#;
+
+        #[derive(Debug)]
+        struct Outcome {
+            before_page: crate::LifecycleState,
+            before_top_load_pending: bool,
+            before_frames: usize,
+            turn: Result<bool, String>,
+            after_page: crate::LifecycleState,
+            after_top_load_pending: bool,
+            after_frames: Vec<obscura_js::frame::FrameLifecycleState>,
+            elapsed: std::time::Duration,
+        }
+
+        // A missing V8 watchdog pins the executor inside the frame callback,
+        // so keep that work on a disposable OS thread. The receiving test still
+        // fails in bounded time instead of hanging the test runner forever.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("autonomous-frame-watchdog".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime");
+                let outcome = runtime.block_on(async {
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(TOP_HTML);
+                    let url = format!("data:text/html;base64,{encoded}");
+                    let mut page = frame_page("autonomous-frame-watchdog");
+                    page.navigate_with_wait(&url, crate::WaitUntil::DomContentLoaded)
+                        .await
+                        .expect("DOMContentLoaded navigation");
+
+                    let before_page = page.lifecycle;
+                    let before_top_load_pending = page.top_load_pending;
+                    let before_frames = page.frames.len();
+                    let started = std::time::Instant::now();
+                    let turn = page.run_autonomous_event_loop_turn().await;
+                    Outcome {
+                        before_page,
+                        before_top_load_pending,
+                        before_frames,
+                        turn,
+                        after_page: page.lifecycle,
+                        after_top_load_pending: page.top_load_pending,
+                        after_frames: page
+                            .frames
+                            .iter()
+                            .map(|frame| frame.lifecycle_state())
+                            .collect(),
+                        elapsed: started.elapsed(),
+                    }
+                });
+                let _ = tx.send(outcome);
+            })
+            .expect("spawn watchdog test worker");
+
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("autonomous pump did not return within the watchdog ceiling");
+        worker.join().expect("watchdog test worker panicked");
+
+        assert_eq!(outcome.before_page, crate::LifecycleState::DomContentLoaded);
+        assert!(outcome.before_top_load_pending);
+        assert_eq!(
+            outcome.before_frames, 0,
+            "the timer ran before DCL returned"
+        );
+        assert_eq!(
+            outcome.turn,
+            Ok(false),
+            "attaching the frame is browser work"
+        );
+        assert_eq!(outcome.after_page, crate::LifecycleState::Failed);
+        assert!(!outcome.after_top_load_pending);
+        assert_eq!(
+            outcome.after_frames,
+            vec![obscura_js::frame::FrameLifecycleState::Failed],
+        );
+        assert!(
+            outcome.elapsed < std::time::Duration::from_secs(10),
+            "scoped lifecycle watchdog returned too late: {:?}",
+            outcome.elapsed,
+        );
+    }
+
+    #[test]
+    fn autonomous_pump_marks_a_nonreturning_dynamic_script_load_handler_failed() {
+        const TOP_HTML: &str = r#"<!doctype html><html><head><script>
+            document.addEventListener('DOMContentLoaded', function () {
+                const script = document.createElement('script');
+                script.src = 'data:text/javascript,globalThis.__dynamicRan%3Dtrue';
+                script.onload = function () { while (true) {} };
+                document.head.appendChild(script);
+            });
+        </script></head><body></body></html>"#;
+
+        #[derive(Debug)]
+        struct Outcome {
+            before_page: crate::LifecycleState,
+            before_top_load_pending: bool,
+            turn: Result<bool, String>,
+            after_page: crate::LifecycleState,
+            after_top_load_pending: bool,
+            elapsed: std::time::Duration,
+        }
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("autonomous-resource-watchdog".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime");
+                let outcome = runtime.block_on(async {
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(TOP_HTML);
+                    let url = format!("data:text/html;base64,{encoded}");
+                    let mut page = frame_page("autonomous-resource-watchdog");
+                    page.navigate_with_wait(&url, crate::WaitUntil::DomContentLoaded)
+                        .await
+                        .expect("DOMContentLoaded navigation");
+
+                    let before_page = page.lifecycle;
+                    let before_top_load_pending = page.top_load_pending;
+                    let started = std::time::Instant::now();
+                    let turn = page.run_autonomous_event_loop_turn().await;
+                    Outcome {
+                        before_page,
+                        before_top_load_pending,
+                        turn,
+                        after_page: page.lifecycle,
+                        after_top_load_pending: page.top_load_pending,
+                        elapsed: started.elapsed(),
+                    }
+                });
+                let _ = tx.send(outcome);
+            })
+            .expect("spawn dynamic resource watchdog test worker");
+
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("autonomous resource callback did not respect the watchdog ceiling");
+        worker.join().expect("watchdog test worker panicked");
+
+        assert_eq!(outcome.before_page, crate::LifecycleState::DomContentLoaded);
+        assert!(outcome.before_top_load_pending);
+        assert!(
+            outcome.turn.is_err(),
+            "watchdog failure was hidden: {outcome:?}"
+        );
+        assert_eq!(outcome.after_page, crate::LifecycleState::Failed);
+        assert!(!outcome.after_top_load_pending);
+        assert!(
+            outcome.elapsed < std::time::Duration::from_secs(10),
+            "resource callback watchdog returned too late: {:?}",
+            outcome.elapsed,
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parsed_body_onload_precedes_listeners_registered_by_body_resource_callbacks() {
+        const HTML: &str = r#"<!doctype html><html><head>
+            <script>globalThis.__bodyResourceLoadOrder = [];</script>
+        </head><body onload="globalThis.__bodyResourceLoadOrder.push('body-handler')">
+            <link rel="stylesheet" href="file:///blocked-body-sheet.css"
+                  onerror="window.addEventListener('load', () => globalThis.__bodyResourceLoadOrder.push('resource-listener'))">
+        </body></html>"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(HTML);
+        let mut page = frame_page("body-handler-parser-encounter-order");
+        page.navigate_with_wait(
+            &format!("data:text/html;base64,{encoded}"),
+            crate::WaitUntil::Load,
+        )
+        .await
+        .expect("body/resource lifecycle navigation");
+
+        assert_eq!(
+            page.evaluate("globalThis.__bodyResourceLoadOrder"),
+            serde_json::json!(["body-handler", "resource-listener"]),
+        );
+    }
+
+    #[test]
+    fn parser_stylesheet_owner_handler_is_bounded_before_the_script_phase() {
+        const TOP_HTML: &str = r#"<!doctype html><html><head>
+            <link rel="stylesheet" href="file:///obscura-blocked.css"
+                  onerror="while (true) {}">
+        </head><body></body></html>"#;
+
+        #[derive(Debug)]
+        struct Outcome {
+            navigation: Result<(), String>,
+            lifecycle: crate::LifecycleState,
+            top_load_pending: bool,
+            elapsed: std::time::Duration,
+        }
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("parser-stylesheet-watchdog".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime");
+                let outcome = runtime.block_on(async {
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(TOP_HTML);
+                    let url = format!("data:text/html;base64,{encoded}");
+                    let mut page = frame_page("parser-stylesheet-watchdog");
+                    let started = std::time::Instant::now();
+                    let navigation = page
+                        .navigate_with_wait(&url, crate::WaitUntil::Load)
+                        .await
+                        .map_err(|error| error.to_string());
+                    Outcome {
+                        navigation,
+                        lifecycle: page.lifecycle,
+                        top_load_pending: page.top_load_pending,
+                        elapsed: started.elapsed(),
+                    }
+                });
+                let _ = tx.send(outcome);
+            })
+            .expect("spawn stylesheet watchdog test worker");
+
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("stylesheet owner callback did not respect the watchdog ceiling");
+        worker.join().expect("stylesheet watchdog worker panicked");
+
+        assert!(
+            outcome.navigation.is_err(),
+            "navigation unexpectedly succeeded: {outcome:?}"
+        );
+        assert_eq!(outcome.lifecycle, crate::LifecycleState::Failed);
+        assert!(!outcome.top_load_pending);
+        assert!(
+            outcome.elapsed < std::time::Duration::from_secs(10),
+            "stylesheet watchdog returned too late: {:?}",
+            outcome.elapsed,
+        );
+    }
+
+    #[test]
+    fn cdp_evaluate_and_call_function_share_one_absolute_watchdog_deadline() {
+        #[derive(Debug)]
+        struct Outcome {
+            sync_evaluate: Result<obscura_js::runtime::RemoteObjectInfo, String>,
+            sync_call: Result<obscura_js::runtime::RemoteObjectInfo, String>,
+            distant_timer: Result<obscura_js::runtime::RemoteObjectInfo, String>,
+            leaked_sentinels: serde_json::Value,
+            isolate_reusable: serde_json::Value,
+            elapsed: std::time::Duration,
+        }
+
+        // A regression in the initial synchronous entry would pin the current
+        // test thread inside V8 forever. Keep the isolate on a disposable worker
+        // so the receiver still reports the missing watchdog in bounded time.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("cdp-absolute-deadline-watchdog".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime");
+                let outcome = runtime.block_on(async {
+                    let mut page = frame_page("cdp-absolute-deadline-watchdog");
+                    page.url = Some(url::Url::parse("https://deadline.example/").unwrap());
+                    page.dom = Some(parse_html("<html><body></body></html>"));
+                    page.init_js();
+
+                    let started = std::time::Instant::now();
+                    let sync_evaluate = page
+                        .evaluate_for_cdp_with_timeout(
+                            "(() => { while (true) {} })()",
+                            true,
+                            true,
+                            40,
+                        )
+                        .await;
+                    let sync_call = page
+                        .call_function_on_for_cdp_with_timeout(
+                            "function () { while (true) {} }",
+                            None,
+                            &[],
+                            true,
+                            true,
+                            40,
+                        )
+                        .await;
+                    let distant_timer = page
+                        .evaluate_for_cdp_with_timeout(
+                            "new Promise(resolve => setTimeout(resolve, 60000))",
+                            true,
+                            true,
+                            40,
+                        )
+                        .await;
+                    let elapsed = started.elapsed();
+                    let leaked_sentinels = page.evaluate(
+                        "Object.getOwnPropertyNames(globalThis).filter(\
+                         name => name.startsWith('__obscura_page_await_')).length",
+                    );
+                    let isolate_reusable = page.evaluate(
+                        "(document.body.setAttribute('data-after-cdp-timeout', 'usable'), \
+                         document.body.getAttribute('data-after-cdp-timeout'))",
+                    );
+                    Outcome {
+                        sync_evaluate,
+                        sync_call,
+                        distant_timer,
+                        leaked_sentinels,
+                        isolate_reusable,
+                        elapsed,
+                    }
+                });
+                let _ = tx.send(outcome);
+            })
+            .expect("spawn CDP watchdog test worker");
+
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a CDP deadline failed to bound synchronous V8 or a distant timer");
+        worker.join().expect("CDP watchdog worker panicked");
+
+        assert!(outcome.sync_evaluate.is_err(), "{outcome:?}");
+        assert!(outcome.sync_call.is_err(), "{outcome:?}");
+        assert!(outcome.distant_timer.is_err(), "{outcome:?}");
+        assert_eq!(outcome.leaked_sentinels.as_f64(), Some(0.0), "{outcome:?}");
+        assert_eq!(
+            outcome.isolate_reusable,
+            serde_json::json!("usable"),
+            "{outcome:?}"
+        );
+        assert!(
+            outcome.elapsed < std::time::Duration::from_secs(2),
+            "the three 40ms commands escaped their shared deadlines: {outcome:?}"
         );
     }
 
@@ -7810,9 +10277,15 @@ mod tests {
             .unwrap();
         let capture = page.take_resource_capture().unwrap();
 
-        assert!(page.frames.is_empty(), "the archive boundary kept a detached realm");
         assert!(
-            capture.resources.iter().all(|resource| resource.frame_id == 0),
+            page.frames.is_empty(),
+            "the archive boundary kept a detached realm"
+        );
+        assert!(
+            capture
+                .resources
+                .iter()
+                .all(|resource| resource.frame_id == 0),
             "a detached frame response leaked into the final archive: {:?}",
             capture
                 .resources
@@ -7820,12 +10293,10 @@ mod tests {
                 .map(|resource| (resource.frame_id, resource.final_url.as_str()))
                 .collect::<Vec<_>>(),
         );
-        assert!(
-            capture
-                .resources
-                .iter()
-                .all(|resource| resource.document_generation == capture.document_generation),
-        );
+        assert!(capture
+            .resources
+            .iter()
+            .all(|resource| resource.document_generation == capture.document_generation),);
         assert_eq!(
             capture.total_bytes,
             capture
@@ -8376,11 +10847,8 @@ mod tests {
                 document.head.appendChild(script);
             </script></body></html>"#,
         );
-        let mut page = import_map_test_page(
-            "preload-dynamic-lifecycle",
-            "http://127.0.0.1:9",
-            &html,
-        );
+        let mut page =
+            import_map_test_page("preload-dynamic-lifecycle", "http://127.0.0.1:9", &html);
 
         page.execute_scripts().await;
 
@@ -8500,11 +10968,8 @@ mod tests {
         let started = std::time::Instant::now();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(125);
 
-        let completed = super::Page::drive_load_delaying_scripts(
-            page.js.as_mut().unwrap(),
-            deadline,
-        )
-        .await;
+        let completed =
+            super::Page::drive_load_delaying_scripts(page.js.as_mut().unwrap(), deadline).await;
 
         let elapsed = started.elapsed();
         assert!(!completed, "the delayed resource must exceed the deadline");
@@ -8646,9 +11111,7 @@ mod tests {
                     .and_then(|line| line.split_ascii_whitespace().nth(1))
                     .unwrap_or("/");
                 let body = match path {
-                    "/app/lazy.js" => {
-                        "import { ready } from './lazy-child.js'; export { ready };"
-                    }
+                    "/app/lazy.js" => "import { ready } from './lazy-child.js'; export { ready };",
                     "/app/lazy-child.js" => {
                         // Cross the lifecycle's 500ms fast-settle floor on a
                         // descendant edge. deno_core must propagate the lazy
@@ -8717,8 +11180,7 @@ mod tests {
             let _ = accepted_tx.send(());
             let mut request = [0u8; 2048];
             let length = stream.read(&mut request).unwrap();
-            assert!(String::from_utf8_lossy(&request[..length])
-                .starts_with("GET /app/analytics "));
+            assert!(String::from_utf8_lossy(&request[..length]).starts_with("GET /app/analytics "));
             std::thread::sleep(std::time::Duration::from_secs(2));
             let body = "{}";
             let response = format!(
@@ -8737,11 +11199,7 @@ mod tests {
                 }});
             </script></body></html>"#,
         );
-        let mut page = import_map_test_page(
-            "ordinary-fetch-readiness",
-            &base,
-            &html,
-        );
+        let mut page = import_map_test_page("ordinary-fetch-readiness", &base, &html);
         let started = std::time::Instant::now();
         page.execute_scripts().await;
         let elapsed = started.elapsed();
@@ -8896,9 +11354,7 @@ mod tests {
         page.js = Some(runtime);
         page.url = Some(url::Url::parse(&page_url).unwrap());
 
-        let report = page
-            .prepare_screenshot_resources_with_report(1_000)
-            .await;
+        let report = page.prepare_screenshot_resources_with_report(1_000).await;
         assert_eq!(
             report,
             super::ScreenshotResourceWarmupReport {
@@ -8921,10 +11377,13 @@ mod tests {
             "cache/network fragment normalization must not alter currentSrc"
         );
         page.screenshot(page.viewport).expect("prefetched capture");
-        assert!(seen_rx
+        let first_request = seen_rx
             .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap()
-            .starts_with("GET /asset.svg "));
+            .unwrap();
+        assert!(
+            first_request.starts_with("GET /asset.svg "),
+            "unexpected warmup request line: {first_request:?}",
+        );
         assert!(
             seen_rx
                 .recv_timeout(std::time::Duration::from_millis(200))
@@ -9033,9 +11492,7 @@ mod tests {
         page.js = Some(runtime);
         page.url = Some(url::Url::parse(&page_url).unwrap());
 
-        let report = page
-            .prepare_screenshot_resources_with_report(1_000)
-            .await;
+        let report = page.prepare_screenshot_resources_with_report(1_000).await;
         assert_eq!(report.discovered, 1);
         assert_eq!(report.attempted, 1);
         assert_eq!(report.loaded, 0);
@@ -9091,9 +11548,7 @@ mod tests {
         page.js = Some(runtime);
         page.url = Some(url::Url::parse(&page_url).unwrap());
 
-        let report = page
-            .prepare_screenshot_resources_with_report(5_000)
-            .await;
+        let report = page.prepare_screenshot_resources_with_report(5_000).await;
         assert_eq!(report.discovered, RESOURCE_COUNT);
         assert_eq!(report.attempted, ATTEMPT_CAP);
         assert_eq!(report.loaded, ATTEMPT_CAP);
@@ -9164,7 +11619,11 @@ mod tests {
         page.navigate(&page_url).await.unwrap();
 
         let mut paths = (0..3)
-            .map(|_| seen_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap())
+            .map(|_| {
+                seen_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+            })
             .collect::<Vec<_>>();
         paths.sort();
         assert_eq!(
@@ -9176,12 +11635,8 @@ mod tests {
             ]
         );
         let js = page.js.as_ref().expect("navigation runtime");
-        assert!(js.render_resource_is_known(&format!(
-            "http://{address}/dynamic.svg"
-        )));
-        assert!(js.render_resource_is_known(&format!(
-            "http://{address}/dynamic.woff2"
-        )));
+        assert!(js.render_resource_is_known(&format!("http://{address}/dynamic.svg")));
+        assert!(js.render_resource_is_known(&format!("http://{address}/dynamic.woff2")));
     }
 
     #[cfg(feature = "render")]
@@ -9342,9 +11797,9 @@ mod tests {
         .expect("materialized graph");
 
         assert!(materialized.starts_with("@media print {\n"));
-        assert!(materialized.contains(
-            r#".print{background:url("https://example.test/css/mark.svg")}"#
-        ));
+        assert!(
+            materialized.contains(r#".print{background:url("https://example.test/css/mark.svg")}"#)
+        );
         assert!(materialized.ends_with(".root{color:red}"));
     }
 
@@ -9694,11 +12149,7 @@ mod tests {
             750
         );
         assert_eq!(
-            remaining_settle_resource_warmup_ms(
-                1_000,
-                std::time::Duration::from_millis(250),
-                100,
-            ),
+            remaining_settle_resource_warmup_ms(1_000, std::time::Duration::from_millis(250), 100,),
             100
         );
         assert_eq!(

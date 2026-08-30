@@ -125,25 +125,20 @@ pub async fn handle(
             let page = ctx
                 .get_session_page_mut(session_id)
                 .ok_or("No page")?;
-            let info = match tokio::time::timeout(
-                std::time::Duration::from_millis(timeout_ms),
-                page.evaluate_for_cdp_with_timeout(
+            // Page owns the single timeout/deadline so its await sentinel is
+            // always cleaned before this command returns. An equal-duration
+            // outer Tokio timeout starts first and can otherwise cancel Page
+            // one poll before its cleanup branch, leaking a global sentinel
+            // and the still-running async continuation on every normal client
+            // timeout.
+            let info = page
+                .evaluate_for_cdp_with_timeout(
                     expression,
                     return_by_value,
                     await_promise,
                     timeout_ms,
-                ),
-            )
-            .await
-            {
-                Ok(Ok(info)) => info,
-                Ok(Err(error)) => return Err(error),
-                Err(_) => {
-                    return Err(format!(
-                        "Runtime.evaluate exceeded {timeout_ms}ms timeout"
-                    ));
-                }
-            };
+                )
+                .await?;
             emit_post_eval_nav(ctx, session_id).await?;
 
             Ok(json!({ "result": remote_object_from_info(&info) }))
@@ -187,27 +182,16 @@ pub async fn handle(
             let page = ctx
                 .get_session_page_mut(session_id)
                 .ok_or("No page")?;
-            let info = match tokio::time::timeout(
-                std::time::Duration::from_millis(timeout_ms),
-                page.call_function_on_for_cdp_with_timeout(
+            let info = page
+                .call_function_on_for_cdp_with_timeout(
                     function_declaration,
                     object_id,
                     &arguments,
                     return_by_value,
                     await_promise,
                     timeout_ms,
-                ),
-            )
-            .await
-            {
-                Ok(Ok(info)) => info,
-                Ok(Err(error)) => return Err(error),
-                Err(_) => {
-                    return Err(format!(
-                        "Runtime.callFunctionOn exceeded {timeout_ms}ms timeout"
-                    ));
-                }
-            };
+                )
+                .await?;
             emit_post_eval_nav(ctx, session_id).await?;
 
             Ok(json!({ "result": remote_object_from_info(&info) }))
