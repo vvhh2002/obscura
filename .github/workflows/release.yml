@@ -332,6 +332,15 @@ jobs:
             cp "$BIN_DIR/obscura" "$BIN_DIR/obscura-worker" dist/stealth/
           fi
 
+      - name: Stage Chinese user manual
+        shell: bash
+        run: |
+          set -euo pipefail
+          for variant in default stealth no-render no-render-stealth; do
+            cp docs/User-Guide.zh-CN.md \
+              "dist/$variant/obscura-user-guide-zh-CN.md"
+          done
+
       - name: Smoke test release binaries (V8 snapshot)
         # Run the V8 path once so a release never ships a binary that crashes at
         # isolate init from a mismatched snapshot (issue #290). The data: URL
@@ -364,22 +373,26 @@ jobs:
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
-          tar czf ${{ matrix.name }}.tar.gz -C dist/default obscura obscura-worker
-          tar czf ${{ matrix.name }}-stealth.tar.gz -C dist/stealth obscura obscura-worker
-          tar czf ${{ matrix.name }}-no-render.tar.gz -C dist/no-render obscura obscura-worker
-          tar czf ${{ matrix.name }}-no-render-stealth.tar.gz -C dist/no-render-stealth obscura obscura-worker
+          tar czf ${{ matrix.name }}.tar.gz -C dist/default \
+            obscura obscura-worker obscura-user-guide-zh-CN.md
+          tar czf ${{ matrix.name }}-stealth.tar.gz -C dist/stealth \
+            obscura obscura-worker obscura-user-guide-zh-CN.md
+          tar czf ${{ matrix.name }}-no-render.tar.gz -C dist/no-render \
+            obscura obscura-worker obscura-user-guide-zh-CN.md
+          tar czf ${{ matrix.name }}-no-render-stealth.tar.gz -C dist/no-render-stealth \
+            obscura obscura-worker obscura-user-guide-zh-CN.md
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
           cd dist/default
-          7z a ../../${{ matrix.name }}.zip obscura.exe obscura-worker.exe
+          7z a ../../${{ matrix.name }}.zip obscura.exe obscura-worker.exe obscura-user-guide-zh-CN.md
           cd ../stealth
-          7z a ../../${{ matrix.name }}-stealth.zip obscura.exe obscura-worker.exe
+          7z a ../../${{ matrix.name }}-stealth.zip obscura.exe obscura-worker.exe obscura-user-guide-zh-CN.md
           cd ../no-render
-          7z a ../../${{ matrix.name }}-no-render.zip obscura.exe obscura-worker.exe
+          7z a ../../${{ matrix.name }}-no-render.zip obscura.exe obscura-worker.exe obscura-user-guide-zh-CN.md
           cd ../no-render-stealth
-          7z a ../../${{ matrix.name }}-no-render-stealth.zip obscura.exe obscura-worker.exe
+          7z a ../../${{ matrix.name }}-no-render-stealth.zip obscura.exe obscura-worker.exe obscura-user-guide-zh-CN.md
 
       - name: Upload packaged binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -397,8 +410,42 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  documentation:
+    name: Release / Chinese user manual
+    needs: prepare
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout resolved release revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - name: Verify and stage Chinese user manual
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse 'HEAD^{commit}')"
+          if [[ "$actual_sha" != "$EXPECTED_SHA" ]]; then
+            echo "Checked out $actual_sha, expected resolved release revision $EXPECTED_SHA" >&2
+            exit 1
+          fi
+          test -s docs/User-Guide.zh-CN.md
+          cp docs/User-Guide.zh-CN.md obscura-user-guide-zh-CN.md
+
+      - name: Upload Chinese user manual
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-documentation
+          path: obscura-user-guide-zh-CN.md
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
-    needs: [prepare, test, build]
+    needs: [prepare, test, build, documentation]
     if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 15
@@ -407,7 +454,7 @@ jobs:
     steps:
       # This job never checks out or executes repository code. The write token is
       # available only while collecting and publishing the completed artifacts.
-      - name: Download packaged binaries
+      - name: Download release artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: release-*

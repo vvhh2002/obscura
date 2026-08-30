@@ -149,6 +149,9 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
 
 ## Install
 
+中文用户可先阅读 [Release 中文使用手册](docs/User-Guide.zh-CN.md)。每个
+Release 压缩包中也包含同一份 `obscura-user-guide-zh-CN.md`。
+
 ### Download
 
 Grab the latest binary from [Releases](https://github.com/h4ckf0r0day/obscura/releases):

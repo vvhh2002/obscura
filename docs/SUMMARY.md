@@ -4,6 +4,7 @@
 
 ## Quickstart
 
+* [Release 中文使用手册](User-Guide.zh-CN.md)
 * [Installation](Installation.md)
 * [Your first fetch](Your-first-fetch.md)
 * [Extract data](Extract-data.md)
