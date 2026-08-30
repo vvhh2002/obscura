@@ -55,7 +55,7 @@ The relevant options are:
 | Option | Meaning |
 | --- | --- |
 | `--assets-dir DIR` | New or empty destination directory. Requires `--dump assets`. |
-| `--wait-until CONDITION` | Navigation boundary: `load` (default), `domcontentloaded`, `networkidle0`, or `networkidle2`. |
+| `--wait-until CONDITION` | Navigation boundary: `load` (default), `commit`, `domcontentloaded`, `networkidle0`, `networkidle2`, or `capture-ready`. |
 | `--wait SECONDS` | Fixed observation window after the selected `--wait-until` condition in archive mode; default `5` when omitted. The default condition is `load`. Delayed timers and asynchronous work can run during it. |
 | `--timeout SECONDS` | Deadline used for navigation, including the selected DOM load boundary, and separately for any `--eval` expression. It does not include settling or final resource warm-up. |
 | `--assets-max-resources N` | Maximum retained responses; default `4096`. |
@@ -76,7 +76,8 @@ transitions the top `Document` through `interactive` and `DOMContentLoaded`,
 and then waits for the tracked load-delay set. That set includes unfinished
 child documents, connected dynamic scripts prepared before completion,
 parser-created eager images and dynamic images queued by the DOM shim, and
-linked stylesheets. Child frames complete from the leaves upward: a child's Window
+linked stylesheets, selected media metadata, video posters, and default text
+tracks. Child frames complete from the leaves upward: a child's Window
 load precedes the `load` event on its owner `<iframe>`, and the top Window load
 runs only after the live descendant tree has completed. The final top transition is
 `readyState = "complete"`, `readystatechange`, then Window load. See
@@ -112,6 +113,15 @@ capture boundary. DOM load is not archive completeness: unobserved lazy
 images, fonts, CSS `url()` resources, ordinary `fetch()`/XHR, timers, and other
 final-DOM assets are intentionally handled by the later observation and
 resource-warm-up barriers rather than by the Window load-delay set.
+
+`--wait-until capture-ready` first reaches the same standard Window load, then
+requires the page's network/resource/frame queues to remain empty and its
+observable DOM/resource activity to stay unchanged for 500 ms, with a
+five-second default capture-ready budget. A timer by itself does not keep this
+boundary pending; a request or connected-DOM mutation caused by the timer
+resets the quiet window. Capture-ready is still not a replacement for the
+archive writer's renderer warm-up, capture-limit checks, frame serialization,
+or final manifest validation.
 
 Archive mode accepts a single URL and conflicts with `--file`; use a distinct
 new directory for each URL in a multi-page workflow. After the fixed settle
@@ -292,7 +302,7 @@ example:
   deferred by a safety cap, or remained unresolved;
 - a final-DOM classic script has no captured response owned by the same frame;
 - a live frame cannot be inspected or serialized;
-- a child frame still has an unsupported module script or pending navigation;
+- a child frame still has an unexecuted module script or pending navigation;
 - a frame/realm/stylesheet count or recursion-depth safety cap was reached;
 - a shadow-root stylesheet owner cannot be materialized safely.
 

@@ -89,7 +89,7 @@ must also remain outside that directory. Capture-limit failures, failed,
 timed-out, or unresolved renderer resources, network or dynamic-script work
 still pending at the archive deadline, a live frame that cannot be serialized,
 final-DOM classic scripts without a response owned by their frame, and detected
-unsupported child-frame module or navigation work still write a
+unexecuted child-frame module or navigation work still write a
 manifest with `complete: false`, then return a non-zero exit status.
 Internal stylesheet/frame safety caps and frame-inspection failures also make
 the archive explicitly incomplete.

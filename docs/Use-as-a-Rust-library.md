@@ -56,6 +56,12 @@ async fn main() -> anyhow::Result<()> {
 
 `Page`:
 - `goto(url).await` navigate and wait for load
+- `goto_with_wait(url, WaitUntil).await` navigate to commit, DCL, load,
+  network-idle, or capture-ready
+- `wait_for_capture_ready().await` apply the default five-second/500 ms quiet
+  policy and return a `CaptureReadyReport`
+- `wait_for_capture_ready_with_options(options).await` use caller-provided
+  total timeout and quiet-window durations
 - `content()` rendered HTML
 - `url()` current URL
 - `frame_urls()` child-frame URLs in creation order
@@ -76,6 +82,47 @@ async fn main() -> anyhow::Result<()> {
 `Element`: `text()`, `attribute(name)`, `click()`.
 
 `CookieStore`: `set`, `get_all`, `get_for_url`, `save_to_file`, `load_from_file`.
+
+## Select a navigation or capture boundary
+
+`goto()` continues to wait for standard Window load. Use `goto_with_wait()` to
+return at a different lifecycle boundary, and use capture readiness when
+post-load requests or DOM mutations matter to the result:
+
+```rust
+use obscura::{Browser, CaptureReadyOptions, WaitUntil};
+use std::time::Duration;
+
+let browser = Browser::new()?;
+let mut page = browser.new_page().await?;
+page.goto_with_wait("https://example.com", WaitUntil::Load).await?;
+
+let report = page.wait_for_capture_ready_with_options(CaptureReadyOptions {
+    timeout: Duration::from_secs(8),
+    quiet_window: Duration::from_millis(750),
+}).await;
+
+anyhow::ensure!(report.quiescent, "page did not become quiet: {report:?}");
+anyhow::ensure!(!report.timed_out, "capture-ready timed out: {report:?}");
+anyhow::ensure!(report.archive_complete, "known archive gaps: {:?}", report.incomplete_reasons);
+```
+
+`WaitUntil::Commit` retains a resumable parser but does not spawn a background
+task in the embedded API. A following `settle()` resumes that continuation
+before it pumps timers, requests, and frames. Prefer DCL, Load, or CaptureReady
+when the immediate return itself must contain parser-tail DOM.
+
+The default options are a five-second total budget and a 500 ms quiet window.
+`CaptureReadyReport` also includes lifecycle state, a pending-resource-work
+flag, and pending network, child-document, cross-frame-message, and incomplete-
+frame counts.
+Timers do not stay pending by themselves, but a timer-created request or DOM
+mutation resets the quiet window.
+
+`archive_complete` is a known-gap diagnostic, not proof that response capture
+was enabled. When capture is enabled its omission counters are included in the
+report, but byte-exact callers should still run renderer resource preparation
+and validate the returned `ResourceCapture` artifact as shown below.
 
 ## Intercept requests
 

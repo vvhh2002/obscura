@@ -7,19 +7,19 @@ pub mod pdf;
 pub mod profiles;
 
 pub use context::BrowserContext;
-pub use lifecycle::{LifecycleState, WaitUntil};
+pub use lifecycle::{CaptureReadyOptions, CaptureReadyReport, LifecycleState, WaitUntil};
 pub use obscura_js::HTML_TO_MARKDOWN_JS;
 #[cfg(feature = "render")]
 pub use obscura_js::{
     validate_capture_region, AnimationSample, AnimationSampleMode, AnimationSampleTime,
     CaptureError, CaptureRegion,
 };
-pub use page::{
-    CapturedResource, FrameResourceDiagnostic, FrameSnapshot, NetworkEvent, Page, PageError,
-    ResourceCapture, ResourceCaptureLimits,
-};
 #[cfg(feature = "render")]
 pub use page::ScreenshotResourceWarmupReport;
+pub use page::{
+    CapturedResource, FrameResourceDiagnostic, FrameSnapshot, NavigationEvent, NetworkEvent, Page,
+    PageError, ResourceCapture, ResourceCaptureLimits,
+};
 #[cfg(feature = "render")]
 pub use pdf::{RasterPdfError, RasterPdfOptions, RasterPdfPageRange};
 // Re-exported so the embeddable `obscura` crate (which depends on obscura-browser,

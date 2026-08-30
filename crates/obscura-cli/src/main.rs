@@ -143,6 +143,8 @@ enum Command {
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
         timeout: u64,
 
+        /// Navigation wait token: commit, domcontentloaded, load,
+        /// networkidle0, networkidle2, or capture-ready.
         #[arg(long, default_value = "load")]
         wait_until: String,
 
@@ -455,7 +457,9 @@ async fn main() -> anyhow::Result<()> {
                     anyhow::bail!("Pass URLs via a positional argument or --file, not both.");
                 }
                 if screenshot.is_some() {
-                    anyhow::bail!("--screenshot is only supported for a single URL, not --file batch mode.");
+                    anyhow::bail!(
+                        "--screenshot is only supported for a single URL, not --file batch mode."
+                    );
                 }
                 // Batch mode is raw HTTP only. Rendering each URL through the
                 // browser/JS stack is what `scrape` is for.
@@ -474,7 +478,7 @@ async fn main() -> anyhow::Result<()> {
                     global_proxy,
                     output,
                     quiet,
-                    stealth
+                    stealth,
                 )
                 .await?;
             } else {
@@ -759,14 +763,8 @@ fn path_starts_with_components(
             return false;
         };
         let equal = if case_insensitive {
-            path_component
-                .as_os_str()
-                .to_string_lossy()
-                .to_lowercase()
-                == base_component
-                    .as_os_str()
-                    .to_string_lossy()
-                    .to_lowercase()
+            path_component.as_os_str().to_string_lossy().to_lowercase()
+                == base_component.as_os_str().to_string_lossy().to_lowercase()
         } else {
             path_component == base_component
         };
@@ -865,14 +863,8 @@ async fn run_fetch(
     // payloads (images, fonts, …) and any non-HTML resource where parsing the
     // body through the DOM/JS layer would corrupt or discard data.
     if dump == DumpFormat::Original {
-        let bytes = fetch_original_bytes(
-            url_str,
-            proxy,
-            user_agent.clone(),
-            timeout_secs,
-            stealth,
-        )
-        .await?;
+        let bytes =
+            fetch_original_bytes(url_str, proxy, user_agent.clone(), timeout_secs, stealth).await?;
         write_or_print_bytes(&bytes, output.as_ref()).await?;
         return Ok(());
     }
@@ -1186,10 +1178,7 @@ async fn run_fetch(
             .take_resource_capture()
             .ok_or_else(|| anyhow::anyhow!("resource capture was not enabled"))?;
         incomplete_reasons.extend(missing_classic_script_reasons(
-            &page_html,
-            &final_url,
-            &frames,
-            &capture,
+            &page_html, &final_url, &frames, &capture,
         ));
         let summary = write_asset_archive(
             directory,
@@ -2245,7 +2234,14 @@ fn response_content_type(resource: &CapturedResource) -> String {
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
         .map(|(_, value)| value)
-        .map(|value| value.split(';').next().unwrap_or(value).trim().to_ascii_lowercase())
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or(value)
+                .trim()
+                .to_ascii_lowercase()
+        })
         .unwrap_or_default()
 }
 
@@ -2332,8 +2328,7 @@ fn classic_script_urls(html: &str, document_url: &str) -> Vec<String> {
             .to_ascii_lowercase();
         if !matches!(
             script_type.as_str(),
-            ""
-                | "text/javascript"
+            "" | "text/javascript"
                 | "application/javascript"
                 | "application/x-javascript"
                 | "text/ecmascript"
@@ -2430,7 +2425,10 @@ fn prepare_asset_archive_directory(directory: &std::path::Path) -> anyhow::Resul
                 );
             }
             if !metadata.is_dir() {
-                anyhow::bail!("asset archive path is not a directory: {}", directory.display());
+                anyhow::bail!(
+                    "asset archive path is not a directory: {}",
+                    directory.display()
+                );
             }
 
             let mut contains_entry = false;
@@ -2452,7 +2450,10 @@ fn prepare_asset_archive_directory(directory: &std::path::Path) -> anyhow::Resul
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(parent) = directory.parent().filter(|path| !path.as_os_str().is_empty()) {
+            if let Some(parent) = directory
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+            {
                 std::fs::create_dir_all(parent).map_err(|error| {
                     anyhow::anyhow!(
                         "failed to create asset archive parent {}: {}",
@@ -2564,9 +2565,15 @@ fn write_asset_archive(
     capture.resources.sort_by(|left, right| {
         left.frame_id
             .cmp(&right.frame_id)
-            .then_with(|| resource_type_name(left.resource_type).cmp(resource_type_name(right.resource_type)))
+            .then_with(|| {
+                resource_type_name(left.resource_type).cmp(resource_type_name(right.resource_type))
+            })
             .then_with(|| left.final_url.as_str().cmp(right.final_url.as_str()))
-            .then_with(|| left.requested_url.as_str().cmp(right.requested_url.as_str()))
+            .then_with(|| {
+                left.requested_url
+                    .as_str()
+                    .cmp(right.requested_url.as_str())
+            })
             .then_with(|| left.method.cmp(&right.method))
     });
 
@@ -2603,13 +2610,11 @@ fn write_asset_archive(
         }));
     }
 
-    if capture.omitted_resources != 0 {
-        incomplete_reasons.push(format!(
-            "capture limits omitted {} responses ({} bytes)",
-            capture.omitted_resources, capture.omitted_bytes
-        ));
+    if let Some(reason) = capture.omission_reason() {
+        incomplete_reasons.push(reason);
     }
     incomplete_reasons.sort();
+    incomplete_reasons.dedup();
     let complete = incomplete_reasons.is_empty();
     let manifest = serde_json::json!({
         "version": 1,
@@ -2675,6 +2680,27 @@ mod tests {
                 assert_eq!(dump, Some(DumpFormat::Original));
             }
             _ => panic!("expected Fetch command"),
+        }
+    }
+
+    #[test]
+    fn parsed_fetch_accepts_commit_and_capture_ready_wait_tokens() {
+        for (token, expected) in [
+            ("commit", obscura_browser::WaitUntil::Commit),
+            ("capture-ready", obscura_browser::WaitUntil::CaptureReady),
+        ] {
+            let args = Args::try_parse_from([
+                "obscura",
+                "fetch",
+                "--wait-until",
+                token,
+                "https://example.com/",
+            ])
+            .expect("clap should accept the lifecycle wait token");
+            let Some(Command::Fetch { wait_until, .. }) = args.command else {
+                panic!("expected Fetch command");
+            };
+            assert_eq!(obscura_browser::WaitUntil::from_str(&wait_until), expected,);
         }
     }
 
@@ -2805,7 +2831,10 @@ mod tests {
 
         let _ = tokio::fs::remove_file(&path).await;
 
-        assert_eq!(bytes, PNG_BYTES, "stealth=true must not change file:// handling");
+        assert_eq!(
+            bytes, PNG_BYTES,
+            "stealth=true must not change file:// handling"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3035,14 +3064,9 @@ mod tests {
 
     #[test]
     fn fetch_screenshot_has_a_short_alias_and_rejects_batch_mode() {
-        let args = Args::try_parse_from([
-            "obscura",
-            "fetch",
-            "https://example.com",
-            "-s",
-            "page.png",
-        ])
-        .unwrap();
+        let args =
+            Args::try_parse_from(["obscura", "fetch", "https://example.com", "-s", "page.png"])
+                .unwrap();
         match args.command {
             Some(Command::Fetch { screenshot, .. }) => {
                 assert_eq!(screenshot, Some(std::path::PathBuf::from("page.png")));
@@ -3066,16 +3090,15 @@ mod tests {
             Some(Command::Fetch { timeout, .. }) => timeout,
             _ => panic!("expected Fetch command"),
         };
-        let context = std::sync::Arc::new(
-            obscura_browser::BrowserContext::with_storage_and_network(
+        let context =
+            std::sync::Arc::new(obscura_browser::BrowserContext::with_storage_and_network(
                 "cli-timeout-test".to_string(),
                 None,
                 false,
                 None,
                 None,
                 true,
-            ),
-        );
+            ));
         let mut page = obscura_browser::Page::new("cli-timeout-test".to_string(), context);
         configure_fetch_navigation_timeout(&mut page, timeout);
         page.navigation_timeout()
@@ -3083,14 +3106,9 @@ mod tests {
 
     #[test]
     fn fetch_timeout_sets_the_page_navigation_budget() {
-        let args = Args::try_parse_from([
-            "obscura",
-            "fetch",
-            "https://example.com",
-            "--timeout",
-            "50",
-        ])
-        .unwrap();
+        let args =
+            Args::try_parse_from(["obscura", "fetch", "https://example.com", "--timeout", "50"])
+                .unwrap();
         assert_eq!(
             configured_fetch_timeout(args),
             std::time::Duration::from_secs(50)
@@ -3220,11 +3238,7 @@ mod tests {
         let aliased_parent = std::path::Path::new("/TEMP/CAPTURE");
         let sibling = std::path::Path::new("/temp/capture/assets-old/manifest.json");
 
-        assert!(path_starts_with_components(
-            aliased_child,
-            archive,
-            true,
-        ));
+        assert!(path_starts_with_components(aliased_child, archive, true,));
         assert!(path_starts_with_components(archive, aliased_parent, true));
         assert!(!path_starts_with_components(sibling, archive, true));
         assert!(

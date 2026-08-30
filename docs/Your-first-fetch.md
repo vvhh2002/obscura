@@ -48,12 +48,22 @@ obscura fetch https://my-spa.example --wait-until domcontentloaded --eval "docum
 
 | Level              | Returns when                                  |
 | ------------------ | --------------------------------------------- |
-| `domcontentloaded` | HTML parsed, scripts ran                      |
-| `load`             | All subresources finished (default)           |
+| `commit`           | Initial live document installed; parser continuation retained |
+| `domcontentloaded` | HTML parsed and DCL-delaying script work finished |
+| `load`             | Standard load-delay set finished (default)    |
 | `networkidle2`     | ≤2 network connections active for 500ms       |
 | `networkidle0`     | 0 network connections active for 500ms        |
+| `capture-ready`    | Load plus a bounded 500ms resource/DOM quiet window |
 
-(When driving obscura via Puppeteer or Playwright the default is `domcontentloaded` to match client expectations.)
+The network-idle waiter has a five-second ceiling. If the requested 500 ms
+threshold is not observed, navigation fails and no network-idle milestone is
+published. Use capture-ready when timeout and pending counts should be returned
+as a diagnostic report instead.
+
+Puppeteer and Playwright apply their own high-level navigation defaults. Raw
+CDP `Page.navigate` without Obscura's optional `waitUntil` field returns at
+commit. See [Document loading and capture
+readiness](Document-loading-and-capture-ready.md).
 
 ## Common flags
 

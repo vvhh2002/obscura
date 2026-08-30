@@ -65,9 +65,22 @@ const CLOSED_SHADOW_REINSERT_PARENT_HTML: &str = r#"<!doctype html><html><body>
 const RESET_PARENT_HTML: &str = r#"<!doctype html><html><head><title>parent</title></head><body>
 <script>
   var f = document.createElement('iframe');
+  window.__resetState = {};
   f.src = '/child.html';
   document.body.appendChild(f);
-  setTimeout(function () { f.src = 'about:blank'; }, 150);
+  f.onload = function () {
+    if (f.src === 'about:blank' && window.__resetFirstWindow) {
+      __resetState.secondFrameId = f._frameId;
+      __resetState.windowStable = f.contentWindow === window.__resetFirstWindow;
+      __resetState.oldMarkerAfter = typeof f.contentWindow.__ran;
+    }
+  };
+  setTimeout(function () {
+    __resetState.firstFrameId = f._frameId;
+    __resetState.oldMarkerBefore = f.contentWindow.__ran;
+    window.__resetFirstWindow = f.contentWindow;
+    f.src = 'about:blank';
+  }, 150);
 </script>
 </body></html>"#;
 
@@ -168,11 +181,11 @@ fn spawn_detached_image_frame_server() -> String {
   window.__detachedImage.src = "/pixel.png";
 </script></body></html>"#;
     const PIXEL_PNG: &[u8] = &[
-        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
-        0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
-        0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78,
-        0xda, 0x63, 0xfc, 0xcf, 0xc0, 0x50, 0x0f, 0x00, 0x05, 0x83, 0x02, 0x7f, 0x94, 0xff,
-        0x2f, 0x59, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xfc,
+        0xcf, 0xc0, 0x50, 0x0f, 0x00, 0x05, 0x83, 0x02, 0x7f, 0x94, 0xff, 0x2f, 0x59, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
     ];
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -292,12 +305,31 @@ async fn removing_and_reinserting_a_closed_shadow_host_recreates_its_iframe() {
     page.settle(2_000).await;
 
     let state = page.evaluate("window.__shadowReinsert");
-    assert_eq!(state["loads"], 2, "closed-shadow iframe did not reload: {state:#?}");
-    assert_eq!(state["childRuns"], serde_json::json!([1, 1]), "replacement child script did not run: {state:#?}");
-    assert_eq!(state["resetFrameId"], 0, "removed iframe kept its frame id: {state:#?}");
-    assert_ne!(state["firstFrameId"], state["secondFrameId"], "frame id was reused: {state:#?}");
-    assert_eq!(state["windowChanged"], true, "contentWindow survived removal: {state:#?}");
-    assert_eq!(page.evaluate("window.__closedShadowHost.shadowRoot"), serde_json::Value::Null);
+    assert_eq!(
+        state["loads"], 2,
+        "closed-shadow iframe did not reload: {state:#?}"
+    );
+    assert_eq!(
+        state["childRuns"],
+        serde_json::json!([1, 1]),
+        "replacement child script did not run: {state:#?}"
+    );
+    assert_eq!(
+        state["resetFrameId"], 0,
+        "removed iframe kept its frame id: {state:#?}"
+    );
+    assert_ne!(
+        state["firstFrameId"], state["secondFrameId"],
+        "frame id was reused: {state:#?}"
+    );
+    assert_eq!(
+        state["windowChanged"], true,
+        "contentWindow survived removal: {state:#?}"
+    );
+    assert_eq!(
+        page.evaluate("window.__closedShadowHost.shadowRoot"),
+        serde_json::Value::Null
+    );
     assert_eq!(page.frame_urls(), vec!["about:srcdoc".to_string()]);
 }
 
@@ -463,7 +495,10 @@ async fn a_rejected_child_frame_does_not_leave_js_references() {
     page.goto(&base).await.unwrap();
     page.settle(2000).await;
 
-    assert!(page.frame_urls().is_empty(), "the frame cap was not applied");
+    assert!(
+        page.frame_urls().is_empty(),
+        "the frame cap was not applied"
+    );
     assert_eq!(
         page.resource_archive_incomplete_reasons(),
         vec!["live frame cap reached (0 realms)".to_string()],
@@ -495,7 +530,10 @@ async fn navigating_blank_releases_child_realms() {
     assert_eq!(page.frame_urls().len(), 1);
 
     page.goto("about:blank").await.unwrap();
-    assert!(page.frame_urls().is_empty(), "old frame realm survived navigation");
+    assert!(
+        page.frame_urls().is_empty(),
+        "old frame realm survived navigation"
+    );
 }
 
 #[tokio::test]
@@ -508,13 +546,38 @@ async fn changing_iframe_src_releases_the_previous_realm() {
     page.goto(&base).await.unwrap();
     page.settle(1000).await;
 
-    assert!(page.frame_urls().is_empty(), "old src realm survived replacement");
-    for registry in ["__obscura_frameWindows", "__obscura_frameElements"] {
+    assert_eq!(
+        page.frame_urls(),
+        vec!["about:blank"],
+        "the replacement synthetic realm was not the only live frame",
+    );
+    let state = page.evaluate("window.__resetState");
+    assert_eq!(
+        state["oldMarkerBefore"], "YES",
+        "child realm did not run: {state:#?}",
+    );
+    assert_ne!(
+        state["firstFrameId"], state["secondFrameId"],
+        "about:blank reused the old document generation: {state:#?}",
+    );
+    assert_eq!(
+        state["windowStable"], true,
+        "navigation replaced the browsing context's WindowProxy: {state:#?}",
+    );
+    assert_eq!(
+        state["oldMarkerAfter"], "undefined",
+        "an author global from the old realm survived replacement: {state:#?}",
+    );
+    for registry in [
+        "__obscura_frameObjects",
+        "__obscura_frameWindows",
+        "__obscura_frameElements",
+    ] {
         assert_eq!(
             page.evaluate(&format!("Object.keys(globalThis.{registry}).length"))
                 .as_f64(),
-            Some(0.0),
-            "old iframe stayed in {registry}",
+            Some(1.0),
+            "{registry} did not retain exactly the replacement realm",
         );
     }
 }

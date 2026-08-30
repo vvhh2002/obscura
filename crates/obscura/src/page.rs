@@ -1,12 +1,12 @@
 use std::cell::RefCell;
 use std::time::Duration;
 
-use obscura_browser::lifecycle::WaitUntil;
-use obscura_browser::{
-    InterceptedRequest, Page as InnerPage, ResourceCapture, ResourceCaptureLimits,
-};
 #[cfg(feature = "render")]
 use obscura_browser::ScreenshotResourceWarmupReport;
+use obscura_browser::{
+    CaptureReadyOptions, CaptureReadyReport, InterceptedRequest, Page as InnerPage,
+    ResourceCapture, ResourceCaptureLimits, WaitUntil,
+};
 use obscura_net::{RequestCallback, ResponseCallback};
 use serde_json::Value;
 
@@ -16,8 +16,11 @@ use crate::error::Error;
 /// as f64, so `Value::as_u64` returns None for an integer-valued result; accept
 /// either an integer or a non-negative finite float. null / non-numbers -> None.
 fn nid_from_value(v: &Value) -> Option<u64> {
-    v.as_u64()
-        .or_else(|| v.as_f64().filter(|f| f.is_finite() && *f >= 0.0).map(|f| f as u64))
+    v.as_u64().or_else(|| {
+        v.as_f64()
+            .filter(|f| f.is_finite() && *f >= 0.0)
+            .map(|f| f as u64)
+    })
 }
 
 /// A browser tab/page.
@@ -34,11 +37,32 @@ pub struct Page {
 impl Page {
     /// Navigate to URL and wait for load.
     pub async fn goto(&mut self, url: &str) -> Result<(), Error> {
+        self.goto_with_wait(url, WaitUntil::Load).await
+    }
+
+    /// Navigate to URL using the requested lifecycle boundary.
+    pub async fn goto_with_wait(&mut self, url: &str, wait_until: WaitUntil) -> Result<(), Error> {
         self.inner
             .get_mut()
-            .navigate_with_wait(url, WaitUntil::Load)
+            .navigate_with_wait(url, wait_until)
             .await
             .map_err(|e| Error::Navigation(e.to_string()))
+    }
+
+    /// Wait for the default bounded capture-ready quiet window.
+    pub async fn wait_for_capture_ready(&mut self) -> CaptureReadyReport {
+        self.inner.get_mut().wait_for_capture_ready().await
+    }
+
+    /// Wait for a caller-specified capture-ready quiet window.
+    pub async fn wait_for_capture_ready_with_options(
+        &mut self,
+        options: CaptureReadyOptions,
+    ) -> CaptureReadyReport {
+        self.inner
+            .get_mut()
+            .wait_for_capture_ready_with_options(options)
+            .await
     }
 
     /// Get current URL.
@@ -84,7 +108,10 @@ impl Page {
             escaped
         );
         let val = self.evaluate(&js);
-        nid_from_value(&val).map(|nid| Element { node_id: nid, page: self })
+        nid_from_value(&val).map(|nid| Element {
+            node_id: nid,
+            page: self,
+        })
     }
 
     /// Wait for CSS selector to appear (polls every 100ms).
@@ -102,7 +129,10 @@ impl Page {
             );
             let val = self.evaluate(&js);
             if let Some(nid) = nid_from_value(&val) {
-                return Ok(Element { node_id: nid, page: self });
+                return Ok(Element {
+                    node_id: nid,
+                    page: self,
+                });
             }
             if start.elapsed() > timeout {
                 return Err(Error::Timeout(format!(
@@ -161,9 +191,7 @@ impl Page {
     /// archive is known to be incomplete. Navigation replaces the previous
     /// document's reasons; diagnostic wording is not a versioned schema.
     pub fn resource_archive_incomplete_reasons(&mut self) -> Vec<String> {
-        self.inner
-            .get_mut()
-            .resource_archive_incomplete_reasons()
+        self.inner.get_mut().resource_archive_incomplete_reasons()
     }
 
     /// Seed renderer image/font resources and return a complete diagnostic for
@@ -264,7 +292,11 @@ impl Element<'_> {
             "(function() {{ var el = globalThis._wrap && globalThis._wrap({}); return el ? el.getAttribute('{}') : null; }})()",
             self.node_id, escaped
         ));
-        if val.is_null() { None } else { Some(val.as_str().unwrap_or("").to_string()) }
+        if val.is_null() {
+            None
+        } else {
+            Some(val.as_str().unwrap_or("").to_string())
+        }
     }
 
     /// Click this element.

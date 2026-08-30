@@ -502,7 +502,7 @@ Fetch and render a single page.
 | `--dump` | `html` | Output: `html`, `text`, `links`, `markdown`, `assets` (best-effort URL inventory as NDJSON), or `original` (raw response body) |
 | `--assets-dir` | — | With `--dump assets`, save final-document HTML, frame HTML, a manifest, and byte-exact content-addressed response files (render build required) |
 | `--eval` | — | JavaScript expression to evaluate |
-| `--wait-until` | `load` | Wait: `load`, `domcontentloaded`, `networkidle0` |
+| `--wait-until` | `load` | Wait: `commit`, `domcontentloaded`, `load`, `networkidle2`, `networkidle0`, `capture-ready` |
 | `--timeout` | `30` | Navigation/eval deadline in seconds |
 | `--wait` | adaptive, up to `5` | Post-load settling; explicit values are fixed, and archive mode uses a fixed 5s default |
 | `--selector` | — | Wait for CSS selector |

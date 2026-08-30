@@ -26,7 +26,8 @@ Load a URL and print its content or an evaluated expression.
     --selector <CSS>         Narrow output to a CSS selector
     --wait <SECONDS>         Fixed post-load delay; omitted usually uses adaptive settle (5s cap)
     --timeout <SECONDS>      Navigation/eval timeout (default 30)
-    --wait-until <LEVEL>     domcontentloaded | load | networkidle2 | networkidle0
+    --wait-until <LEVEL>     commit | domcontentloaded | load | networkidle2 |
+                             networkidle0 | capture-ready
                              (default load)
     --user-agent <UA>        Override the User-Agent
     --assets-dir <DIR>       With --dump assets, save final-page response files and manifest
@@ -46,6 +47,15 @@ Load a URL and print its content or an evaluated expression.
 default and may be combined with `--eval`; the expression runs before capture,
 which is useful for scrolling or preparing page state. It is not available in
 `--file` batch mode.
+
+`commit` returns after the document URL, live parser tree, V8 realm, and
+new-document preload scripts are installed. The CLI's ordinary post-navigation
+settle resumes the retained parser before producing output; `--wait 0`
+deliberately leaves the output at the initial commit boundary. `capture-ready`
+first waits for the standard Window load, then requires 500 ms without new
+observed network/resource/frame or connected-DOM activity, bounded by five
+seconds. It does not change the DOM definition of load. See [Document loading
+and capture readiness](Document-loading-and-capture-ready.md).
 
 When `--wait` is omitted, Obscura normally drives timers and async work until
 the page becomes quiescent, with a five-second ceiling. Supplying `--wait N`
@@ -86,7 +96,7 @@ frame. If a configured capture limit is reached, a network/dynamic-script task
 is still pending, renderer discovery reports a failed/timed-out/unresolved
 image or font, a live frame cannot be serialized, a classic script in the
 final DOM has no response owned by that frame, or a live child frame contains
-an unsupported module or pending navigation, the manifest is written with
+an unexecuted module or pending navigation, the manifest is written with
 `complete: false` and the command exits unsuccessfully instead of silently
 claiming a complete archive. Internal stylesheet/frame count or depth caps and
 frame diagnostic failures are reported the same way. This mode requires a
