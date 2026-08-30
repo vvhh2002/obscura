@@ -1,16 +1,19 @@
+pub mod blocklist;
 pub mod client;
 pub mod cookies;
 pub mod encoding;
 pub mod interceptor;
 pub mod robots;
-pub mod blocklist;
 #[cfg(feature = "stealth")]
 pub mod wreq_client;
 
+pub use blocklist::is_blocked as is_tracker_blocked;
 pub use client::{
-    env_allows_private_network, is_forbidden_ip, CallbackRegistry, ObscuraHttpClient,
-    ObscuraNetError, RequestCallback, RequestCredentials, RequestInfo, RequestMode,
-    ResourceRequest, ResourceType, Response, ResponseCallback, SsrfGuardResolver,
+    env_allows_private_network, is_forbidden_ip, CallbackRegistry, NavigationResponseStream,
+    NetworkActivityCallback, NetworkActivityCancellationGuard, NetworkActivityEvent,
+    NetworkActivityPhase, NetworkActivityTracker, ObscuraHttpClient, ObscuraNetError,
+    RequestCallback, RequestCredentials, RequestInfo, RequestMode, ResourceRequest, ResourceType,
+    Response, ResponseCallback, SsrfGuardResolver, StreamingResponseHead,
 };
 pub use cookies::{canonical_domain, default_cookie_path, CookieInfo, CookieJar};
 pub use encoding::{
@@ -18,7 +21,6 @@ pub use encoding::{
     url_encode_query,
 };
 pub use robots::RobotsCache;
-pub use blocklist::is_blocked as is_tracker_blocked;
 #[cfg(feature = "stealth")]
 pub use wreq_client::{
     StealthHttpClient, STEALTH_NAVIGATOR_PLATFORM, STEALTH_UA_PLATFORM,
