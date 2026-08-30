@@ -121,12 +121,16 @@ tag. It also supports `workflow_dispatch` for a guarded manual build:
 1. Open **Actions → Release → Run workflow** and select the exact branch whose
    current commit should be released.
 2. Enter a SemVer tag with a leading `v`, such as `v0.2.0`.
-3. Leave **publish** disabled to build downloadable workflow artifacts only.
-4. To create or update a GitHub Release, enable **publish**. If the tag does
-   not exist yet, also enable **create_tag**; otherwise the workflow fails
-   before compiling. A pre-existing tag must resolve to the selected commit.
-5. Enable **draft** when the release should remain unpublished. Prerelease tags
-   such as `v0.2.0-rc.1` are always marked as prereleases.
+3. Select **build** to create downloadable workflow artifacts only, or
+   **publish** to create or update a public GitHub Release after every build
+   succeeds.
+
+Manual publication creates a missing tag at the selected commit, generates
+release notes for a new Release, and publishes a non-draft release. Updating an
+existing Release preserves its notes; publishing an existing draft makes it
+public. A pre-existing tag must already resolve to the selected commit. Tags
+with a prerelease suffix, such as `v0.2.0-rc.1`, are marked as prereleases
+automatically.
 
 The prepare job resolves one immutable commit SHA. Every native matrix build
 checks out that SHA, and the tag without its leading `v` is injected as the CLI
@@ -142,5 +146,5 @@ execute repository code. The build jobs remain read-only. A tag created by the
 repository `GITHUB_TOKEN` does not start another workflow, so a tag created by
 manual binary publication does not automatically run the separate Docker
 workflow. When a Docker image is required too, create and push the tag through
-the normal Git flow instead of allowing the manual release to create it; that
-tag push starts both the binary Release and Docker workflows.
+the normal Git flow instead of using the manual **publish** mode; that tag push
+starts both the binary Release and Docker workflows.

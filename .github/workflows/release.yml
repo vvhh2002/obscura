@@ -7,34 +7,17 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag (SemVer with a leading v, for example v0.2.0)
+        description: Version tag (for example v0.2.0)
         required: true
         type: string
-      publish:
-        description: Create or update the GitHub Release after all builds pass
+      mode:
+        description: Build artifacts only, or publish a release after the builds pass
         required: true
-        default: false
-        type: boolean
-      create_tag:
-        description: Allow publish to create a missing tag at the selected workflow revision
-        required: true
-        default: false
-        type: boolean
-      draft:
-        description: Keep a manually published GitHub Release as a draft
-        required: true
-        default: false
-        type: boolean
-      prerelease:
-        description: Mark a stable-version tag as a prerelease
-        required: true
-        default: false
-        type: boolean
-      generate_notes:
-        description: Generate GitHub release notes for a manual publication
-        required: true
-        default: true
-        type: boolean
+        default: build
+        type: choice
+        options:
+          - build
+          - publish
 
 permissions:
   contents: read
@@ -55,7 +38,6 @@ jobs:
     timeout-minutes: 10
     outputs:
       create_tag: ${{ steps.release.outputs.create_tag }}
-      draft: ${{ steps.release.outputs.draft }}
       generate_notes: ${{ steps.release.outputs.generate_notes }}
       prerelease: ${{ steps.release.outputs.prerelease }}
       publish: ${{ steps.release.outputs.publish }}
@@ -74,28 +56,33 @@ jobs:
         id: release
         shell: bash
         env:
-          INPUT_CREATE_TAG: ${{ inputs.create_tag }}
-          INPUT_DRAFT: ${{ inputs.draft }}
-          INPUT_GENERATE_NOTES: ${{ inputs.generate_notes }}
-          INPUT_PRERELEASE: ${{ inputs.prerelease }}
-          INPUT_PUBLISH: ${{ inputs.publish }}
+          INPUT_MODE: ${{ inputs.mode }}
           INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
 
           if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
             tag="$INPUT_TAG"
-            publish="$INPUT_PUBLISH"
-            create_tag="$INPUT_CREATE_TAG"
-            draft="$INPUT_DRAFT"
-            prerelease="$INPUT_PRERELEASE"
-            generate_notes="$INPUT_GENERATE_NOTES"
+            case "$INPUT_MODE" in
+              build)
+                publish=false
+                create_tag=false
+                generate_notes=false
+                ;;
+              publish)
+                publish=true
+                create_tag=true
+                generate_notes=true
+                ;;
+              *)
+                echo "Unknown release mode: $INPUT_MODE" >&2
+                exit 1
+                ;;
+            esac
           else
             tag="$GITHUB_REF_NAME"
             publish=true
             create_tag=false
-            draft=false
-            prerelease=false
             generate_notes=false
           fi
 
@@ -119,17 +106,18 @@ jobs:
             exit 1
           fi
           if [[ "$publish" == "true" && -z "$existing_sha" && "$create_tag" != "true" ]]; then
-            echo "Tag $tag does not exist. Select create_tag to publish it at $sha." >&2
+            echo "Tag $tag is missing and this trigger is not allowed to create it." >&2
             exit 1
           fi
 
           version="${tag#v}"
-          if [[ "$version" == *-* ]]; then
+          version_without_build="${version%%+*}"
+          prerelease=false
+          if [[ "$version_without_build" == *-* ]]; then
             prerelease=true
           fi
 
           printf 'create_tag=%s\n' "$create_tag" >> "$GITHUB_OUTPUT"
-          printf 'draft=%s\n' "$draft" >> "$GITHUB_OUTPUT"
           printf 'generate_notes=%s\n' "$generate_notes" >> "$GITHUB_OUTPUT"
           printf 'prerelease=%s\n' "$prerelease" >> "$GITHUB_OUTPUT"
           printf 'publish=%s\n' "$publish" >> "$GITHUB_OUTPUT"
@@ -139,8 +127,10 @@ jobs:
 
           if [[ -n "$existing_sha" ]]; then
             echo "Building existing tag $tag at $sha"
+          elif [[ "$create_tag" == "true" ]]; then
+            echo "Building $tag at $sha; the missing tag will be created after all builds pass"
           else
-            echo "Building candidate tag $tag at $sha (tag creation allowed: $create_tag)"
+            echo "Building candidate tag $tag at $sha without publishing"
           fi
 
   build:
@@ -355,7 +345,7 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Revalidate release tag
+      - name: Revalidate or create release tag
         shell: bash
         env:
           ALLOW_CREATE_TAG: ${{ needs.prepare.outputs.create_tag }}
@@ -372,11 +362,26 @@ jobs:
           )"; then
             if [[ "$ALLOW_CREATE_TAG" == "true" ]] \
               && grep -q 'HTTP 404' "$error_file"; then
-              echo "Tag $RELEASE_TAG is still absent and may be created at $EXPECTED_SHA"
-              exit 0
+              create_error="$RUNNER_TEMP/release-tag-create-error"
+              if gh api --method POST \
+                "repos/$GITHUB_REPOSITORY/git/refs" \
+                -f ref="refs/tags/$RELEASE_TAG" \
+                -f sha="$EXPECTED_SHA" \
+                >/dev/null 2>"$create_error"; then
+                echo "Created tag $RELEASE_TAG at $EXPECTED_SHA"
+              elif grep -q 'HTTP 422' "$create_error"; then
+                echo "Tag $RELEASE_TAG was created concurrently; validating it"
+              else
+                cat "$create_error" >&2
+                exit 1
+              fi
+              ref_json="$(
+                gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG"
+              )"
+            else
+              cat "$error_file" >&2
+              exit 1
             fi
-            cat "$error_file" >&2
-            exit 1
           fi
 
           object_type="$(jq -er '.object.type' <<<"$ref_json")"
@@ -408,13 +413,40 @@ jobs:
             | xargs -0 sha256sum > SHA256SUMS
           test -s SHA256SUMS
 
+      - name: Decide whether to generate release notes
+        id: release_metadata
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          REQUEST_GENERATE_NOTES: ${{ needs.prepare.outputs.generate_notes }}
+        run: |
+          set -euo pipefail
+
+          generate_notes=false
+          if [[ "$REQUEST_GENERATE_NOTES" == "true" ]]; then
+            error_file="$RUNNER_TEMP/release-lookup-error"
+            if gh api \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+              >/dev/null 2>"$error_file"; then
+              echo "Updating an existing release without regenerating its notes"
+            elif grep -q 'HTTP 404' "$error_file"; then
+              generate_notes=true
+              echo "A new release will receive generated notes"
+            else
+              cat "$error_file" >&2
+              exit 1
+            fi
+          fi
+          printf 'generate_notes=%s\n' "$generate_notes" >> "$GITHUB_OUTPUT"
+
       - name: Publish GitHub release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          draft: ${{ needs.prepare.outputs.draft }}
+          draft: false
           fail_on_unmatched_files: true
           files: dist/*
-          generate_release_notes: ${{ needs.prepare.outputs.generate_notes }}
+          generate_release_notes: ${{ steps.release_metadata.outputs.generate_notes }}
           prerelease: ${{ needs.prepare.outputs.prerelease }}
           tag_name: ${{ needs.prepare.outputs.tag }}
           target_commitish: ${{ needs.prepare.outputs.sha }}
