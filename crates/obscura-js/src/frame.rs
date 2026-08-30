@@ -23,15 +23,22 @@
 //! second isolate could never do that.
 
 use std::rc::Rc;
+use std::sync::Arc;
 
-use obscura_dom::parse_html;
+use obscura_dom::{parse_html, ParserYield, StreamingDocumentParser};
 
+use crate::import_map::ImportMap;
+use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 use crate::ops::{ObscuraState, RealmStates};
 use crate::runtime::ObscuraJsRuntime;
 
 /// One child browsing context: its own realm, document and origin, living in
 /// the page's isolate.
 pub struct FrameRealm {
+    module_realm: deno_core::ManagedJsRealm,
+    /// Shared by the realm's loader and its host-driven evaluation calls so a
+    /// browser capture cannot call a frame quiet between graph fetch and TLA.
+    module_activity: Arc<ModuleLoadActivity>,
     context: deno_core::v8::Global<deno_core::v8::Context>,
     /// Held so the frame's entry can be taken out again when the frame dies.
     realms: Rc<std::cell::RefCell<RealmStates>>,
@@ -50,6 +57,22 @@ pub struct FrameRealm {
     /// Encounter position of the parsed `<body>` in the same ordering domain
     /// as parser script and stylesheet callbacks.
     parser_body_order: Option<usize>,
+    module_evaluations:
+        std::cell::RefCell<std::collections::HashMap<deno_core::ModuleId, Result<(), String>>>,
+    evaluated_module_urls:
+        std::cell::RefCell<std::collections::HashMap<String, Result<(), String>>>,
+    executed_module_scripts: std::cell::RefCell<std::collections::HashSet<u32>>,
+    /// Browser-owned frame documents use the same pausable html5ever parser as
+    /// the top document. Low-level embedders retain the eager constructor for
+    /// compatibility; Page opts into this state through the streaming staged
+    /// constructor below.
+    streaming_document: std::cell::RefCell<Option<FrameStreamingDocument>>,
+    /// Effective sandbox policy for this document generation. Browser-owned
+    /// lifecycle and resource plumbing still execute in the realm; only
+    /// page-authored classic, module, dynamic, and content-handler code is
+    /// disabled.
+    scripts_allowed: bool,
+    document_invalidated: std::cell::Cell<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,9 +91,32 @@ pub struct FrameResourceProbe {
     pub pending_dynamic_scripts: bool,
 }
 
+/// A fetched and instantiated module graph owned by one frame realm.
+/// Evaluation is kept separate so an HTML scheduler can prepare defer/module
+/// graphs during parsing and run them in encounter order after EOF.
+pub struct PreparedFrameModule {
+    module_id: deno_core::ModuleId,
+    description: String,
+    entry_url: Option<String>,
+    graph_modules: Vec<(deno_core::ModuleId, String)>,
+    document_generation: u64,
+}
+
+struct FrameStreamingDocument {
+    parser: Rc<std::cell::RefCell<StreamingDocumentParser>>,
+    source: String,
+}
+
 impl Drop for FrameRealm {
     fn drop(&mut self) {
+        self.invalidate_document_generation();
         self.realms.borrow_mut().forget(&self.context);
+        // Page severs the stable WindowProxy backend before removing a
+        // published frame from its owner list. Staged realms have never been
+        // published. In either case this is the final ownership boundary: stop
+        // polling the old ModuleMap and reclaim its context slots now instead
+        // of retaining every navigated iframe until the page isolate dies.
+        self.module_realm.retire();
     }
 }
 
@@ -128,7 +174,100 @@ impl FrameRealm {
         inherited_origin: Option<&str>,
         html: &str,
     ) -> Option<Self> {
-        let context = parent.create_realm_context()?;
+        Self::new_staged_with_inherited_context_and_script_policy(
+            parent,
+            frame_id,
+            parent_frame_id,
+            url,
+            inherited_base_url,
+            inherited_origin,
+            html,
+            true,
+        )
+    }
+
+    /// Transactional frame construction with the effective iframe sandbox
+    /// scripting policy captured at navigation start. This remains separate
+    /// from origin inheritance: `allow-same-origin` and `allow-scripts` are
+    /// independent sandbox tokens.
+    pub fn new_staged_with_inherited_context_and_script_policy(
+        parent: &mut ObscuraJsRuntime,
+        frame_id: u32,
+        parent_frame_id: u32,
+        url: &str,
+        inherited_base_url: Option<&str>,
+        inherited_origin: Option<&str>,
+        html: &str,
+        scripts_allowed: bool,
+    ) -> Option<Self> {
+        Self::new_staged_impl(
+            parent,
+            frame_id,
+            parent_frame_id,
+            url,
+            inherited_base_url,
+            inherited_origin,
+            html,
+            scripts_allowed,
+            false,
+        )
+    }
+
+    /// Browser document constructor: resource discovery still uses one inert
+    /// full-tree snapshot, but the realm is handed back with an empty live
+    /// `StreamingDocumentParser` tree. Author scripts therefore run at real
+    /// parser pause boundaries and cannot observe source after themselves.
+    pub fn new_streaming_staged_with_inherited_context_and_script_policy(
+        parent: &mut ObscuraJsRuntime,
+        frame_id: u32,
+        parent_frame_id: u32,
+        url: &str,
+        inherited_base_url: Option<&str>,
+        inherited_origin: Option<&str>,
+        html: &str,
+        scripts_allowed: bool,
+    ) -> Option<Self> {
+        Self::new_staged_impl(
+            parent,
+            frame_id,
+            parent_frame_id,
+            url,
+            inherited_base_url,
+            inherited_origin,
+            html,
+            scripts_allowed,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_staged_impl(
+        parent: &mut ObscuraJsRuntime,
+        frame_id: u32,
+        parent_frame_id: u32,
+        url: &str,
+        inherited_base_url: Option<&str>,
+        inherited_origin: Option<&str>,
+        html: &str,
+        scripts_allowed: bool,
+        streaming: bool,
+    ) -> Option<Self> {
+        let mut state = ObscuraState::new();
+        state.dom = Some(parse_html(html));
+        state.url = url.to_string();
+        state.scripting_enabled = scripts_allowed;
+        state.inherited_base_url = inherited_base_url.map(str::to_string);
+        state.inherited_origin = inherited_origin.map(str::to_string);
+        state.frame_id = frame_id;
+        parent.share_resources_with(&mut state);
+        let state = Rc::new(std::cell::RefCell::new(state));
+        let import_map = state.borrow().import_map.clone();
+        let module_loader = Rc::new(ObscuraModuleLoader::with_page_state(
+            url, None, &state, import_map,
+        ));
+        let module_activity = module_loader.activity();
+        let module_realm = parent.create_realm_context(module_loader)?;
+        let context = module_realm.context().clone();
         if !parent.share_ops_with_realm(&context) {
             return None;
         }
@@ -158,22 +297,14 @@ impl FrameRealm {
             }
         }
 
-        let mut state = ObscuraState::new();
-        state.dom = Some(parse_html(html));
-        state.url = url.to_string();
-        state.inherited_base_url = inherited_base_url.map(str::to_string);
-        state.inherited_origin = inherited_origin.map(str::to_string);
-        state.frame_id = frame_id;
-        parent.share_resources_with(&mut state);
-
         let realms = parent.realm_states();
-        realms.borrow_mut().register(
-            context.clone(),
-            frame_id,
-            Rc::new(std::cell::RefCell::new(state)),
-        );
+        realms
+            .borrow_mut()
+            .register(context.clone(), frame_id, state);
 
         let mut realm = FrameRealm {
+            module_realm,
+            module_activity,
             context,
             realms,
             frame_id,
@@ -185,6 +316,12 @@ impl FrameRealm {
             parser_stylesheets: Vec::new(),
             parser_inline_stylesheets: Vec::new(),
             parser_body_order: None,
+            module_evaluations: std::cell::RefCell::new(std::collections::HashMap::new()),
+            evaluated_module_urls: std::cell::RefCell::new(std::collections::HashMap::new()),
+            executed_module_scripts: std::cell::RefCell::new(std::collections::HashSet::new()),
+            streaming_document: std::cell::RefCell::new(None),
+            scripts_allowed,
+            document_invalidated: std::cell::Cell::new(false),
         };
         // Both ids before init, not after: init is what installs `parent` and
         // `top`, and a document that runs even one script believing it is
@@ -195,8 +332,10 @@ impl FrameRealm {
                 &format!(
                     "globalThis.__obscura_frameId = {frame_id};\
                      globalThis.__obscura_parentFrameId = {parent_frame_id};\
+                     globalThis.__obscura_streamingDocumentInit = {streaming};\
                      globalThis.__documentReadyState__ = 'loading';\
-                     globalThis.__obscura_init();"
+                     globalThis.__obscura_init();\
+                     delete globalThis.__obscura_streamingDocumentInit;"
                 ),
             )
             .ok()?;
@@ -204,11 +343,20 @@ impl FrameRealm {
         realm.parser_stylesheets = realm.list_stylesheets(parent).ok()?;
         realm.parser_inline_stylesheets = realm.list_inline_stylesheets(parent).ok()?;
         realm.parser_body_order = realm.list_parser_body_order(parent).ok()?;
-        let parser_nids = realm
-            .parser_scripts
-            .iter()
-            .map(|script| script.nid)
-            .collect::<Vec<_>>();
+        // A streaming realm replaces the inert discovery DOM below. Native
+        // node ids from that snapshot may then collide with a different live
+        // node (including a script created by document.write), so never carry
+        // its already-started ids across the replacement. The streaming loop
+        // marks each real tokenizer-yielded nid immediately before execution.
+        let parser_nids = if streaming {
+            Vec::new()
+        } else {
+            realm
+                .parser_scripts
+                .iter()
+                .map(|script| script.nid)
+                .collect::<Vec<_>>()
+        };
         let parser_stylesheet_markers = realm
             .parser_stylesheets
             .iter()
@@ -236,6 +384,22 @@ impl FrameRealm {
                 ),
             )
             .ok()?;
+        if streaming {
+            let parser = Rc::new(std::cell::RefCell::new(StreamingDocumentParser::new()));
+            let live_dom = parser.borrow().dom().clone();
+            let state = realm.realms.borrow().by_frame_id(frame_id)?;
+            {
+                let mut state = state.borrow_mut();
+                state.dom = Some(live_dom);
+                state.install_streaming_parser(parser.clone());
+            }
+            realm
+                .streaming_document
+                .replace(Some(FrameStreamingDocument {
+                    parser,
+                    source: html.to_string(),
+                }));
+        }
         Some(realm)
     }
 
@@ -280,6 +444,34 @@ impl FrameRealm {
         self.lifecycle.set(FrameLifecycleState::Failed);
     }
 
+    /// Whether this frame's module graph is fetching, evaluating (including
+    /// top-level await), or has just crossed the fetch/evaluation hand-off.
+    /// The short tail prevents capture-ready from observing a false idle slice
+    /// between deno_core module-map turns.
+    pub fn has_pending_module_work(&self) -> bool {
+        self.module_activity
+            .is_pending_or_recent(std::time::Duration::from_millis(100))
+    }
+
+    /// Permanently retire this document generation before its realm is
+    /// detached, replaced, or discarded while staged. Async module futures
+    /// retain the generation they started under and reject their continuation
+    /// once this increments it.
+    pub fn invalidate_document_generation(&self) -> bool {
+        if self.document_invalidated.replace(true) {
+            return false;
+        }
+        self.lifecycle.set(FrameLifecycleState::Failed);
+        let state = self.realms.borrow().by_frame_id(self.frame_id);
+        let Some(state) = state else {
+            return false;
+        };
+        let mut state = state.borrow_mut();
+        state.document_generation = state.document_generation.wrapping_add(1);
+        state.activity_generation = state.activity_generation.wrapping_add(1);
+        true
+    }
+
     /// Finish parsing without claiming that descendant frames and resources
     /// have completed.
     pub fn dispatch_dom_content_loaded(&self, parent: &mut ObscuraJsRuntime) -> Result<(), String> {
@@ -288,8 +480,10 @@ impl FrameRealm {
         }
         self.execute_script(
             parent,
-            "globalThis.__documentReadyState__ = 'interactive';\
-             try { globalThis.__obscura_dispatchDocumentLifecycleEvent('readystatechange'); } catch (_) {}\
+            "if (globalThis.__documentReadyState__ === 'loading') {\
+               globalThis.__documentReadyState__ = 'interactive';\
+               try { globalThis.__obscura_dispatchDocumentLifecycleEvent('readystatechange'); } catch (_) {}\
+             }\
              try { globalThis.__obscura_dispatchDocumentLifecycleEvent('DOMContentLoaded'); } catch (_) {}",
         )?;
         self.lifecycle.set(FrameLifecycleState::DomContentLoaded);
@@ -381,6 +575,11 @@ impl FrameRealm {
         &self.origin
     }
 
+    /// Effective iframe sandbox script policy captured for this document.
+    pub fn scripts_allowed(&self) -> bool {
+        self.scripts_allowed
+    }
+
     /// Absolute URLs fetched from this frame's realm. Frame documents keep
     /// their DOM and request bookkeeping separate from the page realm, so a
     /// page-level asset dump has to aggregate these explicitly.
@@ -413,6 +612,253 @@ impl FrameRealm {
         self.run(parent, source).map(|_| ())
     }
 
+    /// Merge an import map into this frame's independent resolution state.
+    /// Resolutions already observed by this frame remain frozen by
+    /// `ImportMap::merge`; sibling and parent realms have separate maps.
+    pub fn add_import_map(&self, source: &str, base_url: &str) -> Result<(), String> {
+        let map = ImportMap::parse(source, base_url)?;
+        let state = self
+            .realms
+            .borrow()
+            .by_frame_id(self.frame_id)
+            .ok_or_else(|| "frame realm is no longer live".to_string())?;
+        let import_map = state.borrow().import_map.clone();
+        import_map
+            .try_borrow_mut()
+            .map_err(|_| "Frame import map is already borrowed".to_string())?
+            .merge(map);
+        Ok(())
+    }
+
+    /// Fetch and instantiate an external module graph in this frame's
+    /// ModuleMap. `source` may provide an already-fetched entry while static
+    /// descendants and later dynamic imports continue through the frame's
+    /// shared browser HTTP state.
+    pub async fn prepare_external_module(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+        url: &str,
+        source: Option<&str>,
+        budget_ms: u64,
+    ) -> Result<PreparedFrameModule, String> {
+        let document_generation = self.document_generation()?;
+        let (module_id, graph_modules) = parent
+            .load_module_in_realm(&self.module_realm, url, source, false, budget_ms)
+            .await?;
+        self.ensure_document_generation(document_generation)?;
+        Ok(PreparedFrameModule {
+            module_id,
+            description: format!("Frame module {url}"),
+            entry_url: Some(url.to_string()),
+            graph_modules,
+            document_generation,
+        })
+    }
+
+    /// Fetch and instantiate an inline module graph. The document URL remains
+    /// the module's observable base and import.meta URL, matching top-level
+    /// module handling.
+    pub async fn prepare_inline_module(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+        source: &str,
+        base_url: &str,
+        budget_ms: u64,
+    ) -> Result<PreparedFrameModule, String> {
+        let document_generation = self.document_generation()?;
+        let (module_id, graph_modules) = parent
+            .load_module_in_realm(&self.module_realm, base_url, Some(source), true, budget_ms)
+            .await?;
+        self.ensure_document_generation(document_generation)?;
+        Ok(PreparedFrameModule {
+            module_id,
+            description: "Inline frame module".to_string(),
+            entry_url: None,
+            graph_modules,
+            document_generation,
+        })
+    }
+
+    /// Evaluate a prepared graph, including top-level await, while the owning
+    /// runtime polls all managed realms. Duplicate roots reuse their first
+    /// browser-style outcome instead of hitting deno_core's duplicate-eval
+    /// assertion.
+    pub async fn evaluate_prepared_module(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+        prepared: PreparedFrameModule,
+        budget_ms: u64,
+    ) -> Result<(), String> {
+        self.ensure_document_generation(prepared.document_generation)?;
+        if let Some(outcome) = self
+            .module_evaluations
+            .borrow()
+            .get(&prepared.module_id)
+            .cloned()
+        {
+            return outcome;
+        }
+        if let Some(outcome) = prepared
+            .entry_url
+            .as_ref()
+            .and_then(|url| self.evaluated_module_urls.borrow().get(url).cloned())
+        {
+            return outcome;
+        }
+
+        let _evaluation_activity = self.module_activity.begin();
+        let outcome = parent
+            .evaluate_module_in_realm(
+                &self.module_realm,
+                prepared.module_id,
+                budget_ms,
+                &prepared.description,
+            )
+            .await;
+        self.ensure_document_generation(prepared.document_generation)?;
+        self.module_evaluations
+            .borrow_mut()
+            .insert(prepared.module_id, outcome.clone());
+        let has_external_entry = prepared.entry_url.is_some();
+        if let Some(entry_url) = prepared.entry_url {
+            self.evaluated_module_urls
+                .borrow_mut()
+                .insert(entry_url, outcome.clone());
+        }
+        if outcome.is_ok() {
+            for (module_id, specifier) in prepared.graph_modules {
+                self.module_evaluations
+                    .borrow_mut()
+                    .insert(module_id, Ok(()));
+                if module_id != prepared.module_id || has_external_entry {
+                    self.evaluated_module_urls
+                        .borrow_mut()
+                        .insert(specifier, Ok(()));
+                }
+            }
+        }
+        outcome
+    }
+
+    pub async fn load_external_module(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+        url: &str,
+        source: Option<&str>,
+        budget_ms: u64,
+    ) -> Result<(), String> {
+        if let Some(outcome) = self.evaluated_module_urls.borrow().get(url).cloned() {
+            return outcome;
+        }
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(budget_ms);
+        let prepared = self
+            .prepare_external_module(parent, url, source, budget_ms)
+            .await?;
+        let remaining_ms = remaining_budget_ms(deadline).ok_or_else(|| {
+            format!("Frame module {url} exhausted its {budget_ms}ms load+evaluation budget")
+        })?;
+        self.evaluate_prepared_module(parent, prepared, remaining_ms)
+            .await
+    }
+
+    pub async fn load_inline_module(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+        source: &str,
+        base_url: &str,
+        budget_ms: u64,
+    ) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(budget_ms);
+        let prepared = self
+            .prepare_inline_module(parent, source, base_url, budget_ms)
+            .await?;
+        let remaining_ms = remaining_budget_ms(deadline).ok_or_else(|| {
+            format!("Inline frame module exhausted its {budget_ms}ms load+evaluation budget")
+        })?;
+        self.evaluate_prepared_module(parent, prepared, remaining_ms)
+            .await
+    }
+
+    fn document_generation(&self) -> Result<u64, String> {
+        if self.document_invalidated.get() {
+            return Err("frame document is no longer current".to_string());
+        }
+        let state = self
+            .realms
+            .borrow()
+            .by_frame_id(self.frame_id)
+            .ok_or_else(|| "frame realm is no longer live".to_string())?;
+        let generation = state.borrow().document_generation;
+        Ok(generation)
+    }
+
+    fn ensure_document_generation(&self, expected: u64) -> Result<(), String> {
+        if self.document_invalidated.get() {
+            return Err(
+                "frame document was replaced while its module graph was loading".to_string(),
+            );
+        }
+        let current = self.document_generation()?;
+        if current == expected {
+            Ok(())
+        } else {
+            Err("frame document was replaced while its module graph was loading".to_string())
+        }
+    }
+
+    /// A parser continuation is stale not only when a navigation increments
+    /// the native generation, but also as soon as its owner (or an ancestor
+    /// owner) leaves the composed tree. Page performs the same check at the
+    /// transaction boundary; streaming parsing needs it between script pauses
+    /// so a first script cannot detach the iframe and let later source run.
+    fn ensure_streaming_document_is_current(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+        expected_generation: u64,
+    ) -> Result<(), String> {
+        self.ensure_document_generation(expected_generation)?;
+
+        let mut child_frame_id = self.frame_id;
+        let mut owner_frame_id = self.parent_frame_id;
+        loop {
+            let expression = format!(
+                "({{live:globalThis.__obscura_frameOwnerIsLive({child_frame_id}),\
+                   parentFrameId:(globalThis.__obscura_parentFrameId || 0) >>> 0}})"
+            );
+            let value = if owner_frame_id == 0 {
+                parent.evaluate_host_probe(&expression)?
+            } else {
+                let owner_context = self
+                    .realms
+                    .borrow()
+                    .context_by_frame_id(owner_frame_id)
+                    .ok_or_else(|| format!("frame owner realm {owner_frame_id} disappeared"))?;
+                parent.eval_json_in_realm(&owner_context, &expression)?
+            };
+            let live = value
+                .get("live")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| {
+                    format!("frame owner liveness probe in realm {owner_frame_id} was invalid")
+                })?;
+            if !live {
+                self.invalidate_document_generation();
+                return Err("frame document was detached while parser work was pending".to_string());
+            }
+            if owner_frame_id == 0 {
+                return Ok(());
+            }
+            child_frame_id = owner_frame_id;
+            owner_frame_id = value
+                .get("parentFrameId")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| {
+                    format!("frame owner ancestry probe in realm {child_frame_id} was invalid")
+                })?;
+        }
+    }
+
     /// Installs a CDP Runtime binding in this realm while keeping the native
     /// op table outside the frame's global object.
     pub fn install_cdp_binding(
@@ -439,8 +885,8 @@ impl FrameRealm {
     /// the page. One script throwing does not stop the ones after it, matching
     /// how a browser treats separate classic scripts.
     ///
-    /// Module scripts are skipped and reported: they need the frame's own module
-    /// loader, which is not wired up yet.
+    /// Module and import-map scripts are handled by
+    /// [`Self::run_document_modules`] after the parser/classic pass.
     ///
     /// Returns one message per script that failed or was skipped.
     pub fn run_document_scripts(
@@ -455,6 +901,27 @@ impl FrameRealm {
         )
     }
 
+    fn ordered_parser_stylesheet_events(
+        &self,
+        events: &mut std::collections::BTreeMap<u32, String>,
+    ) -> std::collections::VecDeque<(usize, String)> {
+        let mut ordered = self
+            .parser_stylesheets
+            .iter()
+            .map(|stylesheet| (stylesheet.nid, stylesheet.parser_order))
+            .chain(
+                self.parser_inline_stylesheets
+                    .iter()
+                    .map(|stylesheet| (stylesheet.nid, stylesheet.parser_order)),
+            )
+            .filter_map(|(nid, parser_order)| {
+                events.remove(&nid).map(|source| (parser_order, source))
+            })
+            .collect::<Vec<_>>();
+        ordered.sort_by_key(|(parser_order, _)| *parser_order);
+        std::collections::VecDeque::from(ordered)
+    }
+
     /// Frame parser runner with already-fetched stylesheet completions keyed
     /// by the stable native node id of their owner link. The CSS bytes may be
     /// ready before parsing, but installation and load/error dispatch happen
@@ -467,18 +934,7 @@ impl FrameRealm {
     ) -> Vec<String> {
         let scripts = &self.parser_scripts;
 
-        let mut stylesheet_events = self
-            .parser_stylesheets
-            .iter()
-            .into_iter()
-            .filter_map(|stylesheet| {
-                stylesheet_events
-                    .remove(&stylesheet.nid)
-                    .map(|source| (stylesheet.parser_order, source))
-            })
-            .collect::<Vec<_>>();
-        stylesheet_events.sort_by_key(|(order, _)| *order);
-        let mut stylesheet_events = std::collections::VecDeque::from(stylesheet_events);
+        let mut stylesheet_events = self.ordered_parser_stylesheet_events(&mut stylesheet_events);
 
         let mut problems = Vec::new();
         let mut body_load_handler_installed = false;
@@ -512,13 +968,10 @@ impl FrameRealm {
                 }
                 body_load_handler_installed = true;
             }
+            if !self.scripts_allowed {
+                continue;
+            }
             if !script.is_classic() {
-                if script.type_attribute == "module" {
-                    problems.push(format!(
-                        "frame module script {index} skipped: not supported"
-                    ));
-                    self.dispatch_parser_script_event(parent, script.nid, "error");
-                }
                 continue;
             }
 
@@ -580,6 +1033,619 @@ impl FrameRealm {
         problems
     }
 
+    /// Execute the complete parser script set, including import maps and ES
+    /// modules, against this frame's managed realm.
+    ///
+    /// Module graphs are prepared at their encounter point, which freezes the
+    /// import-map rules visible to that graph. Ordinary module scripts defer
+    /// evaluation until the parser pass is complete; `async` modules evaluate
+    /// as soon as their graph is ready. External classic and module entry
+    /// sources may be supplied from the page transport so resource archiving
+    /// does not need a second request.
+    pub async fn run_document_scripts_and_modules_with_stylesheet_events(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+        load_external: impl Fn(&str) -> Option<String>,
+        mut stylesheet_events: std::collections::BTreeMap<u32, String>,
+        module_budget_ms: u64,
+    ) -> Vec<String> {
+        let has_streaming_document = self.streaming_document.borrow().is_some();
+        if has_streaming_document {
+            return self
+                .run_streaming_document_scripts_and_modules(
+                    parent,
+                    &load_external,
+                    stylesheet_events,
+                    module_budget_ms,
+                )
+                .await;
+        }
+        let document_generation = match self.document_generation() {
+            Ok(generation) => generation,
+            Err(error) => return vec![error],
+        };
+        let mut stylesheet_events = self.ordered_parser_stylesheet_events(&mut stylesheet_events);
+        let mut deferred_modules = Vec::new();
+        let mut problems = Vec::new();
+        let mut body_load_handler_installed = false;
+
+        for (index, script) in self.parser_scripts.iter().enumerate() {
+            while stylesheet_events
+                .front()
+                .is_some_and(|(order, _)| *order < script.parser_order)
+            {
+                let (order, source) = stylesheet_events.pop_front().unwrap();
+                if !body_load_handler_installed
+                    && self
+                        .parser_body_order
+                        .is_some_and(|body_order| body_order < order)
+                {
+                    if let Err(error) = self.install_parsed_body_load_handler(parent) {
+                        problems.push(format!("frame body load handler setup failed: {error}"));
+                    }
+                    body_load_handler_installed = true;
+                }
+                if let Err(error) = self.execute_script(parent, &source) {
+                    problems.push(format!("frame parser stylesheet event failed: {error}"));
+                }
+            }
+            if !body_load_handler_installed
+                && self
+                    .parser_body_order
+                    .is_some_and(|body_order| body_order < script.parser_order)
+            {
+                if let Err(error) = self.install_parsed_body_load_handler(parent) {
+                    problems.push(format!("frame body load handler setup failed: {error}"));
+                }
+                body_load_handler_installed = true;
+            }
+
+            if !self.scripts_allowed {
+                continue;
+            }
+
+            if script.type_attribute == "importmap" {
+                let result = if script.src.is_empty() {
+                    self.add_import_map(&script.text, &script.base_url)
+                } else {
+                    Err("external import maps are not supported".to_string())
+                };
+                if let Err(error) = result {
+                    problems.push(format!("frame import map {index} failed: {error}"));
+                    self.dispatch_parser_script_event(parent, script.nid, "error");
+                }
+                continue;
+            }
+
+            if script.type_attribute == "module" {
+                let external = !script.src.is_empty();
+                let prepared = if external {
+                    let resolved = self
+                        .resolve_from(url::Url::parse(&script.base_url).ok().as_ref(), &script.src);
+                    let source = load_external(&resolved);
+                    self.prepare_external_module(
+                        parent,
+                        &resolved,
+                        source.as_deref(),
+                        module_budget_ms,
+                    )
+                    .await
+                } else {
+                    self.prepare_inline_module(
+                        parent,
+                        &script.text,
+                        &script.base_url,
+                        module_budget_ms,
+                    )
+                    .await
+                };
+                if let Err(error) = self.ensure_document_generation(document_generation) {
+                    problems.push(error);
+                    return problems;
+                }
+
+                match prepared {
+                    Ok(prepared) if script.async_attribute => {
+                        let result = self
+                            .evaluate_prepared_module(parent, prepared, module_budget_ms)
+                            .await;
+                        if let Err(error) = self.ensure_document_generation(document_generation) {
+                            problems.push(error);
+                            return problems;
+                        }
+                        self.executed_module_scripts.borrow_mut().insert(script.nid);
+                        match result {
+                            Ok(()) => self.dispatch_parser_script_event(parent, script.nid, "load"),
+                            Err(error) => {
+                                problems
+                                    .push(format!("frame async module {index} failed: {error}"));
+                                self.dispatch_parser_script_event(parent, script.nid, "error");
+                            }
+                        }
+                    }
+                    Ok(prepared) => deferred_modules.push((index, script.nid, prepared)),
+                    Err(error) => {
+                        self.executed_module_scripts.borrow_mut().insert(script.nid);
+                        problems.push(format!("frame module {index} failed: {error}"));
+                        self.dispatch_parser_script_event(parent, script.nid, "error");
+                    }
+                }
+                continue;
+            }
+
+            if !script.is_classic() {
+                continue;
+            }
+            let external = !script.src.is_empty();
+            let (name, source) = if external {
+                let resolved =
+                    self.resolve_from(url::Url::parse(&script.base_url).ok().as_ref(), &script.src);
+                match load_external(&resolved) {
+                    Some(source) => (resolved, source),
+                    None => {
+                        problems.push(format!("frame script {resolved} could not be loaded"));
+                        self.dispatch_parser_script_event(parent, script.nid, "error");
+                        continue;
+                    }
+                }
+            } else {
+                (format!("inline {index}"), script.text.clone())
+            };
+            if source.trim().is_empty() {
+                if external {
+                    self.dispatch_parser_script_event(parent, script.nid, "load");
+                }
+                continue;
+            }
+            let _ = self.execute_script(
+                parent,
+                &format!("globalThis.__currentScriptNid={};", script.nid),
+            );
+            if let Err(error) = self.execute_script(parent, &source) {
+                problems.push(format!("frame script {name} failed: {error}"));
+            }
+            let _ = self.execute_script(parent, "globalThis.__currentScriptNid=0;");
+            if external {
+                self.dispatch_parser_script_event(parent, script.nid, "load");
+            }
+        }
+
+        while let Some((order, source)) = stylesheet_events.pop_front() {
+            if !body_load_handler_installed
+                && self
+                    .parser_body_order
+                    .is_some_and(|body_order| body_order < order)
+            {
+                if let Err(error) = self.install_parsed_body_load_handler(parent) {
+                    problems.push(format!("frame body load handler setup failed: {error}"));
+                }
+                body_load_handler_installed = true;
+            }
+            if let Err(error) = self.execute_script(parent, &source) {
+                problems.push(format!("frame parser stylesheet event failed: {error}"));
+            }
+        }
+        if !body_load_handler_installed {
+            if let Err(error) = self.install_parsed_body_load_handler(parent) {
+                problems.push(format!("frame body load handler setup failed: {error}"));
+            }
+        }
+
+        for (index, nid, prepared) in deferred_modules {
+            let result = self
+                .evaluate_prepared_module(parent, prepared, module_budget_ms)
+                .await;
+            if let Err(error) = self.ensure_document_generation(document_generation) {
+                problems.push(error);
+                return problems;
+            }
+            self.executed_module_scripts.borrow_mut().insert(nid);
+            match result {
+                Ok(()) => self.dispatch_parser_script_event(parent, nid, "load"),
+                Err(error) => {
+                    problems.push(format!("frame module {index} failed: {error}"));
+                    self.dispatch_parser_script_event(parent, nid, "error");
+                }
+            }
+        }
+        problems
+    }
+
+    /// Drive the child document's live tokenizer and execute parser work at
+    /// html5ever's real `TokenizerResult::Script` boundary. The complete
+    /// response is already decoded by the iframe fetch shim, but remains only
+    /// buffered tokenizer input: source after a blocking script is not added to
+    /// the DOM until this method resumes the parser.
+    async fn run_streaming_document_scripts_and_modules<F>(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+        load_external: &F,
+        mut stylesheet_events: std::collections::BTreeMap<u32, String>,
+        module_budget_ms: u64,
+    ) -> Vec<String>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let document_generation = match self.document_generation() {
+            Ok(generation) => generation,
+            Err(error) => return vec![error],
+        };
+        if let Err(error) = self.ensure_streaming_document_is_current(parent, document_generation) {
+            return vec![error];
+        }
+        let Some(mut document) = self.streaming_document.borrow_mut().take() else {
+            return vec!["frame streaming parser was already consumed".to_string()];
+        };
+        let mut stylesheet_events = self.ordered_parser_stylesheet_events(&mut stylesheet_events);
+        let mut deferred_classics = Vec::new();
+        let mut deferred_modules = Vec::new();
+        let mut problems = Vec::new();
+        let mut body_load_handler_installed = false;
+        let mut script_cursor = 0usize;
+        // Keep the response buffer separate from the parser borrow. Besides
+        // satisfying Rust's aliasing rules, this makes the ownership model
+        // explicit: bytes remain buffered input until `resume` exposes them.
+        let source = std::mem::take(&mut document.source);
+        let mut parser_state = document.parser.borrow_mut().feed(&source);
+
+        loop {
+            // Enrol only resources exposed by the tokenizer so far. The JS
+            // helper is weak-set guarded, which makes this safe at every pause
+            // while preserving encounter-before-script timing.
+            if let Err(error) = self.execute_script(
+                parent,
+                "globalThis.__obscura_startParserCreatedResources();",
+            ) {
+                problems.push(format!("frame parser resource sweep failed: {error}"));
+            }
+            if let Err(error) =
+                self.ensure_streaming_document_is_current(parent, document_generation)
+            {
+                problems.push(error);
+                return problems;
+            }
+            match parser_state {
+                ParserYield::NeedInput => parser_state = document.parser.borrow_mut().finish(),
+                ParserYield::Finished => break,
+                ParserYield::Script(nid) => {
+                    let index = script_cursor;
+                    script_cursor = script_cursor.saturating_add(1);
+                    let Some(mut script) = self.parser_scripts.get(index).cloned() else {
+                        problems.push(format!(
+                            "frame parser yielded unexpected script node {}",
+                            nid.raw(),
+                        ));
+                        parser_state = document.parser.borrow_mut().resume();
+                        continue;
+                    };
+                    // Discovery happens on an inert full-tree clone before the
+                    // live parser starts. Preloads may allocate native nodes in
+                    // between, so encounter order is stable but arena ids are
+                    // not. The tokenizer's id is authoritative for currentScript
+                    // and load/error dispatch.
+                    script.nid = nid.raw();
+                    let _ = self.execute_script(
+                        parent,
+                        &format!("globalThis.__markParserScripts([{}]);", script.nid),
+                    );
+
+                    while stylesheet_events
+                        .front()
+                        .is_some_and(|(order, _)| *order < script.parser_order)
+                    {
+                        let (order, source) = stylesheet_events.pop_front().unwrap();
+                        if !body_load_handler_installed
+                            && self
+                                .parser_body_order
+                                .is_some_and(|body_order| body_order < order)
+                        {
+                            if let Err(error) = self.install_parsed_body_load_handler(parent) {
+                                problems
+                                    .push(format!("frame body load handler setup failed: {error}"));
+                            }
+                            body_load_handler_installed = true;
+                        }
+                        if let Err(error) = self.execute_script(parent, &source) {
+                            problems.push(format!("frame parser stylesheet event failed: {error}"));
+                        }
+                        if let Err(error) =
+                            self.ensure_streaming_document_is_current(parent, document_generation)
+                        {
+                            problems.push(error);
+                            return problems;
+                        }
+                    }
+                    if !body_load_handler_installed
+                        && self
+                            .parser_body_order
+                            .is_some_and(|body_order| body_order < script.parser_order)
+                    {
+                        if let Err(error) = self.install_parsed_body_load_handler(parent) {
+                            problems.push(format!("frame body load handler setup failed: {error}"));
+                        }
+                        body_load_handler_installed = true;
+                    }
+
+                    if self.scripts_allowed {
+                        if script.type_attribute == "importmap" {
+                            let result = if script.src.is_empty() {
+                                self.add_import_map(&script.text, &script.base_url)
+                            } else {
+                                Err("external import maps are not supported".to_string())
+                            };
+                            if let Err(error) = result {
+                                problems.push(format!("frame import map {index} failed: {error}"));
+                                self.dispatch_parser_script_event(parent, script.nid, "error");
+                            }
+                        } else if script.type_attribute == "module" {
+                            let external = !script.src.is_empty();
+                            let prepared = if external {
+                                let resolved = self.resolve_from(
+                                    url::Url::parse(&script.base_url).ok().as_ref(),
+                                    &script.src,
+                                );
+                                let source = load_external(&resolved);
+                                self.prepare_external_module(
+                                    parent,
+                                    &resolved,
+                                    source.as_deref(),
+                                    module_budget_ms,
+                                )
+                                .await
+                            } else {
+                                self.prepare_inline_module(
+                                    parent,
+                                    &script.text,
+                                    &script.base_url,
+                                    module_budget_ms,
+                                )
+                                .await
+                            };
+                            if let Err(error) = self
+                                .ensure_streaming_document_is_current(parent, document_generation)
+                            {
+                                problems.push(error);
+                                return problems;
+                            }
+                            match prepared {
+                                Ok(prepared) if script.async_attribute => {
+                                    let result = self
+                                        .evaluate_prepared_module(
+                                            parent,
+                                            prepared,
+                                            module_budget_ms,
+                                        )
+                                        .await;
+                                    if let Err(error) = self.ensure_streaming_document_is_current(
+                                        parent,
+                                        document_generation,
+                                    ) {
+                                        problems.push(error);
+                                        return problems;
+                                    }
+                                    self.executed_module_scripts.borrow_mut().insert(script.nid);
+                                    match result {
+                                        Ok(()) => self.dispatch_parser_script_event(
+                                            parent, script.nid, "load",
+                                        ),
+                                        Err(error) => {
+                                            problems.push(format!(
+                                                "frame async module {index} failed: {error}"
+                                            ));
+                                            self.dispatch_parser_script_event(
+                                                parent, script.nid, "error",
+                                            );
+                                        }
+                                    }
+                                }
+                                Ok(prepared) => {
+                                    deferred_modules.push((index, script.nid, prepared))
+                                }
+                                Err(error) => {
+                                    self.executed_module_scripts.borrow_mut().insert(script.nid);
+                                    problems.push(format!("frame module {index} failed: {error}"));
+                                    self.dispatch_parser_script_event(parent, script.nid, "error");
+                                }
+                            }
+                        } else if script.is_classic() {
+                            // defer is meaningful only on external classic
+                            // scripts; async wins when both attributes exist.
+                            if !script.src.is_empty()
+                                && script.defer_attribute
+                                && !script.async_attribute
+                            {
+                                deferred_classics.push((index, script));
+                            } else {
+                                if !self.execute_streaming_classic(
+                                    parent,
+                                    index,
+                                    &script,
+                                    load_external,
+                                    document_generation,
+                                    &mut problems,
+                                ) {
+                                    return problems;
+                                }
+                            }
+                        }
+                    }
+                    if let Err(error) =
+                        self.ensure_streaming_document_is_current(parent, document_generation)
+                    {
+                        problems.push(error);
+                        return problems;
+                    }
+                    parser_state = document.parser.borrow_mut().resume();
+                }
+            }
+        }
+
+        while let Some((order, source)) = stylesheet_events.pop_front() {
+            if !body_load_handler_installed
+                && self
+                    .parser_body_order
+                    .is_some_and(|body_order| body_order < order)
+            {
+                if let Err(error) = self.install_parsed_body_load_handler(parent) {
+                    problems.push(format!("frame body load handler setup failed: {error}"));
+                }
+                body_load_handler_installed = true;
+            }
+            if let Err(error) = self.execute_script(parent, &source) {
+                problems.push(format!("frame parser stylesheet event failed: {error}"));
+            }
+            if let Err(error) =
+                self.ensure_streaming_document_is_current(parent, document_generation)
+            {
+                problems.push(error);
+                return problems;
+            }
+        }
+        if !body_load_handler_installed {
+            if let Err(error) = self.install_parsed_body_load_handler(parent) {
+                problems.push(format!("frame body load handler setup failed: {error}"));
+            }
+        }
+
+        // The realm was initialised against the live empty tree at commit.
+        // Enrol parser-created resources now that EOF made them visible, then
+        // perform the parser-complete ready-state transition before defer and
+        // ordinary module evaluation. DOMContentLoaded itself remains owned by
+        // the parent frame driver after those scripts settle.
+        if let Err(error) = self.execute_script(
+            parent,
+            "globalThis.__obscura_startParserCreatedResources();\
+             if (globalThis.__documentReadyState__ === 'loading') {\
+               globalThis.__documentReadyState__ = 'interactive';\
+               try { globalThis.__obscura_dispatchDocumentLifecycleEvent('readystatechange'); } catch (_) {}\
+             }",
+        ) {
+            problems.push(format!("frame parser EOF transition failed: {error}"));
+        }
+        if let Err(error) = self.ensure_streaming_document_is_current(parent, document_generation) {
+            problems.push(error);
+            return problems;
+        }
+
+        if self.scripts_allowed {
+            for (index, script) in deferred_classics {
+                if !self.execute_streaming_classic(
+                    parent,
+                    index,
+                    &script,
+                    load_external,
+                    document_generation,
+                    &mut problems,
+                ) {
+                    return problems;
+                }
+                if let Err(error) =
+                    self.ensure_streaming_document_is_current(parent, document_generation)
+                {
+                    problems.push(error);
+                    return problems;
+                }
+            }
+            for (index, nid, prepared) in deferred_modules {
+                let result = self
+                    .evaluate_prepared_module(parent, prepared, module_budget_ms)
+                    .await;
+                if let Err(error) =
+                    self.ensure_streaming_document_is_current(parent, document_generation)
+                {
+                    problems.push(error);
+                    return problems;
+                }
+                self.executed_module_scripts.borrow_mut().insert(nid);
+                match result {
+                    Ok(()) => self.dispatch_parser_script_event(parent, nid, "load"),
+                    Err(error) => {
+                        problems.push(format!("frame module {index} failed: {error}"));
+                        self.dispatch_parser_script_event(parent, nid, "error");
+                    }
+                }
+            }
+        }
+        if let Some(state) = self.realms.borrow().by_frame_id(self.frame_id) {
+            state.borrow_mut().clear_streaming_parser();
+        }
+        problems
+    }
+
+    fn execute_streaming_classic<F>(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+        index: usize,
+        script: &DocumentScript,
+        load_external: &F,
+        document_generation: u64,
+        problems: &mut Vec<String>,
+    ) -> bool
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let external = !script.src.is_empty();
+        let (name, source) = if external {
+            let resolved =
+                self.resolve_from(url::Url::parse(&script.base_url).ok().as_ref(), &script.src);
+            let loaded = load_external(&resolved);
+            if let Err(error) =
+                self.ensure_streaming_document_is_current(parent, document_generation)
+            {
+                problems.push(error);
+                return false;
+            }
+            match loaded {
+                Some(source) => (resolved, source),
+                None => {
+                    problems.push(format!("frame script {resolved} could not be loaded"));
+                    self.dispatch_parser_script_event(parent, script.nid, "error");
+                    return match self
+                        .ensure_streaming_document_is_current(parent, document_generation)
+                    {
+                        Ok(()) => true,
+                        Err(error) => {
+                            problems.push(error);
+                            false
+                        }
+                    };
+                }
+            }
+        } else {
+            (format!("inline {index}"), script.text.clone())
+        };
+        if source.trim().is_empty() {
+            if external {
+                self.dispatch_parser_script_event(parent, script.nid, "load");
+            }
+            return match self.ensure_streaming_document_is_current(parent, document_generation) {
+                Ok(()) => true,
+                Err(error) => {
+                    problems.push(error);
+                    false
+                }
+            };
+        }
+        let _ = self.execute_script(
+            parent,
+            &format!("globalThis.__currentScriptNid={};", script.nid),
+        );
+        if let Err(error) = self.execute_script(parent, &source) {
+            problems.push(format!("frame script {name} failed: {error}"));
+        }
+        let _ = self.execute_script(parent, "globalThis.__currentScriptNid=0;");
+        if external {
+            self.dispatch_parser_script_event(parent, script.nid, "load");
+        }
+        match self.ensure_streaming_document_is_current(parent, document_generation) {
+            Ok(()) => true,
+            Err(error) => {
+                problems.push(error);
+                false
+            }
+        }
+    }
+
     fn install_parsed_body_load_handler(
         &self,
         parent: &mut ObscuraJsRuntime,
@@ -612,9 +1678,27 @@ impl FrameRealm {
     /// anything, because `run_document_scripts` resolves sources synchronously.
     pub fn external_script_urls(&self, parent: &mut ObscuraJsRuntime) -> Vec<String> {
         let _ = parent;
+        if !self.scripts_allowed {
+            return Vec::new();
+        }
         self.parser_scripts
             .iter()
             .filter(|script| script.is_classic() && !script.src.is_empty())
+            .map(|script| {
+                self.resolve_from(url::Url::parse(&script.base_url).ok().as_ref(), &script.src)
+            })
+            .collect()
+    }
+
+    /// Absolute entry URLs for parser-owned external module scripts. Static
+    /// descendants remain the managed realm loader's responsibility.
+    pub fn external_module_urls(&self) -> Vec<String> {
+        if !self.scripts_allowed {
+            return Vec::new();
+        }
+        self.parser_scripts
+            .iter()
+            .filter(|script| script.type_attribute == "module" && !script.src.is_empty())
             .map(|script| {
                 self.resolve_from(url::Url::parse(&script.base_url).ok().as_ref(), &script.src)
             })
@@ -733,15 +1817,19 @@ impl FrameRealm {
     /// styles are excluded: they represent a linked/imported owner elsewhere
     /// in the DOM and treating them as new author sheets would fetch an
     /// `@import` twice and disturb cascade order.
-    pub fn parser_inline_stylesheet_sources(&self) -> Vec<(usize, String, String, String)> {
+    pub fn parser_inline_stylesheet_sources(
+        &self,
+    ) -> Vec<(usize, u32, String, String, String, usize)> {
         self.parser_inline_stylesheets
             .iter()
             .map(|stylesheet| {
                 (
                     stylesheet.author_index,
+                    stylesheet.nid,
                     stylesheet.text.clone(),
                     stylesheet.media.clone(),
                     stylesheet.base_url.clone(),
+                    stylesheet.parser_order,
                 )
             })
             .collect()
@@ -794,9 +1882,9 @@ impl FrameRealm {
         })
     }
 
-    /// Number of module scripts still present in this live frame. Frame module
-    /// execution is not wired up yet, so callers use this to mark a resource
-    /// archive incomplete instead of silently claiming full coverage.
+    /// Number of module scripts still present but not evaluated in this live
+    /// frame. A sandboxed document deliberately reports zero: its module
+    /// elements are inert by policy rather than unsupported archive work.
     pub fn unsupported_module_script_count(&self, parent: &mut ObscuraJsRuntime) -> usize {
         self.try_unsupported_module_script_count(parent)
             .unwrap_or_default()
@@ -806,10 +1894,16 @@ impl FrameRealm {
         &self,
         parent: &mut ObscuraJsRuntime,
     ) -> Result<usize, String> {
+        if !self.scripts_allowed {
+            return Ok(0);
+        }
         Ok(self
             .list_scripts(parent)?
             .iter()
-            .filter(|script| script.type_attribute == "module")
+            .filter(|script| {
+                script.type_attribute == "module"
+                    && !self.executed_module_scripts.borrow().contains(&script.nid)
+            })
             .count())
     }
 
@@ -1025,6 +2119,8 @@ impl FrameRealm {
                       src: node.getAttribute('src') || '',
                       type: (node.getAttribute('type') || '').toLowerCase(),
                       text: node.textContent || '',
+                      async: node.hasAttribute('async'),
+                      defer: node.hasAttribute('defer'),
                       baseUrl: activeBase,
                       parserOrder: order,
                     }});
@@ -1113,7 +2209,10 @@ impl FrameRealm {
                   let foundBase = false;
                   let authorIndex = 0;
                   const stylesheets = [];
-                  const parserNodes = document.querySelectorAll('base[href],style');
+                  let parserOrder = 0;
+                  const parserNodes = document.querySelectorAll(
+                    'base[href],body,script,link[rel~="stylesheet"],style'
+                  );
                   for (const node of parserNodes) {{
                     if (node.localName === 'base') {{
                       if (!foundBase) {{
@@ -1123,6 +2222,8 @@ impl FrameRealm {
                       }}
                       continue;
                     }}
+                    const order = parserOrder++;
+                    if (node.localName !== 'style') continue;
                     if (node.hasAttribute('data-obscura-adopted')
                         || node.hasAttribute('data-obscura-linked')
                         || node.hasAttribute('data-obscura-external-stylesheets')
@@ -1132,9 +2233,11 @@ impl FrameRealm {
                     if (type && type !== 'text/css') continue;
                     stylesheets.push({{
                       authorIndex: authorIndex++,
+                      nid: node._nid,
                       text: node.textContent || '',
                       media: node.getAttribute('media') || '',
                       baseUrl: activeBase,
+                      parserOrder: order,
                     }});
                   }}
                   return stylesheets;
@@ -1176,13 +2279,28 @@ impl FrameRealm {
     }
 }
 
-#[derive(serde::Deserialize)]
+fn remaining_budget_ms(deadline: tokio::time::Instant) -> Option<u64> {
+    let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
+    if remaining.is_zero() {
+        return None;
+    }
+    let millis = remaining
+        .as_millis()
+        .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0));
+    Some(millis.min(u128::from(u64::MAX)) as u64)
+}
+
+#[derive(Clone, serde::Deserialize)]
 struct DocumentScript {
     nid: u32,
     src: String,
     #[serde(rename = "type")]
     type_attribute: String,
     text: String,
+    #[serde(rename = "async")]
+    async_attribute: bool,
+    #[serde(rename = "defer")]
+    defer_attribute: bool,
     #[serde(rename = "baseUrl")]
     base_url: String,
     #[serde(rename = "parserOrder")]
@@ -1208,10 +2326,13 @@ struct DocumentStylesheet {
 struct DocumentInlineStylesheet {
     #[serde(rename = "authorIndex")]
     author_index: usize,
+    nid: u32,
     text: String,
     media: String,
     #[serde(rename = "baseUrl")]
     base_url: String,
+    #[serde(rename = "parserOrder")]
+    parser_order: usize,
 }
 
 impl DocumentScript {
@@ -1253,12 +2374,569 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
+    fn spawn_frame_module_server(expected_requests: usize) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..expected_requests {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let length = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..length]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/");
+                let (status, body) = match path {
+                    "/dep.js" => ("200 OK", "export const value = 'static';"),
+                    "/dynamic.js" => ("200 OK", "export const value = 'dynamic';"),
+                    _ => ("404 Not Found", "not found"),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\n\
+                     Content-Type: application/javascript\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn install_local_module_client(runtime: &ObscuraJsRuntime) {
+        let jar = std::sync::Arc::new(obscura_net::CookieJar::new());
+        runtime.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(jar, None, true),
+        ));
+    }
+
     fn page(url: &str, html: &str) -> ObscuraJsRuntime {
         let mut runtime = ObscuraJsRuntime::new();
         runtime.set_dom(parse_html(html));
         runtime.set_url(url);
         runtime.run_page_init();
         runtime
+    }
+
+    fn streaming_frame(
+        parent: &mut ObscuraJsRuntime,
+        html: &str,
+        scripts_allowed: bool,
+    ) -> FrameRealm {
+        FrameRealm::new_streaming_staged_with_inherited_context_and_script_policy(
+            parent,
+            1,
+            0,
+            "https://child.example/frame.html",
+            None,
+            None,
+            html,
+            scripts_allowed,
+        )
+        .expect("streaming frame realm")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn streaming_frame_blocking_script_cannot_see_parser_tail() {
+        let mut parent = page(
+            "https://parent.example/",
+            "<html><body><iframe></iframe></body></html>",
+        );
+        let frame = streaming_frame(
+            &mut parent,
+            concat!(
+                "<!doctype html><html><body>",
+                "<script>globalThis.__tailAtPause = document.getElementById('tail') !== null;</script>",
+                "<div id='tail'>after script</div>",
+                "</body></html>",
+            ),
+            true,
+        );
+
+        let problems = frame
+            .run_document_scripts_and_modules_with_stylesheet_events(
+                &mut parent,
+                |_| None,
+                std::collections::BTreeMap::new(),
+                1_000,
+            )
+            .await;
+
+        assert!(problems.is_empty(), "unexpected problems: {problems:?}");
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "[globalThis.__tailAtPause, document.getElementById('tail')?.textContent]",
+                )
+                .unwrap(),
+            serde_json::json!([false, "after script"]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn streaming_frame_document_write_splices_primary_tokenizer_recursively() {
+        let mut parent = page(
+            "https://parent.example/",
+            "<html><body><iframe></iframe></body></html>",
+        );
+        let frame = streaming_frame(
+            &mut parent,
+            concat!(
+                "<!doctype html><html><body>",
+                "<script>",
+                "globalThis.__writeOrder=['outer-before'];",
+                "document.write('<script>__writeOrder.push(\\\"nested\\\");",
+                "document.write(\\\"<span id=written>inserted</span>\\\");<\\/script>');",
+                "__writeOrder.push('outer-after');",
+                "</script>",
+                "<script>__writeOrder.push(document.getElementById('source-tail')?'tail-seen':'tail-hidden');</script>",
+                "<div id='source-tail'>tail</div>",
+                "</body></html>",
+            ),
+            true,
+        );
+
+        let problems = frame
+            .run_document_scripts_and_modules_with_stylesheet_events(
+                &mut parent,
+                |_| None,
+                std::collections::BTreeMap::new(),
+                1_000,
+            )
+            .await;
+
+        assert!(problems.is_empty(), "unexpected problems: {problems:?}");
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "[globalThis.__writeOrder, document.getElementById('written')?.textContent, !!document.getElementById('source-tail')]",
+                )
+                .unwrap(),
+            serde_json::json!([
+                ["outer-before", "nested", "outer-after", "tail-hidden"],
+                "inserted",
+                true,
+            ]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn streaming_frame_external_defer_runs_at_eof_in_encounter_order() {
+        let mut parent = page(
+            "https://parent.example/",
+            "<html><body><iframe></iframe></body></html>",
+        );
+        let frame = streaming_frame(
+            &mut parent,
+            concat!(
+                "<!doctype html><html><body>",
+                "<script>globalThis.__streamOrder = [];globalThis.__streamReady = [];",
+                "document.addEventListener('readystatechange',()=>__streamReady.push(document.readyState));",
+                "document.addEventListener('DOMContentLoaded',()=>__streamReady.push('dcl:'+document.readyState));</script>",
+                "<script defer src='/first.js'></script>",
+                "<script>__streamOrder.push('blocking:' + (document.getElementById('tail') !== null));</script>",
+                "<span id='tail'></span>",
+                "<script defer src='/second.js'></script>",
+                "</body></html>",
+            ),
+            true,
+        );
+
+        let problems = frame
+            .run_document_scripts_and_modules_with_stylesheet_events(
+                &mut parent,
+                |url| {
+                    if url.ends_with("/first.js") {
+                        Some(
+                            "__streamOrder.push('first:' + document.readyState + ':' + (document.getElementById('tail') !== null));"
+                                .to_string(),
+                        )
+                    } else if url.ends_with("/second.js") {
+                        Some(
+                            "__streamOrder.push('second:' + document.readyState + ':' + (document.getElementById('tail') !== null));"
+                                .to_string(),
+                        )
+                    } else {
+                        None
+                    }
+                },
+                std::collections::BTreeMap::new(),
+                1_000,
+            )
+            .await;
+
+        assert!(problems.is_empty(), "unexpected problems: {problems:?}");
+        assert_eq!(
+            frame
+                .evaluate(&mut parent, "globalThis.__streamOrder")
+                .unwrap(),
+            serde_json::json!([
+                "blocking:false",
+                "first:interactive:true",
+                "second:interactive:true"
+            ]),
+        );
+        assert_eq!(
+            frame
+                .evaluate(&mut parent, "globalThis.__streamReady")
+                .unwrap(),
+            serde_json::json!(["interactive"]),
+        );
+        frame.dispatch_dom_content_loaded(&mut parent).unwrap();
+        assert_eq!(
+            frame
+                .evaluate(&mut parent, "globalThis.__streamReady")
+                .unwrap(),
+            serde_json::json!(["interactive", "dcl:interactive"]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn streaming_frame_reselects_media_when_source_appears_after_parser_pause() {
+        let mut parent = page(
+            "https://parent.example/",
+            "<html><body><iframe></iframe></body></html>",
+        );
+        let frame = streaming_frame(
+            &mut parent,
+            concat!(
+                "<!doctype html><video id='movie'>",
+                "<script>globalThis.__mediaBeforeSource = document.getElementById('movie').networkState;</script>",
+                "<source src='data:video/mp4;base64,AA=='>",
+                "<script>globalThis.__mediaAfterSource = document.getElementById('movie').currentSrc;</script>",
+                "</video>",
+                "<video id='direct' src='data:video/mp4;base64,AQ=='>",
+                "<script>globalThis.__directBeforeSource = [document.getElementById('direct').currentSrc,document.getElementById('direct')._mediaRequest];</script>",
+                "<source src='data:video/mp4;base64,Ag=='>",
+                "<script>globalThis.__directAfterSource = [document.getElementById('direct').currentSrc,document.getElementById('direct')._mediaRequest];</script>",
+                "</video>",
+            ),
+            true,
+        );
+
+        let problems = frame
+            .run_document_scripts_and_modules_with_stylesheet_events(
+                &mut parent,
+                |_| None,
+                std::collections::BTreeMap::new(),
+                1_000,
+            )
+            .await;
+
+        assert!(problems.is_empty(), "unexpected problems: {problems:?}");
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "[globalThis.__mediaBeforeSource, globalThis.__mediaAfterSource, globalThis.__directBeforeSource, globalThis.__directAfterSource]",
+                )
+                .unwrap(),
+            serde_json::json!([
+                3,
+                "data:video/mp4;base64,AA==",
+                ["data:video/mp4;base64,AQ==", 1],
+                ["data:video/mp4;base64,AQ==", 1]
+            ]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn streaming_parser_resource_bridge_resists_author_weakset_poisoning() {
+        let mut parent = page(
+            "https://parent.example/",
+            "<html><body><iframe></iframe></body></html>",
+        );
+        let frame = streaming_frame(
+            &mut parent,
+            concat!(
+                "<!doctype html><html><body>",
+                "<script>",
+                "globalThis.__parserPrivateNames = [typeof _parserResourcePreparation, typeof _startParserCreatedResources];",
+                "globalThis.__parserBridgeOriginal = globalThis.__obscura_startParserCreatedResources;",
+                "const descriptor = Object.getOwnPropertyDescriptor(globalThis, '__obscura_startParserCreatedResources');",
+                "globalThis.__parserBridgeDescriptor = [descriptor.writable, descriptor.enumerable, descriptor.configurable];",
+                "globalThis.__parserBridgeDefineRejected = false;",
+                "try { Object.defineProperty(globalThis, '__obscura_startParserCreatedResources', { value() { throw new Error('replaced'); } }); }",
+                "catch (_) { globalThis.__parserBridgeDefineRejected = true; }",
+                "globalThis.__obscura_startParserCreatedResources = () => { throw new Error('assigned'); };",
+                "globalThis._parserResourcePreparation = { has() { throw new Error('forged private state'); } };",
+                "globalThis._startParserCreatedResources = () => { throw new Error('forged helper'); };",
+                "globalThis.__savedWeakSet = WeakSet;",
+                "globalThis.__savedWeakSetHas = WeakSet.prototype.has;",
+                "globalThis.__savedWeakSetAdd = WeakSet.prototype.add;",
+                "globalThis.__poisonImageQueueCalls = 0;",
+                "globalThis.__originalPoisonImageQueue = HTMLImageElement.prototype._queueImageRequest;",
+                "HTMLImageElement.prototype._queueImageRequest = function(...args) { __poisonImageQueueCalls++; return __originalPoisonImageQueue.apply(this, args); };",
+                "WeakSet.prototype.has = () => { throw new Error('poisoned has'); };",
+                "WeakSet.prototype.add = () => { throw new Error('poisoned add'); };",
+                "globalThis.WeakSet = class PoisonedWeakSet { constructor() { throw new Error('poisoned constructor'); } };",
+                "</script>",
+                "<img id='poison-image' src='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAADCAYAAAC56t6BAAAAFklEQVR4nGP8z8Dwn4GBgYGJAQrgDAAxOwIE7x6DkQAAAABJRU5ErkJggg=='>",
+                "<video id='poison-media' src='data:video/mp4;base64,AA=='></video>",
+                "<script>",
+                "const poisonImage = document.getElementById('poison-image');",
+                "const poisonMedia = document.getElementById('poison-media');",
+                "const poisonImagePrepared = poisonImage._imageQueued || (poisonImage._imageComplete && poisonImage._imageDecoded);",
+                "globalThis.__poisonSweepState = [",
+                "  globalThis.__obscura_startParserCreatedResources === globalThis.__parserBridgeOriginal,",
+                "  globalThis.__poisonImageQueueCalls, poisonImagePrepared, poisonMedia._mediaRequest, poisonMedia.currentSrc",
+                "];",
+                "HTMLImageElement.prototype._queueImageRequest = globalThis.__originalPoisonImageQueue;",
+                "globalThis.__savedWeakSet.prototype.has = globalThis.__savedWeakSetHas;",
+                "globalThis.__savedWeakSet.prototype.add = globalThis.__savedWeakSetAdd;",
+                "globalThis.WeakSet = globalThis.__savedWeakSet;",
+                "</script>",
+                "</body></html>",
+            ),
+            true,
+        );
+
+        let problems = frame
+            .run_document_scripts_and_modules_with_stylesheet_events(
+                &mut parent,
+                |_| None,
+                std::collections::BTreeMap::new(),
+                1_000,
+            )
+            .await;
+
+        assert!(problems.is_empty(), "unexpected problems: {problems:?}");
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "[globalThis.__parserPrivateNames, globalThis.__parserBridgeDescriptor, globalThis.__parserBridgeDefineRejected, globalThis.__poisonSweepState]",
+                )
+                .unwrap(),
+            serde_json::json!([
+                ["undefined", "undefined"],
+                [false, false, false],
+                true,
+                [true, 1, true, 1, "data:video/mp4;base64,AA=="]
+            ]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn streaming_parser_eof_resource_sweep_is_idempotent_across_resource_types() {
+        let mut parent = page(
+            "https://parent.example/",
+            "<html><body><iframe></iframe></body></html>",
+        );
+        let frame = streaming_frame(
+            &mut parent,
+            concat!(
+                "<!doctype html><html><body>",
+                "<script>",
+                "globalThis.__resourceSweepCalls = { image: 0, media: 0, poster: 0, track: 0, frame: 0 };",
+                "globalThis.__originalImageQueue = HTMLImageElement.prototype._queueImageRequest;",
+                "globalThis.__originalMediaQueue = HTMLMediaElement.prototype._queueMediaRequest;",
+                "globalThis.__originalPosterQueue = HTMLVideoElement.prototype._queuePosterRequest;",
+                "globalThis.__originalTrackQueue = HTMLTrackElement.prototype._queueTrackRequest;",
+                "globalThis.__originalBlankLoad = HTMLIFrameElement.prototype._loadIframeBlank;",
+                "HTMLImageElement.prototype._queueImageRequest = function(...args) { __resourceSweepCalls.image++; return __originalImageQueue.apply(this, args); };",
+                "HTMLMediaElement.prototype._queueMediaRequest = function(...args) { __resourceSweepCalls.media++; return __originalMediaQueue.apply(this, args); };",
+                "HTMLVideoElement.prototype._queuePosterRequest = function(...args) { __resourceSweepCalls.poster++; return __originalPosterQueue.apply(this, args); };",
+                "HTMLTrackElement.prototype._queueTrackRequest = function(...args) { __resourceSweepCalls.track++; return __originalTrackQueue.apply(this, args); };",
+                "HTMLIFrameElement.prototype._loadIframeBlank = function(...args) { __resourceSweepCalls.frame++; return __originalBlankLoad.apply(this, args); };",
+                "</script>",
+                "<img id='eof-image' src='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAADCAYAAAC56t6BAAAAFklEQVR4nGP8z8Dwn4GBgYGJAQrgDAAxOwIE7x6DkQAAAABJRU5ErkJggg=='>",
+                "<video id='eof-media' src='data:video/mp4;base64,AA==' poster='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAADCAYAAAC56t6BAAAAFklEQVR4nGP8z8Dwn4GBgYGJAQrgDAAxOwIE7x6DkQAAAABJRU5ErkJggg=='>",
+                "<track id='eof-track' default src='data:text/vtt,WEBVTT'>",
+                "</video>",
+                "<iframe id='eof-frame' src='about:blank'></iframe>",
+                "</body></html>",
+            ),
+            true,
+        );
+
+        let problems = frame
+            .run_document_scripts_and_modules_with_stylesheet_events(
+                &mut parent,
+                |_| None,
+                std::collections::BTreeMap::new(),
+                1_000,
+            )
+            .await;
+        assert!(problems.is_empty(), "unexpected problems: {problems:?}");
+
+        // data: media/poster requests complete locally. Pump their promise
+        // reactions so this regression also proves they never fall into the
+        // HTTP-only page transport when synchronous render loading is off.
+        parent.run_event_loop_bounded(100).await.unwrap();
+
+        // The parser driver sweeps after the final resume and again at its EOF
+        // transition. Repeating the fixed bridge here must still be a no-op.
+        frame
+            .execute_script(
+                &mut parent,
+                "globalThis.__obscura_startParserCreatedResources(); globalThis.__obscura_startParserCreatedResources();",
+            )
+            .unwrap();
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "(() => { const image = document.getElementById('eof-image'); const media = document.getElementById('eof-media'); return [globalThis.__resourceSweepCalls, image._imageQueued || (image._imageComplete && image._imageDecoded), media._mediaRequest, media.readyState, media.networkState, media._posterRequest, media._posterQueued, document.getElementById('eof-track').readyState, document.getElementById('eof-frame')._iframeLoadingUrl]; })()",
+                )
+                .unwrap(),
+            serde_json::json!([
+                {"image": 1, "media": 1, "poster": 1, "track": 1, "frame": 1},
+                true,
+                1,
+                1,
+                1,
+                1,
+                false,
+                2,
+                "about:blank"
+            ]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn streaming_frame_async_script_completion_is_inside_load_gate() {
+        let mut parent = page(
+            "https://parent.example/",
+            "<html><body><iframe></iframe></body></html>",
+        );
+        let frame = streaming_frame(
+            &mut parent,
+            concat!(
+                "<!doctype html><html><body>",
+                "<script>globalThis.__asyncEvents = [];</script>",
+                "<script async src='/async.js' onload=\"__asyncEvents.push('load')\"></script>",
+                "<div id='tail'></div>",
+                "</body></html>",
+            ),
+            true,
+        );
+
+        let problems = frame
+            .run_document_scripts_and_modules_with_stylesheet_events(
+                &mut parent,
+                |url| {
+                    url.ends_with("/async.js").then(|| {
+                        "__asyncEvents.push('body:' + (document.getElementById('tail') !== null));"
+                            .to_string()
+                    })
+                },
+                std::collections::BTreeMap::new(),
+                1_000,
+            )
+            .await;
+
+        assert!(problems.is_empty(), "unexpected problems: {problems:?}");
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "[globalThis.__asyncEvents, document.getElementById('tail') !== null]",
+                )
+                .unwrap(),
+            serde_json::json!([["body:false", "load"], true]),
+            "the scheduler returned before async execution and its owner load event completed",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn streaming_frame_generation_change_rejects_stale_external_source() {
+        let mut parent = page(
+            "https://parent.example/",
+            "<html><body><iframe></iframe></body></html>",
+        );
+        let frame = streaming_frame(
+            &mut parent,
+            concat!(
+                "<!doctype html><html><body>",
+                "<script src='/stale.js'></script>",
+                "<div id='tail'></div>",
+                "</body></html>",
+            ),
+            true,
+        );
+
+        let problems = frame
+            .run_document_scripts_and_modules_with_stylesheet_events(
+                &mut parent,
+                |_| {
+                    assert!(frame.invalidate_document_generation());
+                    Some("globalThis.__staleExternalRan = true;".to_string())
+                },
+                std::collections::BTreeMap::new(),
+                1_000,
+            )
+            .await;
+
+        assert!(
+            problems.iter().any(|problem| problem.contains("replaced")),
+            "generation cancellation was not reported: {problems:?}",
+        );
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "[typeof globalThis.__staleExternalRan, document.getElementById('tail') !== null]",
+                )
+                .unwrap(),
+            serde_json::json!(["undefined", false]),
+            "stale script work or parser tail escaped after generation invalidation",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn streaming_frame_detach_stops_later_parser_work() {
+        let mut parent = page(
+            "https://child.example/parent.html",
+            "<html><body><iframe></iframe></body></html>",
+        );
+        let frame = streaming_frame(
+            &mut parent,
+            concat!(
+                "<!doctype html><html><body>",
+                "<script>globalThis.__firstRan=true;</script>",
+                "<script>globalThis.__staleTailScript=true;</script>",
+                "<div id='tail'></div>",
+                "</body></html>",
+            ),
+            true,
+        );
+        parent
+            .execute_script(
+                "detach-streaming-owner",
+                "document.querySelector('iframe').remove();",
+            )
+            .unwrap();
+
+        let problems = frame
+            .run_document_scripts_and_modules_with_stylesheet_events(
+                &mut parent,
+                |_| None,
+                std::collections::BTreeMap::new(),
+                1_000,
+            )
+            .await;
+
+        assert!(
+            problems.iter().any(|problem| problem.contains("detached")),
+            "detachment was not reported: {problems:?}",
+        );
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "[globalThis.__firstRan, typeof globalThis.__staleTailScript, document.getElementById('tail') !== null]",
+                )
+                .unwrap(),
+            serde_json::json!([serde_json::Value::Null, "undefined", false]),
+        );
     }
 
     #[test]
@@ -1323,7 +3001,7 @@ mod tests {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
         let frame = FrameRealm::new(
             &mut parent,
-            1,
+            100,
             0,
             "https://child.example/frame",
             "<html><body><iframe></iframe></body></html>",
@@ -1335,13 +3013,13 @@ mod tests {
                 "(document.querySelector('iframe'), globalThis.__obscura_liveFrameIds())",
             )
             .expect("initial liveness probe");
-        assert!(live_frame_ids.is_array(), "liveness must remain an id array");
+        assert!(
+            live_frame_ids.is_array(),
+            "liveness must remain an id array"
+        );
 
         frame
-            .execute_script(
-                &mut parent,
-                r#"JSON.stringify = () => "true";"#,
-            )
+            .execute_script(&mut parent, r#"JSON.stringify = () => "true";"#)
             .expect("author mutations");
 
         assert_eq!(
@@ -1520,6 +3198,428 @@ mod tests {
     }
 
     #[test]
+    fn initial_blank_window_proxy_survives_managed_realm_commit_and_removal() {
+        let mut parent = page(
+            "https://parent.example/path/page.html",
+            "<!doctype html><iframe id='child'></iframe>",
+        );
+        assert_eq!(
+            parent
+                .evaluate(
+                    r#"(() => {
+                      const frame = document.getElementById('child');
+                      globalThis.__savedBlankWindow = frame.contentWindow;
+                      return {
+                        href: __savedBlankWindow.location.href,
+                        origin: __savedBlankWindow.location.origin,
+                        document: frame.contentDocument === __savedBlankWindow.document,
+                      };
+                    })()"#,
+                )
+                .unwrap(),
+            serde_json::json!({
+                "href": "about:blank",
+                "origin": "https://parent.example",
+                "document": true,
+            }),
+        );
+
+        let mut pending = parent.take_pending_frames();
+        assert_eq!(pending.len(), 1, "initial about:blank was not managed");
+        let pending = pending.remove(0);
+        assert_eq!(pending.url, "about:blank");
+        assert_eq!(
+            pending.inherited_base_url.as_deref(),
+            Some("https://parent.example/path/page.html"),
+        );
+        assert_eq!(
+            pending.inherited_origin.as_deref(),
+            Some("https://parent.example"),
+        );
+
+        let frame = FrameRealm::new_with_inherited_context(
+            &mut parent,
+            pending.frame_id,
+            pending.parent_frame_id,
+            &pending.url,
+            pending.inherited_base_url.as_deref(),
+            pending.inherited_origin.as_deref(),
+            &pending.html,
+        )
+        .expect("managed initial blank realm");
+        assert_eq!(parent.managed_realm_count(), 1);
+        frame
+            .execute_script(&mut parent, "globalThis.__managedBlankMarker = 'realm';")
+            .unwrap();
+        frame.dispatch_load_events(&mut parent).unwrap();
+
+        assert_eq!(
+            parent
+                .evaluate(
+                    r#"(() => {
+                      const current = document.getElementById('child').contentWindow;
+                      return {
+                        identity: __savedBlankWindow === current,
+                        marker: __savedBlankWindow.__managedBlankMarker,
+                        document: __savedBlankWindow.document === document.getElementById('child').contentDocument,
+                        readyState: __savedBlankWindow.document.readyState,
+                      };
+                    })()"#,
+                )
+                .unwrap(),
+            serde_json::json!({
+                "identity": true,
+                "marker": "realm",
+                "document": true,
+                "readyState": "complete",
+            }),
+        );
+
+        parent
+            .execute_script(
+                "replace-frame",
+                "document.getElementById('child').srcdoc = '<!doctype html><p>replacement</p>';",
+            )
+            .unwrap();
+        let mut replacement = parent.take_pending_frames();
+        assert_eq!(replacement.len(), 1);
+        let replacement = replacement.remove(0);
+        assert_eq!(replacement.url, "about:srcdoc");
+        assert_ne!(replacement.frame_id, frame.frame_id());
+        let replacement_realm = FrameRealm::new_with_inherited_context(
+            &mut parent,
+            replacement.frame_id,
+            replacement.parent_frame_id,
+            &replacement.url,
+            replacement.inherited_base_url.as_deref(),
+            replacement.inherited_origin.as_deref(),
+            &replacement.html,
+        )
+        .expect("replacement realm");
+        assert_eq!(parent.managed_realm_count(), 2);
+        replacement_realm
+            .execute_script(&mut parent, "globalThis.__replacementMarker = 'new-realm';")
+            .unwrap();
+        assert_eq!(
+            parent
+                .evaluate(
+                    r#"({
+                      identity: __savedBlankWindow === document.getElementById('child').contentWindow,
+                      oldMarker: typeof __savedBlankWindow.__managedBlankMarker,
+                      replacementMarker: __savedBlankWindow.__replacementMarker,
+                    })"#,
+                )
+                .unwrap(),
+            serde_json::json!({
+                "identity": true,
+                "oldMarker": "undefined",
+                "replacementMarker": "new-realm",
+            }),
+        );
+
+        // Committing the replacement has already moved the stable proxy's
+        // backend away from the initial blank context. Its host realm can now
+        // be retired without changing proxy identity or exposing stale data.
+        drop(frame);
+        assert_eq!(parent.managed_realm_count(), 1);
+        assert_eq!(
+            parent
+                .evaluate(
+                    "({ identity: __savedBlankWindow === document.getElementById('child').contentWindow, replacementMarker: __savedBlankWindow.__replacementMarker })",
+                )
+                .unwrap(),
+            serde_json::json!({"identity": true, "replacementMarker": "new-realm"}),
+        );
+
+        // Removal synchronously detaches the proxy backend before the host can
+        // drop the FrameRealm. A page-held WindowProxy must remain safe to
+        // inspect and must no longer retain author globals from the old realm.
+        parent
+            .execute_script("remove-frame", "document.getElementById('child').remove();")
+            .unwrap();
+        assert_eq!(
+            parent
+                .evaluate(
+                    "({ marker: typeof __savedBlankWindow.__managedBlankMarker, href: __savedBlankWindow.location.href })",
+                )
+                .unwrap(),
+            serde_json::json!({"marker": "undefined", "href": "about:blank"}),
+        );
+        drop(replacement_realm);
+        assert_eq!(parent.managed_realm_count(), 0);
+        assert_eq!(
+            parent
+                .evaluate("typeof __savedBlankWindow.document")
+                .unwrap(),
+            serde_json::json!("object"),
+            "saved proxy became unsafe after managed realm drop",
+        );
+    }
+
+    #[test]
+    fn repeated_staged_frame_churn_retires_every_managed_realm() {
+        let mut parent = page(
+            "https://parent.example/",
+            "<!doctype html><html><body></body></html>",
+        );
+
+        for frame_id in 1..=32 {
+            let frame = FrameRealm::new_staged_with_inherited_context(
+                &mut parent,
+                frame_id,
+                0,
+                &format!("https://child.example/{frame_id}.html"),
+                None,
+                None,
+                "<!doctype html><p>frame</p>",
+            )
+            .expect("staged frame realm");
+            let managed = frame.module_realm.clone();
+            assert_eq!(parent.managed_realm_count(), 1);
+
+            drop(frame);
+
+            assert_eq!(parent.managed_realm_count(), 0);
+            assert!(managed.is_retired());
+            assert!(!managed.retire(), "retirement must be idempotent");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retired_managed_realm_is_not_polled_again() {
+        let mut parent = page(
+            "https://parent.example/",
+            "<!doctype html><html><body></body></html>",
+        );
+        let frame = FrameRealm::new_staged_with_inherited_context(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/frame.html",
+            None,
+            None,
+            "<!doctype html><p>frame</p>",
+        )
+        .expect("staged frame realm");
+        let managed = frame.module_realm.clone();
+
+        parent.run_event_loop().await.unwrap();
+        let polls_before_retirement = managed.event_loop_poll_count();
+        assert!(polls_before_retirement > 0);
+
+        drop(frame);
+        assert_eq!(parent.managed_realm_count(), 0);
+        assert!(managed.is_retired());
+
+        // Advance a real main-realm microtask and event-loop turn. A stale
+        // registry entry would increment the retired realm's diagnostic count
+        // even if its ModuleMap happened to have no pending work.
+        parent
+            .execute_script(
+                "main-after-frame-retirement",
+                "Promise.resolve().then(() => { globalThis.__mainAfterRetire = true; });",
+            )
+            .unwrap();
+        parent.run_event_loop().await.unwrap();
+        assert_eq!(managed.event_loop_poll_count(), polls_before_retirement,);
+        assert_eq!(
+            parent.evaluate("globalThis.__mainAfterRetire").unwrap(),
+            serde_json::json!(true),
+        );
+    }
+
+    #[test]
+    fn sandboxed_initial_blank_has_an_opaque_origin() {
+        let mut parent = page(
+            "https://parent.example/page.html",
+            "<!doctype html><iframe id='child' sandbox src='about:blank#section'></iframe>",
+        );
+        assert_eq!(
+            parent
+                .evaluate(
+                    r#"(() => {
+                      const frame = document.getElementById('child');
+                      globalThis.__sandboxWindow = frame.contentWindow;
+                      return {
+                        href: __sandboxWindow.location.href,
+                        origin: __sandboxWindow.location.origin,
+                        documentBlocked: frame.contentDocument === null,
+                        proxyDocumentBlocked: typeof __sandboxWindow.document === 'undefined',
+                      };
+                    })()"#,
+                )
+                .unwrap(),
+            serde_json::json!({
+                "href": "about:blank#section",
+                "origin": "null",
+                "documentBlocked": true,
+                "proxyDocumentBlocked": true,
+            }),
+        );
+
+        let mut pending = parent.take_pending_frames();
+        assert_eq!(pending.len(), 1);
+        let pending = pending.remove(0);
+        assert_eq!(pending.url, "about:blank#section");
+        assert_eq!(pending.inherited_origin.as_deref(), Some("null"));
+        assert!(!pending.scripts_allowed);
+        let frame = FrameRealm::new_staged_with_inherited_context_and_script_policy(
+            &mut parent,
+            pending.frame_id,
+            pending.parent_frame_id,
+            &pending.url,
+            pending.inherited_base_url.as_deref(),
+            pending.inherited_origin.as_deref(),
+            &pending.html,
+            pending.scripts_allowed,
+        )
+        .expect("sandboxed blank realm");
+        assert!(frame.publish_to_owners(&mut parent));
+        frame
+            .execute_script(&mut parent, "globalThis.__sandboxSecret = 'hidden';")
+            .unwrap();
+        assert_eq!(frame.origin(), "null");
+        assert_eq!(
+            parent
+                .evaluate(
+                    "({ same: __sandboxWindow === document.getElementById('child').contentWindow, secret: typeof __sandboxWindow.__sandboxSecret })",
+                )
+                .unwrap(),
+            serde_json::json!({"same": true, "secret": "undefined"}),
+        );
+    }
+
+    #[test]
+    fn iframe_allow_scripts_policy_is_captured_in_each_pending_navigation() {
+        let parent = page(
+            "https://parent.example/page.html",
+            concat!(
+                "<!doctype html>",
+                "<iframe sandbox srcdoc='<p>blocked</p>'></iframe>",
+                "<iframe sandbox='ALLOW-SCRIPTS allow-same-origin' srcdoc='<p>allowed</p>'></iframe>",
+                "<iframe srcdoc='<p>ordinary</p>'></iframe>",
+            ),
+        );
+        let pending = parent.take_pending_frames();
+        assert_eq!(pending.len(), 3);
+        assert_eq!(
+            pending
+                .iter()
+                .map(|frame| frame.scripts_allowed)
+                .collect::<Vec<_>>(),
+            vec![false, true, true],
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sandboxed_frame_keeps_dom_and_lifecycle_but_suppresses_all_author_scripts() {
+        let mut parent = page(
+            "https://parent.example/page.html",
+            "<!doctype html><html><body></body></html>",
+        );
+        let frame = FrameRealm::new_staged_with_inherited_context_and_script_policy(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/frame.html",
+            None,
+            None,
+            concat!(
+                "<!doctype html><html><body onload='globalThis.__contentHandlers++'>",
+                "<p id='kept'>sandbox DOM</p>",
+                "<button id='handler' onclick='globalThis.__contentHandlers++'>click</button>",
+                "<script>globalThis.__classicRuns++;</script>",
+                "<script src='ignored-classic.js'></script>",
+                "<script type='module'>globalThis.__moduleRuns++;</script>",
+                "<script type='module' src='ignored-module.js'></script>",
+                "<iframe srcdoc='<script>globalThis.__nestedRuns = true;</script><p>nested</p>'></iframe>",
+                "</body></html>",
+            ),
+            false,
+        )
+        .expect("sandboxed frame realm");
+        assert!(!frame.scripts_allowed());
+
+        // A disabled sandbox flag propagates through descendant browsing
+        // contexts even when the nested iframe has no sandbox attribute.
+        let nested = parent.take_pending_frames();
+        assert_eq!(nested.len(), 1);
+        assert!(!nested[0].scripts_allowed);
+
+        frame
+            .execute_script(
+                &mut parent,
+                r#"
+                  globalThis.__classicRuns = 0;
+                  globalThis.__moduleRuns = 0;
+                  globalThis.__dynamicRuns = 0;
+                  globalThis.__contentHandlers = 0;
+                  globalThis.__lifecycle = [];
+                  document.addEventListener('DOMContentLoaded', () => __lifecycle.push('dcl'));
+                  addEventListener('load', () => __lifecycle.push('load'));
+
+                  const inline = document.createElement('script');
+                  inline.textContent = 'globalThis.__dynamicRuns += 1';
+                  document.body.appendChild(inline);
+
+                  const external = document.createElement('script');
+                  external.src = 'data:text/javascript,globalThis.__dynamicRuns%20%2B%3D%201';
+                  document.body.appendChild(external);
+
+                  const module = document.createElement('script');
+                  module.type = 'module';
+                  module.textContent = 'globalThis.__dynamicRuns += 1';
+                  document.body.appendChild(module);
+                "#,
+            )
+            .expect("host setup in sandboxed realm");
+
+        assert!(frame.external_script_urls(&mut parent).is_empty());
+        assert!(frame.external_module_urls().is_empty());
+        let attempted_fetches = std::cell::Cell::new(0usize);
+        let problems = frame
+            .run_document_scripts_and_modules_with_stylesheet_events(
+                &mut parent,
+                |_| {
+                    attempted_fetches.set(attempted_fetches.get() + 1);
+                    None
+                },
+                std::collections::BTreeMap::new(),
+                1_000,
+            )
+            .await;
+        assert!(
+            problems.is_empty(),
+            "sandboxed parser reported: {problems:?}"
+        );
+        assert_eq!(attempted_fetches.get(), 0);
+        assert_eq!(frame.unsupported_module_script_count(&mut parent), 0);
+        assert!(!frame.has_pending_dynamic_scripts(&mut parent));
+
+        frame.dispatch_load_events(&mut parent).unwrap();
+        frame
+            .execute_script(&mut parent, "document.getElementById('handler').click();")
+            .unwrap();
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "({classic:__classicRuns,module:__moduleRuns,dynamic:__dynamicRuns,handlers:__contentHandlers,lifecycle:__lifecycle,ready:document.readyState,dom:document.getElementById('kept').textContent})",
+                )
+                .unwrap(),
+            serde_json::json!({
+                "classic": 0,
+                "module": 0,
+                "dynamic": 0,
+                "handlers": 0,
+                "lifecycle": ["dcl", "load"],
+                "ready": "complete",
+                "dom": "sandbox DOM",
+            }),
+        );
+    }
+
+    #[test]
     fn parser_created_srcdoc_inside_declarative_shadow_root_is_queued() {
         let parent = page(
             "https://parent.example/path/page.html",
@@ -1549,12 +3649,17 @@ mod tests {
             "https://parent.example/page",
             "<html><body><iframe style='width:300px;height:65px'></iframe></body></html>",
         );
-        let frame = FrameRealm::new(
+        let mut pending = parent.take_pending_frames();
+        assert_eq!(pending.len(), 1);
+        let pending = pending.remove(0);
+        let frame = FrameRealm::new_with_inherited_context(
             &mut parent,
-            1,
-            0,
-            "https://child.example/frame",
-            "<html><body></body></html>",
+            pending.frame_id,
+            pending.parent_frame_id,
+            &pending.url,
+            pending.inherited_base_url.as_deref(),
+            pending.inherited_origin.as_deref(),
+            &pending.html,
         )
         .expect("frame realm");
 
@@ -1763,7 +3868,7 @@ mod tests {
             frame
                 .parser_inline_stylesheet_sources()
                 .into_iter()
-                .map(|(_, _, _, base)| base)
+                .map(|(_, _, _, _, base, _)| base)
                 .collect::<Vec<_>>(),
             vec![
                 "https://child.example/original/page.html".to_string(),
@@ -1856,7 +3961,7 @@ mod tests {
     }
 
     #[test]
-    fn one_bad_frame_script_does_not_stop_the_rest() {
+    fn classic_pass_leaves_modules_for_the_managed_module_runner() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
         let frame = FrameRealm::new(
             &mut parent,
@@ -1879,16 +3984,227 @@ mod tests {
             frame.evaluate(&mut parent, "window.log.join(',')").unwrap(),
             serde_json::json!("a,b")
         );
-        assert_eq!(problems.len(), 3, "problems: {problems:?}");
+        assert_eq!(problems.len(), 2, "problems: {problems:?}");
         assert!(problems.iter().any(|p| p.contains("boom")), "{problems:?}");
         assert!(
             problems.iter().any(|p| p.contains("missing.js")),
             "{problems:?}"
         );
-        assert!(
-            problems.iter().any(|p| p.contains("module")),
-            "{problems:?}"
+        assert_eq!(frame.unsupported_module_script_count(&mut parent), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn managed_frame_inline_module_waits_for_top_level_await() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/frame.html",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+
+        frame
+            .load_inline_module(
+                &mut parent,
+                "await Promise.resolve(); globalThis.__frameTla = 'complete';",
+                "https://child.example/frame.html",
+                1_000,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            frame
+                .evaluate(&mut parent, "globalThis.__frameTla")
+                .unwrap(),
+            serde_json::json!("complete"),
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn managed_frame_external_graph_uses_its_import_map_and_dynamic_import() {
+        let base = spawn_frame_module_server(2);
+        let frame_url = format!("{base}/frame.html");
+        let mut parent = page(&format!("{base}/parent.html"), "<html><body></body></html>");
+        install_local_module_client(&parent);
+        let frame = FrameRealm::new(&mut parent, 1, 0, &frame_url, "<html><body></body></html>")
+            .expect("frame realm");
+        frame
+            .add_import_map(
+                &format!(
+                    r#"{{"imports":{{"dep":"{base}/dep.js","dynamic":"{base}/dynamic.js"}}}}"#
+                ),
+                &frame_url,
+            )
+            .unwrap();
+
+        frame
+            .load_external_module(
+                &mut parent,
+                &format!("{base}/entry.js"),
+                Some(
+                    "import { value as left } from 'dep';\
+                     const right = (await import('dynamic')).value;\
+                     globalThis.__frameGraph = `${left}:${right}`;",
+                ),
+                2_000,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            frame
+                .evaluate(&mut parent, "globalThis.__frameGraph")
+                .unwrap(),
+            serde_json::json!("static:dynamic"),
+        );
+        assert_eq!(
+            parent.evaluate("typeof globalThis.__frameGraph").unwrap(),
+            serde_json::json!("undefined"),
+            "frame module global leaked into the parent realm",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_import_map_is_frozen_when_the_first_graph_starts() {
+        let base = spawn_frame_module_server(1);
+        let frame_url = format!("{base}/frame.html");
+        let mut parent = page(&format!("{base}/parent.html"), "<html><body></body></html>");
+        install_local_module_client(&parent);
+        let html = format!(
+            r#"<html><body>
+               <script type="importmap">{{"imports":{{"pkg":"{base}/dep.js"}}}}</script>
+               <script type="module" src="entry-one.js"></script>
+               <script type="importmap">{{"imports":{{"pkg":"{base}/dynamic.js"}}}}</script>
+               <script type="module" src="entry-two.js"></script>
+               </body></html>"#,
+        );
+        let frame = FrameRealm::new(&mut parent, 1, 0, &frame_url, &html).expect("frame realm");
+
+        let problems = frame
+            .run_document_scripts_and_modules_with_stylesheet_events(
+                &mut parent,
+                |url| {
+                    if url.ends_with("entry-one.js") {
+                        Some(
+                            "import { value } from 'pkg'; globalThis.__firstMap = value;"
+                                .to_string(),
+                        )
+                    } else if url.ends_with("entry-two.js") {
+                        Some(
+                            "import { value } from 'pkg'; globalThis.__secondMap = value;"
+                                .to_string(),
+                        )
+                    } else {
+                        None
+                    }
+                },
+                std::collections::BTreeMap::new(),
+                2_000,
+            )
+            .await;
+
+        assert!(problems.is_empty(), "unexpected problems: {problems:?}");
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "[globalThis.__firstMap, globalThis.__secondMap]"
+                )
+                .unwrap(),
+            serde_json::json!(["static", "static"]),
+            "a later import map changed a resolution already observed by the frame",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sibling_frames_have_independent_module_maps_and_caches() {
+        let base = spawn_frame_module_server(2);
+        let mut parent = page(&format!("{base}/parent.html"), "<html><body></body></html>");
+        install_local_module_client(&parent);
+        let first_url = format!("{base}/first.html");
+        let second_url = format!("{base}/second.html");
+        let first =
+            FrameRealm::new(&mut parent, 1, 0, &first_url, "<html></html>").expect("first frame");
+        let second =
+            FrameRealm::new(&mut parent, 2, 0, &second_url, "<html></html>").expect("second frame");
+        first
+            .add_import_map(
+                &format!(r#"{{"imports":{{"pkg":"{base}/dep.js"}}}}"#),
+                &first_url,
+            )
+            .unwrap();
+        second
+            .add_import_map(
+                &format!(r#"{{"imports":{{"pkg":"{base}/dynamic.js"}}}}"#),
+                &second_url,
+            )
+            .unwrap();
+
+        first
+            .load_external_module(
+                &mut parent,
+                &format!("{base}/first-entry.js"),
+                Some("import { value } from 'pkg'; globalThis.__which = value;"),
+                2_000,
+            )
+            .await
+            .unwrap();
+        second
+            .load_external_module(
+                &mut parent,
+                &format!("{base}/second-entry.js"),
+                Some("import { value } from 'pkg'; globalThis.__which = value;"),
+                2_000,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first.evaluate(&mut parent, "globalThis.__which").unwrap(),
+            serde_json::json!("static"),
+        );
+        assert_eq!(
+            second.evaluate(&mut parent, "globalThis.__which").unwrap(),
+            serde_json::json!("dynamic"),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_module_runner_executes_modules_and_clears_archive_diagnostic() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/frame.html",
+            r#"<html><body>
+               <script>globalThis.__order = ['classic'];</script>
+               <script type="module">
+                 await Promise.resolve();
+                 globalThis.__order.push('module');
+               </script>
+               </body></html>"#,
+        )
+        .expect("frame realm");
+
+        let problems = frame
+            .run_document_scripts_and_modules_with_stylesheet_events(
+                &mut parent,
+                |_| None,
+                std::collections::BTreeMap::new(),
+                1_000,
+            )
+            .await;
+
+        assert!(problems.is_empty(), "unexpected problems: {problems:?}");
+        assert_eq!(
+            frame.evaluate(&mut parent, "globalThis.__order").unwrap(),
+            serde_json::json!(["classic", "module"]),
+        );
+        assert_eq!(frame.unsupported_module_script_count(&mut parent), 0);
     }
 
     #[test]
@@ -2328,5 +4644,69 @@ mod tests {
         assert_eq!(frame.origin(), "null");
         assert!(!frame.is_same_origin_as("null"));
         assert!(!frame.is_same_origin_as("https://parent.example"));
+    }
+
+    #[test]
+    fn frame_module_evaluation_is_visible_as_pending_activity() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/frame.html",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+        assert!(!frame.has_pending_module_work());
+        // `evaluate_prepared_module` holds this same guard across deno_core's
+        // evaluation future. Exercise the shared readiness signal directly so
+        // this regression test does not depend on V8's stalled-TLA policy.
+        let evaluation_activity = frame.module_activity.begin();
+        assert!(
+            frame.has_pending_module_work(),
+            "top-level await was invisible to capture readiness",
+        );
+
+        assert!(frame.invalidate_document_generation());
+        drop(evaluation_activity);
+        assert!(
+            frame.has_pending_module_work(),
+            "cancelling evaluation lost the completion activity edge",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalidated_frame_rejects_a_prepared_module_continuation() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/frame.html",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+        let prepared = frame
+            .prepare_inline_module(
+                &mut parent,
+                "globalThis.__staleModuleRan = true;",
+                "https://child.example/frame.html",
+                1_000,
+            )
+            .await
+            .expect("prepared module");
+
+        assert!(frame.invalidate_document_generation());
+        let error = frame
+            .evaluate_prepared_module(&mut parent, prepared, 1_000)
+            .await
+            .expect_err("an old module continuation was accepted");
+        assert!(error.contains("replaced"), "unexpected error: {error}");
+        assert_eq!(
+            frame
+                .evaluate(&mut parent, "typeof globalThis.__staleModuleRan")
+                .unwrap(),
+            serde_json::json!("undefined"),
+        );
     }
 }

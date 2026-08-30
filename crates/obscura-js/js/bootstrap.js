@@ -32,6 +32,7 @@ const _core = Deno.core;
     '__obscura_dispatchWindowLoad', '__obscura_dispatchDocumentLifecycleEvent',
     '__obscura_dispatchParserScriptEvent',
     '__obscura_installParsedBodyLoadHandler',
+    '__obscura_startParserCreatedResources',
     '__markParserScripts', '__markParserStylesheets',
     '__obscura_isParserStylesheetPending', '__obscura_hasPendingDynamicScripts',
     '__obscura_hasPendingLoadDelayingScripts',
@@ -72,7 +73,7 @@ const _core = Deno.core;
     'MessageChannel', 'MessagePort', 'BroadcastChannel', 'CustomElementRegistry',
     'Scheduler',
     'XMLHttpRequestEventTarget', 'HTMLMediaElement', 'HTMLVideoElement',
-    'HTMLAudioElement', 'WebGL2RenderingContext',
+    'HTMLAudioElement', 'HTMLSourceElement', 'HTMLTrackElement', 'WebGL2RenderingContext',
     'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement', 'SVGPathElement',
     'SVGSVGElement',
   ];
@@ -2174,6 +2175,26 @@ function __prepareInsertedScript(script) {
   }
 }
 
+// Parser sweeps and dynamic insertion steps share this marker. Keep both the
+// set and its native operations inside a dedicated closure: page script can
+// replace the global WeakSet constructor or poison WeakSet.prototype between
+// tokenizer pauses, but it cannot reach this set or change the captured
+// operations used by the host's fixed parser-resource bridge.
+const _parserResourcePreparation = (() => {
+  const NativeWeakSet = WeakSet;
+  const weakSetHas = Function.prototype.call.bind(NativeWeakSet.prototype.has);
+  const weakSetAdd = Function.prototype.call.bind(NativeWeakSet.prototype.add);
+  const prepared = new NativeWeakSet();
+  const facade = {
+    has(resource) { return weakSetHas(prepared, resource); },
+    mark(resource) { weakSetAdd(prepared, resource); },
+    newSweepTracker() { return new NativeWeakSet(); },
+    trackerHas(tracker, resource) { return weakSetHas(tracker, resource); },
+    trackerMark(tracker, resource) { weakSetAdd(tracker, resource); },
+  };
+  return Object.freeze(facade);
+})();
+
 function __prepareInsertedSubtree(root, includeRoot = true) {
   // HTML's script preparation algorithm leaves a disconnected script
   // unstarted.  When an ancestor is later connected, insertion steps visit
@@ -2235,8 +2256,45 @@ function __prepareInsertedSubtree(root, includeRoot = true) {
   }
   for (const image of images) {
     if (image instanceof HTMLImageElement && image.loading !== 'lazy') {
+      _parserResourcePreparation.mark(image);
       image._queueImageRequest();
     }
+  }
+
+  // Connected media resources participate in the document load-delay set even
+  // though Obscura stops after metadata fetch and never decodes playback data.
+  const mediaElements = [];
+  if (includeRoot && root.nodeType === 1
+      && (root.tagName === 'AUDIO' || root.tagName === 'VIDEO')) {
+    mediaElements.push(root);
+  }
+  const mediaIds = _domParse("query_selector_all_scoped", root._nid, "audio,video") || [];
+  for (const nid of mediaIds) {
+    const media = _wrapEl(+nid);
+    if (media && !mediaElements.includes(media)) mediaElements.push(media);
+  }
+  for (const media of mediaElements) {
+    _parserResourcePreparation.mark(media);
+    if (media instanceof HTMLMediaElement) media._queueMediaRequest(false);
+    if (media instanceof HTMLVideoElement) media._queuePosterRequest();
+  }
+
+  const trackIds = _domParse("query_selector_all_scoped", root._nid, "track[default]") || [];
+  if (includeRoot && root instanceof HTMLTrackElement && root.default) {
+    _parserResourcePreparation.mark(root);
+    root._queueTrackRequest();
+  }
+  for (const nid of trackIds) {
+    const track = _wrapEl(+nid);
+    if (track instanceof HTMLTrackElement) {
+      _parserResourcePreparation.mark(track);
+      track._queueTrackRequest();
+    }
+  }
+  if (includeRoot && root instanceof HTMLSourceElement
+      && root.parentNode instanceof HTMLMediaElement) {
+    _parserResourcePreparation.mark(root);
+    root.parentNode._mediaSourceChanged();
   }
 
   const frames = [];
@@ -2254,6 +2312,7 @@ function __prepareInsertedSubtree(root, includeRoot = true) {
     }
   }
   for (const frame of frames) {
+    _parserResourcePreparation.mark(frame);
     if (frame.hasAttribute('srcdoc')) {
       if (frame._iframeLoadingUrl !== 'about:srcdoc') {
         frame._loadIframeSrcdoc(frame.getAttribute('srcdoc') || '');
@@ -2261,8 +2320,9 @@ function __prepareInsertedSubtree(root, includeRoot = true) {
       continue;
     }
     const src = frame.getAttribute('src');
-    if (src && src !== 'about:blank') frame._loadIframeSrc(src);
-    else frame._loadIframeBlank();
+    const blankUrl = _canonicalIframeAboutBlank(src);
+    if (blankUrl) frame._loadIframeBlank(blankUrl);
+    else frame._loadIframeSrc(src);
   }
 
   // querySelectorAll deliberately stays inside the light tree. Insertion
@@ -2283,6 +2343,26 @@ function __prepareInsertedSubtree(root, includeRoot = true) {
   }
 }
 
+function _cancelMediaResourcesInSubtree(root, includeRoot = true) {
+  const elements = [];
+  if (includeRoot && root?.nodeType === 1
+      && (root.tagName === 'AUDIO' || root.tagName === 'VIDEO' || root.tagName === 'TRACK')) {
+    elements.push(root);
+  }
+  const ids = root?.nodeType
+    ? (_domParse("query_selector_all_scoped", root._nid, "audio,video,track") || [])
+    : [];
+  for (const nid of ids) {
+    const element = _wrapEl(+nid);
+    if (element && !elements.includes(element)) elements.push(element);
+  }
+  for (const element of elements) {
+    if (element instanceof HTMLMediaElement) element._cancelMediaRequest();
+    if (element instanceof HTMLVideoElement) element._cancelPosterRequest();
+    if (element instanceof HTMLTrackElement) element._cancelTrackRequest();
+  }
+}
+
 // Cancel child-document reservations before a DOM mutation removes their
 // owning iframe. Attached realms are still released by the host liveness
 // sweep; this synchronous cleanup covers requests which have an owner id but
@@ -2297,7 +2377,9 @@ function _cancelIframeDocumentsInSubtree(root, includeRoot = true) {
     if (frame && !frames.includes(frame)) frames.push(frame);
   }
   for (const frame of frames) {
-    if (typeof frame._resetIframeFrame === 'function') frame._resetIframeFrame();
+    if (typeof frame._resetIframeFrame === 'function') {
+      frame._resetIframeFrame(true);
+    }
   }
 
   // Removal steps are shadow-including for the same reason insertion steps
@@ -2489,6 +2571,7 @@ class Node {
       _linkedStylesheetNodes.delete(c);
     }
     _cancelIframeDocumentsInSubtree(c);
+    _cancelMediaResourcesInSubtree(c);
     const parentConnected = this.isConnected;
     const removed = _dom("remove_child", c._nid) === "true";
     if (!removed) {
@@ -3629,6 +3712,7 @@ class Element extends Node {
     // only changes fallback children and must not cancel/reload the iframe's
     // current browsing context.
     _cancelIframeDocumentsInSubtree(this, false);
+    _cancelMediaResourcesInSubtree(this, false);
     // Native fragment replacement bypasses Node.removeChild. Disassociate
     // descendant style sheets before the backing nodes leave the document so
     // retained CSSStyleSheet wrappers cannot keep stale owner/source nodes.
@@ -3764,12 +3848,18 @@ class Element extends Node {
     if (n === "src" && this.localName === "iframe") {
       // `srcdoc` wins whenever it is present, including an empty value.
       if (!this.hasAttribute("srcdoc")) {
-        if (value && value !== "about:blank") this._loadIframeSrc(value);
+        const blankUrl = _canonicalIframeAboutBlank(value);
+        if (blankUrl) this._loadIframeBlank(blankUrl);
+        else if (value) this._loadIframeSrc(value);
         else this._loadIframeBlank();
       }
     }
     if (n === "srcdoc" && this.localName === "iframe") {
       this._loadIframeSrcdoc(value);
+    }
+    if (n === "loading" && this.localName === "iframe"
+        && value.toLowerCase() !== "lazy") {
+      this._startDeferredLazyIframeNavigation();
     }
     if (this._nullNamespaceAttrs instanceof Map) {
       this._nullNamespaceAttrs.set(n, value);
@@ -3829,11 +3919,14 @@ class Element extends Node {
     _dom("remove_attribute", this._nid, n);
     if (this.localName === "iframe" && n === "srcdoc") {
       const fallback = this.getAttribute("src");
-      if (fallback && fallback !== "about:blank") this._loadIframeSrc(fallback);
-      else this._loadIframeBlank();
+      const blankUrl = _canonicalIframeAboutBlank(fallback);
+      if (blankUrl) this._loadIframeBlank(blankUrl);
+      else this._loadIframeSrc(fallback);
     } else if (this.localName === "iframe" && n === "src"
                && !this.hasAttribute("srcdoc")) {
       this._loadIframeBlank();
+    } else if (this.localName === "iframe" && n === "loading") {
+      this._startDeferredLazyIframeNavigation();
     }
     if (this._nullNamespaceAttrs instanceof Map) {
       this._nullNamespaceAttrs.delete(n);
@@ -4061,6 +4154,13 @@ class Element extends Node {
     if (Object.prototype.hasOwnProperty.call(cache, name)) return cache[name];
     const src = this.getAttribute && this.getAttribute(name);
     if (src === null) { cache[name] = null; return null; }
+    // An iframe sandbox without allow-scripts disables content event handlers
+    // along with script elements. Ask native per-document state so a
+    // same-origin parent cannot re-enable handlers by mutating a child global.
+    if (!_core.ops.op_scripting_enabled(_realmFrameId)) {
+      cache[name] = null;
+      return null;
+    }
     try {
       cache[name] = new Function('event', src);
     } catch (e) {
@@ -4593,7 +4693,52 @@ class Element extends Node {
   set srcdoc(v) {
     if (this.localName === 'iframe') this.setAttribute('srcdoc', String(v));
   }
-  _resetIframeFrame() {
+  get loading() {
+    if (this.localName !== 'iframe') return undefined;
+    return (this.getAttribute('loading') || '').toLowerCase() === 'lazy'
+      ? 'lazy'
+      : 'eager';
+  }
+  set loading(value) {
+    if (this.localName === 'iframe') this.setAttribute('loading', value);
+  }
+  _iframeHasOpaqueSandboxOrigin() {
+    if (this.localName !== 'iframe' || !this.hasAttribute('sandbox')) return false;
+    const tokens = String(this.getAttribute('sandbox') || '')
+      .toLowerCase().split(/\s+/).filter(Boolean);
+    return !tokens.includes('allow-same-origin');
+  }
+  _iframeHasSandboxedScripts() {
+    if (this.localName !== 'iframe' || !this.hasAttribute('sandbox')) return false;
+    const tokens = String(this.getAttribute('sandbox') || '')
+      .toLowerCase().split(/\s+/).filter(Boolean);
+    return !tokens.includes('allow-scripts');
+  }
+  _deferLazyIframeNavigation(kind, value) {
+    this._iframeLazyNavigation = { kind, value };
+    if (this._iframeLazyLoadListener) return;
+    const element = this;
+    this._iframeLazyLoadListener = () => {
+      element._iframeLazyLoadListener = null;
+      const start = () => element._startDeferredLazyIframeNavigation();
+      if (_scheduleAfter(0, start) === undefined) start();
+    };
+    globalThis.addEventListener('load', this._iframeLazyLoadListener, { once: true });
+  }
+  _startDeferredLazyIframeNavigation() {
+    const navigation = this._iframeLazyNavigation;
+    if (!navigation || !this.isConnected) return;
+    this._iframeLazyNavigation = null;
+    this._iframeForceLazyNavigation = true;
+    try {
+      if (navigation.kind === 'srcdoc') this._loadIframeSrcdoc(navigation.value);
+      else if (navigation.kind === 'blank') this._loadIframeBlank(navigation.value);
+      else this._loadIframeSrc(navigation.value);
+    } finally {
+      this._iframeForceLazyNavigation = false;
+    }
+  }
+  _resetIframeFrame(destroyBrowsingContext = false) {
     _endResourceLoadDelay(this._iframeBlankDelaysLoad);
     this._iframeBlankDelaysLoad = false;
     this._iframeBlankLoadPending = false;
@@ -4614,20 +4759,65 @@ class Element extends Node {
     this._iframeLoadingUrl = null;
     this._iframeDoc = new _IframeDocument(
       '<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
-    this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
+    if (destroyBrowsingContext) {
+      // Navigation replaces the active Window but preserves the iframe's
+      // browsing context and therefore its WindowProxy. Removing the owner
+      // element destroys that browsing context instead: a later reinsertion
+      // creates a new one and must not make an old `contentWindow` reference
+      // spring back to life.
+      const discardedWindow = _navigateIframeWindow(
+        this._iframeWin, this._iframeDoc, 'about:blank', 0, this);
+      _discardIframeWindowRealm(discardedWindow);
+      this._iframeWin = null;
+    } else {
+      this._iframeWin = _navigateIframeWindow(
+        this._iframeWin, this._iframeDoc, 'about:blank', 0, this);
+    }
   }
-  _loadIframeBlank() {
+  _loadIframeBlank(documentUrl = 'about:blank') {
     if (!this.isConnected) return;
-    if (this._iframeLoadingUrl === 'about:blank' && this._iframeBlankLoadPending) return;
+    if (!this._iframeForceLazyNavigation && this.loading === 'lazy'
+        && globalThis.document?.readyState !== 'complete') {
+      this._deferLazyIframeNavigation('blank', documentUrl);
+      return;
+    }
+    this._iframeLazyNavigation = null;
+    if (this._iframeLoadingUrl === documentUrl && this._iframeBlankLoadPending) return;
     this._resetIframeFrame();
-    this._iframeLoadingUrl = 'about:blank';
+    this._iframeLoadingUrl = documentUrl;
     this._iframeBlankLoadPending = true;
+    const inheritedBase = _domParse("document_base_url")
+      || _domParse("document_url") || "about:blank";
+    // `_resetIframeFrame` already created the empty document. Preserve those
+    // detached nodes and only apply an allowed fragment to its observable URL;
+    // creating a second facade here would leak an unreachable native subtree
+    // on every blank navigation.
+    this._iframeDoc._url = documentUrl;
+    this._iframeDoc._baseUrl = inheritedBase;
+    const box = this.getBoundingClientRect();
+    this._frameId = _core.ops.op_frame_document_ready(
+      documentUrl, inheritedBase,
+      '<!DOCTYPE html><html><head></head><body></body></html>',
+      Math.round(box.width) || 300, Math.round(box.height) || 150, 0,
+      this._iframeHasOpaqueSandboxOrigin(), this._iframeHasSandboxedScripts());
+    this._iframeWin = _navigateIframeWindow(
+      this._iframeWin, this._iframeDoc, documentUrl, this._frameId, this);
+    if (this._frameId) {
+      _obscuraFrameElements[this._frameId] = this;
+      _obscuraFrameWindows[this._frameId] = this._iframeWin;
+      // The managed document owns the lifecycle and its owner-element load.
+      // Page attaches it between event-loop turns, exactly like srcdoc.
+      return;
+    }
+
+    // If the bounded native frame queue refused the managed blank document,
+    // retain the old synthetic fallback rather than losing the load event.
     this._iframeBlankDelaysLoad = _beginResourceLoadDelay();
     const generation = this._iframeNavigationGeneration;
     const el = this;
     const complete = () => {
       if (el._iframeNavigationGeneration !== generation
-          || el._iframeLoadingUrl !== 'about:blank'
+          || el._iframeLoadingUrl !== documentUrl
           || !el._iframeBlankLoadPending) return;
       el._iframeBlankLoadPending = false;
       try {
@@ -4661,6 +4851,17 @@ class Element extends Node {
   }
   _loadIframeSrc(url) {
     if (!this.isConnected) return;
+    if (!this._iframeForceLazyNavigation && this.loading === 'lazy'
+        && globalThis.document?.readyState !== 'complete') {
+      this._deferLazyIframeNavigation('src', url);
+      return;
+    }
+    this._iframeLazyNavigation = null;
+    const blankUrl = _canonicalIframeAboutBlank(url);
+    if (blankUrl) {
+      this._loadIframeBlank(blankUrl);
+      return;
+    }
     let fullUrl = url;
     if (!url.includes('://')) {
       try { fullUrl = new URL(url, _domParse("document_base_url") || _domParse("document_url") || "about:blank").href; } catch(e) {}
@@ -4670,6 +4871,10 @@ class Element extends Node {
     if (this._iframeLoadingUrl === fullUrl) return;
     this._resetIframeFrame();
     this._iframeLoadingUrl = fullUrl;
+    // Active sandbox flags are fixed when navigation starts. Attribute changes
+    // while the response is in flight affect only a later navigation.
+    const sandboxedOrigin = this._iframeHasOpaqueSandboxOrigin();
+    const sandboxedScripts = this._iframeHasSandboxedScripts();
     const requestFrameId = _core.ops.op_reserve_frame_document();
     if (!requestFrameId) {
       this._queueIframeFallbackLoad(fullUrl);
@@ -4695,16 +4900,17 @@ class Element extends Node {
         const box = el.getBoundingClientRect();
         el._frameId = _core.ops.op_frame_document_ready(
           documentUrl, '', html, Math.round(box.width) || 300,
-          Math.round(box.height) || 150, requestFrameId);
+          Math.round(box.height) || 150, requestFrameId,
+          sandboxedOrigin, sandboxedScripts);
         el._iframeRequestFrameId = 0;
         if (el._frameId) _obscuraFrameElements[el._frameId] = el;
         el._iframeDoc = new _IframeDocument(html, documentUrl, el);
-        el._iframeWin = new _IframeWindow(el._iframeDoc, documentUrl);
+        el._iframeWin = _navigateIframeWindow(
+          el._iframeWin, el._iframeDoc, documentUrl, el._frameId, el);
         // Bind the window to the realm the host just queued. This is what makes
         // posting into the frame reach the frame's own listeners, and makes a
         // message coming back out arrive with this window as its `source`.
         if (el._frameId) {
-          el._iframeWin._frameId = el._frameId;
           _obscuraFrameWindows[el._frameId] = el._iframeWin;
           _obscuraFrameElements[el._frameId] = el;
         }
@@ -4712,7 +4918,7 @@ class Element extends Node {
         _core.ops.op_cancel_frame_document(requestFrameId);
         el._iframeRequestFrameId = 0;
         el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
-        el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
+        el._iframeWin = _navigateIframeWindow(el._iframeWin, el._iframeDoc, fullUrl, 0, el);
       }
 
       // A successfully queued document is completed by the host only after its
@@ -4725,13 +4931,19 @@ class Element extends Node {
       _core.ops.op_cancel_frame_document(requestFrameId);
       el._iframeRequestFrameId = 0;
       el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
-      el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
+      el._iframeWin = _navigateIframeWindow(el._iframeWin, el._iframeDoc, fullUrl, 0, el);
 
       _dispatchTrustedElementEvent(el, 'load');
     });
   }
   _loadIframeSrcdoc(html) {
     if (!this.isConnected) return;
+    if (!this._iframeForceLazyNavigation && this.loading === 'lazy'
+        && globalThis.document?.readyState !== 'complete') {
+      this._deferLazyIframeNavigation('srcdoc', String(html));
+      return;
+    }
+    this._iframeLazyNavigation = null;
     this._resetIframeFrame();
     this._iframeLoadingUrl = 'about:srcdoc';
     const inheritedBase = _domParse("document_base_url")
@@ -4739,13 +4951,14 @@ class Element extends Node {
     const box = this.getBoundingClientRect();
     this._frameId = _core.ops.op_frame_document_ready(
       'about:srcdoc', inheritedBase, String(html),
-      Math.round(box.width) || 300, Math.round(box.height) || 150, 0);
+      Math.round(box.width) || 300, Math.round(box.height) || 150, 0,
+      this._iframeHasOpaqueSandboxOrigin(), this._iframeHasSandboxedScripts());
     if (this._frameId) _obscuraFrameElements[this._frameId] = this;
     this._iframeDoc = new _IframeDocument(
       String(html), 'about:srcdoc', this, inheritedBase);
-    this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:srcdoc');
+    this._iframeWin = _navigateIframeWindow(
+      this._iframeWin, this._iframeDoc, 'about:srcdoc', this._frameId, this);
     if (this._frameId) {
-      this._iframeWin._frameId = this._frameId;
       _obscuraFrameWindows[this._frameId] = this._iframeWin;
       _obscuraFrameElements[this._frameId] = this;
     }
@@ -4755,6 +4968,7 @@ class Element extends Node {
   }
   get contentDocument() {
     if (this.localName !== 'iframe') return undefined;
+    if (this._iframeWin && !_iframeWindowProxyIsSameOrigin(this._iframeWin)) return null;
     const real = _frameObjectsFor(this);
     if (real?.document) return real.document;
     if (this._iframeDoc) {
@@ -4767,7 +4981,8 @@ class Element extends Node {
     }
     if (!this._iframeDoc) {
       this._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
-      this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
+      this._iframeWin = _navigateIframeWindow(
+        this._iframeWin, this._iframeDoc, 'about:blank', 0, this);
     }
     return this._iframeDoc;
   }
@@ -6212,6 +6427,38 @@ class Document extends Node {
   write(...args) {
     var html = args.join('');
     if (!html) return;
+    var scriptNid = globalThis.__currentScriptNid || 0;
+    if (scriptNid) {
+      // While a parser-inserted script is running, feed the browser-owned
+      // primary tokenizer itself. The native bridge temporarily suspends the
+      // unread response tail and returns every nested parser script at the
+      // exact html5ever pause boundary. Running that script here keeps
+      // document.write synchronous (including recursively written markup)
+      // without constructing a second fragment tree beside the live DOM.
+      var active = _domParse('document_write_active', String(scriptNid), html);
+      if (active && active.state !== 'inactive') {
+        while (active && active.state === 'script') {
+          var nestedNid = +active.nid;
+          var nested = _wrapEl(nestedNid);
+          try {
+            if (nested) __prepareInsertedScript(nested);
+          } finally {
+            active = _domParse(
+              'document_write_active_resume',
+              String(nestedNid),
+              '',
+            );
+          }
+        }
+        // Parser mutations bypass Node.appendChild, so invalidate wrapper
+        // ancestry/layout caches and enrol newly exposed resources explicitly.
+        _domMutationEpoch++;
+        _treeMutationEpoch++;
+        try { _registerWindowNamedTree(globalThis.document?.documentElement); } catch (_) {}
+        try { globalThis.__obscura_startParserCreatedResources(); } catch (_) {}
+        return;
+      }
+    }
     var body = this.body;
     if (!body) return;
     // The host parses into the input stream and returns [[parent, node], …], parents first. The
@@ -6222,7 +6469,6 @@ class Document extends Node {
     // behind it, not at the end of the body. The point moves along with every node placed,
     // even across calls, so that a script's second call lands behind the first instead of
     // directly behind the script again.
-    var scriptNid = globalThis.__currentScriptNid || 0;
     var after = null;
     if (scriptNid) {
       var anchorNid = this._writeAnchorScript === scriptNid && this._writeAnchorNid
@@ -6782,8 +7028,33 @@ globalThis.HTMLImageElement = HTMLImageElement;
 _markNative(HTMLImageElement);
 _markNative(HTMLImageElement.prototype.decode);
 
-// Report only capabilities backed by a real decoder. Poster rendering is an
-// image operation and does not make any audio/video container playable.
+async function _fetchMediaResource(url) {
+  url = String(url || "");
+  // data: resources are already local document bytes. They must not enter the
+  // page's HTTP-only transport (or the renderer's synchronous compatibility
+  // loader), and media lifecycle deliberately stops at fetched metadata rather
+  // than decoding the container. Reject only a malformed data URL with no
+  // payload separator; valid empty payloads are still successful resources.
+  if (url.startsWith("data:")) {
+    if (!url.includes(",")) throw new Error("Malformed data URL");
+    return { status: 200, url, headers: {}, body: "" };
+  }
+  const pageOrigin = _domParse("document_origin") || "null";
+  const raw = await _core.ops.op_fetch_url(
+    url, "GET", "{}", "", pageOrigin, "no-cors", "same-origin",
+    JSON.stringify([_realmFrameId, 0])
+  );
+  const response = JSON.parse(raw);
+  if (response.blocked || !(response.status >= 200 && response.status <= 299)) {
+    throw new Error(`Media resource failed with HTTP ${response.status || 0}`);
+  }
+  return response;
+}
+
+// Report only capabilities backed by a real decoder. Resource selection and
+// network lifecycle are still observable and archived; successful fetching
+// deliberately stops at HAVE_METADATA because Obscura does not decode or play
+// media containers.
 class HTMLMediaElement extends Element {
   static NETWORK_EMPTY = 0;
   static NETWORK_IDLE = 1;
@@ -6794,8 +7065,18 @@ class HTMLMediaElement extends Element {
   static HAVE_CURRENT_DATA = 2;
   static HAVE_FUTURE_DATA = 3;
   static HAVE_ENOUGH_DATA = 4;
+  constructor(nid) {
+    super(nid);
+    this._mediaRequest = 0;
+    this._mediaQueued = false;
+    this._mediaNetworkState = HTMLMediaElement.NETWORK_EMPTY;
+    this._mediaReadyState = HTMLMediaElement.HAVE_NOTHING;
+    this._mediaCurrentSrc = "";
+    this._mediaError = null;
+    this._mediaDelaysLoad = false;
+  }
   canPlayType(_type) { return ''; }
-  load() {}
+  load() { this._queueMediaRequest(true); }
   play() {
     return Promise.reject(new DOMException(
       "The element has no supported sources.",
@@ -6814,9 +7095,9 @@ class HTMLMediaElement extends Element {
   get HAVE_ENOUGH_DATA() { return HTMLMediaElement.HAVE_ENOUGH_DATA; }
   get paused() { return true; }
   get ended() { return false; }
-  get networkState() { return HTMLMediaElement.NETWORK_EMPTY; }
-  get readyState() { return HTMLMediaElement.HAVE_NOTHING; }
-  get error() { return null; }
+  get networkState() { return this._mediaNetworkState; }
+  get readyState() { return this._mediaReadyState; }
+  get error() { return this._mediaError; }
   get seeking() { return false; }
   get currentTime() { return 0; }
   set currentTime(v) {}
@@ -6832,7 +7113,19 @@ class HTMLMediaElement extends Element {
     catch (_error) { return raw; }
   }
   set src(v) { this.setAttribute('src', v); }
-  get currentSrc() { return ""; }
+  get currentSrc() { return this._mediaCurrentSrc; }
+  get preload() {
+    const value = (this.getAttribute("preload") || "auto").toLowerCase();
+    return value === "none" || value === "metadata" ? value : "auto";
+  }
+  set preload(value) { this.setAttribute("preload", value); }
+  get autoplay() { return this.hasAttribute("autoplay"); }
+  set autoplay(value) { value ? this.setAttribute("autoplay", "") : this.removeAttribute("autoplay"); }
+  get crossOrigin() { return this.getAttribute("crossorigin"); }
+  set crossOrigin(value) {
+    if (value === null) this.removeAttribute("crossorigin");
+    else this.setAttribute("crossorigin", value);
+  }
   get textTracks() {
     return TextTrackList.from(
       Array.from(this.querySelectorAll("track")).map((element) => element.track)
@@ -6841,12 +7134,110 @@ class HTMLMediaElement extends Element {
   addTextTrack(kind, label = "", language = "") {
     return new TextTrack(null, String(kind), String(label), String(language));
   }
+
+  setAttribute(name, value) {
+    const normalized = String(name).toLowerCase();
+    super.setAttribute(name, value);
+    if (normalized === "src" || normalized === "preload" || normalized === "autoplay"
+        || normalized === "crossorigin") {
+      this._mediaSourceChanged();
+    }
+  }
+
+  removeAttribute(name) {
+    const normalized = String(name).toLowerCase();
+    super.removeAttribute(name);
+    if (normalized === "src" || normalized === "preload" || normalized === "autoplay"
+        || normalized === "crossorigin") {
+      this._mediaSourceChanged();
+    }
+  }
+
+  _selectedMediaSource() {
+    const direct = this.getAttribute("src");
+    if (direct) return _resolveResourceUrl(direct);
+    for (const source of this.querySelectorAll("source")) {
+      const raw = source.getAttribute("src");
+      if (!raw) continue;
+      const type = source.getAttribute("type") || "";
+      if (type && !this.canPlayType(type)) continue;
+      return _resolveResourceUrl(raw);
+    }
+    return "";
+  }
+
+  _mediaSourceChanged() {
+    this._finishMediaLoadDelay();
+    this._mediaRequest++;
+    this._mediaQueued = false;
+    this._mediaNetworkState = HTMLMediaElement.NETWORK_EMPTY;
+    this._mediaReadyState = HTMLMediaElement.HAVE_NOTHING;
+    this._mediaCurrentSrc = "";
+    this._mediaError = null;
+    if (this.isConnected && (this.preload !== "none" || this.autoplay)) {
+      this._queueMediaRequest(false);
+    }
+  }
+
+  _queueMediaRequest(force) {
+    if ((!this.isConnected && !force) || this._mediaQueued) return;
+    if (!force && this.preload === "none" && !this.autoplay) return;
+    const selected = this._selectedMediaSource();
+    if (!selected) {
+      this._mediaNetworkState = HTMLMediaElement.NETWORK_NO_SOURCE;
+      return;
+    }
+    const request = ++this._mediaRequest;
+    this._mediaQueued = true;
+    this._mediaCurrentSrc = selected;
+    this._mediaNetworkState = HTMLMediaElement.NETWORK_LOADING;
+    this._mediaReadyState = HTMLMediaElement.HAVE_NOTHING;
+    this._mediaError = null;
+    this._mediaDelaysLoad = this.isConnected && _beginResourceLoadDelay();
+    Promise.resolve(_fetchMediaResource(selected)).then(
+      () => {
+        if (request !== this._mediaRequest) return;
+        this._mediaQueued = false;
+        this._mediaNetworkState = HTMLMediaElement.NETWORK_IDLE;
+        this._mediaReadyState = HTMLMediaElement.HAVE_METADATA;
+        this._finishMediaLoadDelay();
+        try { _dispatchTrustedElementEvent(this, "loadedmetadata"); } catch (_error) {}
+        try { _dispatchTrustedElementEvent(this, "suspend"); } catch (_error) {}
+      },
+      error => {
+        if (request !== this._mediaRequest) return;
+        this._mediaQueued = false;
+        this._mediaNetworkState = HTMLMediaElement.NETWORK_NO_SOURCE;
+        this._mediaReadyState = HTMLMediaElement.HAVE_NOTHING;
+        this._mediaError = { code: 4, message: String(error && error.message || error) };
+        this._finishMediaLoadDelay();
+        try { _dispatchTrustedElementEvent(this, "error"); } catch (_error) {}
+      },
+    );
+  }
+
+  _finishMediaLoadDelay() {
+    _endResourceLoadDelay(this._mediaDelaysLoad);
+    this._mediaDelaysLoad = false;
+  }
+
+  _cancelMediaRequest() {
+    this._mediaRequest++;
+    this._mediaQueued = false;
+    this._finishMediaLoadDelay();
+  }
 }
 _markNative(HTMLMediaElement.prototype.canPlayType);
 _markNative(HTMLMediaElement.prototype.play);
 _markNative(HTMLMediaElement.prototype.load);
 _markNative(HTMLMediaElement.prototype.pause);
 class HTMLVideoElement extends HTMLMediaElement {
+  constructor(nid) {
+    super(nid);
+    this._posterRequest = 0;
+    this._posterQueued = false;
+    this._posterDelaysLoad = false;
+  }
   get poster() {
     const raw = this.getAttribute("poster");
     if (!raw) return "";
@@ -6856,8 +7247,83 @@ class HTMLVideoElement extends HTMLMediaElement {
   set poster(value) { this.setAttribute("poster", value); }
   get videoWidth() { return 0; }
   get videoHeight() { return 0; }
+
+  setAttribute(name, value) {
+    const normalized = String(name).toLowerCase();
+    super.setAttribute(name, value);
+    if (normalized === "poster") this._queuePosterRequest();
+  }
+
+  removeAttribute(name) {
+    const normalized = String(name).toLowerCase();
+    super.removeAttribute(name);
+    if (normalized === "poster") {
+      this._posterRequest++;
+      this._posterQueued = false;
+      _endResourceLoadDelay(this._posterDelaysLoad);
+      this._posterDelaysLoad = false;
+    }
+  }
+
+  _queuePosterRequest() {
+    if (!this.isConnected || this._posterQueued || !this.poster) return;
+    const request = ++this._posterRequest;
+    const url = this.poster;
+    this._posterQueued = true;
+    this._posterDelaysLoad = _beginResourceLoadDelay();
+    Promise.resolve(_fetchMediaResource(url)).then(
+      () => {
+        if (request !== this._posterRequest) return;
+        this._posterQueued = false;
+        _endResourceLoadDelay(this._posterDelaysLoad);
+        this._posterDelaysLoad = false;
+      },
+      () => {
+        if (request !== this._posterRequest) return;
+        this._posterQueued = false;
+        _endResourceLoadDelay(this._posterDelaysLoad);
+        this._posterDelaysLoad = false;
+      },
+    );
+  }
+
+  _cancelPosterRequest() {
+    this._posterRequest++;
+    this._posterQueued = false;
+    _endResourceLoadDelay(this._posterDelaysLoad);
+    this._posterDelaysLoad = false;
+  }
 }
 class HTMLAudioElement extends HTMLMediaElement {}
+class HTMLSourceElement extends Element {
+  get src() {
+    const raw = this.getAttribute("src");
+    return raw ? _resolveResourceUrl(raw) : "";
+  }
+  set src(value) { this.setAttribute("src", value); }
+  get type() { return this.getAttribute("type") || ""; }
+  set type(value) { this.setAttribute("type", value); }
+  get media() { return this.getAttribute("media") || ""; }
+  set media(value) { this.setAttribute("media", value); }
+
+  setAttribute(name, value) {
+    const normalized = String(name).toLowerCase();
+    super.setAttribute(name, value);
+    if (["src", "type", "media"].includes(normalized)
+        && this.parentNode instanceof HTMLMediaElement) {
+      this.parentNode._mediaSourceChanged();
+    }
+  }
+
+  removeAttribute(name) {
+    const normalized = String(name).toLowerCase();
+    super.removeAttribute(name);
+    if (["src", "type", "media"].includes(normalized)
+        && this.parentNode instanceof HTMLMediaElement) {
+      this.parentNode._mediaSourceChanged();
+    }
+  }
+}
 class HTMLTrackElement extends Element {
   static NONE = 0;
   static LOADING = 1;
@@ -6865,7 +7331,19 @@ class HTMLTrackElement extends Element {
   static ERROR = 3;
   get kind() { return this.getAttribute("kind") || "subtitles"; }
   set kind(value) { this.setAttribute("kind", value); }
-  get src() { return this.getAttribute("src") || ""; }
+  constructor(nid) {
+    super(nid);
+    this._trackReadyState = this.src.startsWith("data:")
+      ? HTMLTrackElement.LOADED
+      : HTMLTrackElement.NONE;
+    this._trackRequest = 0;
+    this._trackQueued = false;
+    this._trackDelaysLoad = false;
+  }
+  get src() {
+    const raw = this.getAttribute("src");
+    return raw ? _resolveResourceUrl(raw) : "";
+  }
   set src(value) { this.setAttribute("src", value); }
   get srclang() { return this.getAttribute("srclang") || ""; }
   set srclang(value) { this.setAttribute("srclang", value); }
@@ -6873,17 +7351,73 @@ class HTMLTrackElement extends Element {
   set label(value) { this.setAttribute("label", value); }
   get default() { return this.hasAttribute("default"); }
   set default(value) { value ? this.setAttribute("default", "") : this.removeAttribute("default"); }
-  get readyState() { return HTMLTrackElement.LOADED; }
+  get readyState() { return this._trackReadyState; }
   get track() {
     if (!this._textTrack) {
       this._textTrack = new TextTrack(this, this.kind, this.label, this.srclang);
     }
     return this._textTrack;
   }
+
+  setAttribute(name, value) {
+    const normalized = String(name).toLowerCase();
+    super.setAttribute(name, value);
+    if (normalized === "src" || normalized === "default") this._queueTrackRequest();
+  }
+
+  removeAttribute(name) {
+    const normalized = String(name).toLowerCase();
+    super.removeAttribute(name);
+    if (normalized === "src" || normalized === "default") {
+      this._trackRequest++;
+      this._trackQueued = false;
+      this._trackReadyState = HTMLTrackElement.NONE;
+      _endResourceLoadDelay(this._trackDelaysLoad);
+      this._trackDelaysLoad = false;
+    }
+  }
+
+  _queueTrackRequest() {
+    if (!this.isConnected || !this.default || !this.src || this._trackQueued) return;
+    if (this.src.startsWith("data:")) {
+      this._trackReadyState = HTMLTrackElement.LOADED;
+      return;
+    }
+    const request = ++this._trackRequest;
+    this._trackQueued = true;
+    this._trackReadyState = HTMLTrackElement.LOADING;
+    this._trackDelaysLoad = _beginResourceLoadDelay();
+    Promise.resolve(_fetchMediaResource(this.src)).then(
+      () => {
+        if (request !== this._trackRequest) return;
+        this._trackQueued = false;
+        this._trackReadyState = HTMLTrackElement.LOADED;
+        _endResourceLoadDelay(this._trackDelaysLoad);
+        this._trackDelaysLoad = false;
+        try { _dispatchTrustedElementEvent(this, "load"); } catch (_error) {}
+      },
+      () => {
+        if (request !== this._trackRequest) return;
+        this._trackQueued = false;
+        this._trackReadyState = HTMLTrackElement.ERROR;
+        _endResourceLoadDelay(this._trackDelaysLoad);
+        this._trackDelaysLoad = false;
+        try { _dispatchTrustedElementEvent(this, "error"); } catch (_error) {}
+      },
+    );
+  }
+
+  _cancelTrackRequest() {
+    this._trackRequest++;
+    this._trackQueued = false;
+    _endResourceLoadDelay(this._trackDelaysLoad);
+    this._trackDelaysLoad = false;
+  }
 }
 globalThis.HTMLMediaElement = HTMLMediaElement;
 globalThis.HTMLVideoElement = HTMLVideoElement;
 globalThis.HTMLAudioElement = HTMLAudioElement;
+globalThis.HTMLSourceElement = HTMLSourceElement;
 globalThis.HTMLTrackElement = HTMLTrackElement;
 globalThis.TextTrack = TextTrack;
 globalThis.TextTrackList = TextTrackList;
@@ -6974,6 +7508,7 @@ function _elementClassFor(nid) {
   if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
   if (tag === "AUDIO") return HTMLAudioElement;
   if (tag === "VIDEO") return HTMLVideoElement;
+  if (tag === "SOURCE") return HTMLSourceElement;
   if (tag === "TRACK") return HTMLTrackElement;
   return Element;
 }
@@ -6995,6 +7530,7 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
     if (tag === "AUDIO") return HTMLAudioElement;
     if (tag === "VIDEO") return HTMLVideoElement;
+    if (tag === "SOURCE") return HTMLSourceElement;
     if (tag === "TRACK") return HTMLTrackElement;
   }
   return Element;
@@ -12739,8 +13275,113 @@ class _IframeDocument {
 }
 
 const _iframeRealmGlobalCache = new WeakMap();
+// A browsing context owns one WindowProxy for its whole lifetime. The object
+// behind it changes on navigation, including the transition from the initial
+// about:blank document to a managed V8 realm. Keep the proxy target in a
+// closure-private table so page code cannot swap the realm backend or retain a
+// discarded context through an exposed implementation field.
+const _iframeWindowProxyTargets = new WeakMap();
+const _iframeWindowTargetStates = new WeakMap();
 let _iframeRealmGlobalNames = [];
 let _iframeRealmGlobalNameSet = new Set();
+
+function _iframeWindowLocation(url, iframeElement) {
+  let parsed;
+  try { parsed = new URL(url); } catch (_) { parsed = null; }
+  const opaque = iframeElement?._iframeHasOpaqueSandboxOrigin?.() === true;
+  const inheritedOrigin = !opaque && (_canonicalIframeAboutBlank(url) || url === 'about:srcdoc')
+    ? _realmOrigin()
+    : null;
+  const location = {
+    href: url,
+    origin: opaque ? 'null' : (inheritedOrigin || parsed?.origin || ''),
+    protocol: parsed?.protocol || '',
+    host: parsed?.host || '',
+    hostname: parsed?.hostname || '',
+    port: parsed?.port || '',
+    pathname: parsed?.pathname || '/',
+    search: parsed?.search || '',
+    hash: parsed?.hash || '',
+    toString() { return this.href; },
+    assign() {}, reload() {}, replace() {},
+  };
+  return location;
+}
+
+function _iframeWindowIsSameOrigin(url, iframeElement) {
+  if (iframeElement?._iframeHasOpaqueSandboxOrigin?.() === true) return false;
+  if (_canonicalIframeAboutBlank(url) || url === 'about:srcdoc') return true;
+  try { return new URL(url).origin === _realmOrigin(); } catch (_) { return false; }
+}
+
+function _canonicalIframeAboutBlank(value) {
+  if (value == null || String(value) === '') return 'about:blank';
+  try {
+    const url = new URL(String(value));
+    if (url.protocol === 'about:' && url.pathname === 'blank' && !url.search) {
+      return url.href;
+    }
+  } catch (_) {}
+  return null;
+}
+
+const _crossOriginWindowKeys = new Set([
+  'window', 'self', 'location', 'close', 'closed', 'focus', 'blur',
+  'frames', 'length', 'top', 'opener', 'parent', 'postMessage',
+]);
+
+function _navigateIframeWindow(proxy, document, url, frameId, iframeElement) {
+  const target = proxy && _iframeWindowProxyTargets.get(proxy);
+  if (target) {
+    const state = _iframeWindowTargetStates.get(target);
+    // The WindowProxy persists, but author globals belong to the old Window.
+    // Keep only the synthetic interface installed by the browser when a new
+    // document replaces that backend.
+    for (const key of Reflect.ownKeys(target)) {
+      if (!state.syntheticKeys.has(key)) {
+        try { Reflect.deleteProperty(target, key); } catch (_) {}
+      }
+    }
+    state.realmWindow = null;
+    state.frameId = frameId >>> 0;
+    state.iframeElement = iframeElement || state.iframeElement;
+    state.sameOrigin = _iframeWindowIsSameOrigin(url, state.iframeElement);
+    target.document = document;
+    target._url = url;
+    target.frameElement = state.iframeElement;
+    target.closed = false;
+    target.location = _iframeWindowLocation(url, state.iframeElement);
+    return proxy;
+  }
+  return new _IframeWindow(document, url, frameId, iframeElement);
+}
+
+function _attachIframeWindowRealm(proxy, frameWindow, frameDocument, frameId) {
+  const target = proxy && _iframeWindowProxyTargets.get(proxy);
+  if (!target) return false;
+  const state = _iframeWindowTargetStates.get(target);
+  state.realmWindow = frameWindow;
+  state.frameId = frameId >>> 0;
+  if (frameDocument) target.document = frameDocument;
+  target.closed = false;
+  return true;
+}
+
+function _discardIframeWindowRealm(proxy) {
+  const target = proxy && _iframeWindowProxyTargets.get(proxy);
+  if (!target) return false;
+  const state = _iframeWindowTargetStates.get(target);
+  state.realmWindow = null;
+  state.frameId = 0;
+  target.closed = true;
+  return true;
+}
+
+function _iframeWindowProxyIsSameOrigin(proxy) {
+  const target = proxy && _iframeWindowProxyTargets.get(proxy);
+  const state = target && _iframeWindowTargetStates.get(target);
+  return !state || state.sameOrigin;
+}
 
 function _iframeSourceIsConstructor(value) {
   try {
@@ -12802,32 +13443,88 @@ function _iframeRealmGlobal(target, name) {
 
 const _iframeWindowProxyHandler = {
   get(target, key, receiver) {
-    if (key === 'globalThis') return receiver;
-    if (Reflect.has(target, key)) return Reflect.get(target, key, receiver);
+    const state = _iframeWindowTargetStates.get(target);
+    if (state && !state.sameOrigin && typeof key === 'string'
+        && key !== '__obscura_wrapsRealm' && !_crossOriginWindowKeys.has(key)) {
+      return undefined;
+    }
+    if (key === 'globalThis' || key === 'self' || key === 'window' || key === 'frames') {
+      return receiver;
+    }
+    if (key === '__obscura_wrapsRealm') return Boolean(state?.realmWindow);
+    if (key === 'postMessage') return state?.postMessage;
+    const realm = state?.realmWindow;
+    if (realm) {
+      try {
+        if (Reflect.has(realm, key)) return Reflect.get(realm, key);
+      } catch (_) {
+        // A context can be detached between two host turns. Fall through to
+        // the safe synthetic surface instead of touching a severed global.
+      }
+    }
+    if (Reflect.has(target, key)) return Reflect.get(target, key, target);
     if (typeof key === 'string' && _iframeRealmGlobalNameSet.has(key)) {
       return _iframeRealmGlobal(target, key);
     }
     return undefined;
   },
   has(target, key) {
-    return key === 'globalThis'
-      || Reflect.has(target, key)
+    const state = _iframeWindowTargetStates.get(target);
+    if (state && !state.sameOrigin && typeof key === 'string'
+        && key !== '__obscura_wrapsRealm' && !_crossOriginWindowKeys.has(key)) {
+      return false;
+    }
+    let realmHas = false;
+    try { realmHas = Boolean(state?.realmWindow && Reflect.has(state.realmWindow, key)); }
+    catch (_) {}
+    return key === 'globalThis' || key === 'self' || key === 'window' || key === 'frames'
+      || key === '__obscura_wrapsRealm' || key === 'postMessage'
+      || realmHas || Reflect.has(target, key)
       || (typeof key === 'string' && _iframeRealmGlobalNameSet.has(key));
   },
   ownKeys(target) {
+    const state = _iframeWindowTargetStates.get(target);
     const keys = Reflect.ownKeys(target);
     const seen = new Set(keys);
+    try {
+      if (state?.realmWindow) {
+        for (const key of Reflect.ownKeys(state.realmWindow)) {
+          if (!seen.has(key)) { keys.push(key); seen.add(key); }
+        }
+      }
+    } catch (_) {}
     for (const name of _iframeRealmGlobalNames) {
-      if (!seen.has(name)) keys.push(name);
+      if (!seen.has(name)) { keys.push(name); seen.add(name); }
     }
-    if (!seen.has('globalThis')) keys.push('globalThis');
+    for (const name of ['globalThis', 'self', 'window', 'frames']) {
+      if (!seen.has(name)) { keys.push(name); seen.add(name); }
+    }
     return keys;
   },
   getOwnPropertyDescriptor(target, key) {
+    const state = _iframeWindowTargetStates.get(target);
+    if (state && !state.sameOrigin && typeof key === 'string'
+        && key !== '__obscura_wrapsRealm' && !_crossOriginWindowKeys.has(key)) {
+      return undefined;
+    }
     const own = Reflect.getOwnPropertyDescriptor(target, key);
     if (own) return own;
-    if (key === 'globalThis') {
-      return { value: target.self, writable: true, enumerable: false, configurable: true };
+    if (key === 'globalThis' || key === 'self' || key === 'window' || key === 'frames') {
+      return { value: state?.proxy, writable: true, enumerable: false, configurable: true };
+    }
+    if (key === 'postMessage') {
+      return { value: state?.postMessage, writable: true, enumerable: true, configurable: true };
+    }
+    try {
+      const descriptor = state?.realmWindow
+        ? Reflect.getOwnPropertyDescriptor(state.realmWindow, key)
+        : undefined;
+      if (descriptor) {
+        // The descriptor belongs to a replaceable backend, so it cannot be
+        // non-configurable on the stable proxy target.
+        return { ...descriptor, configurable: true };
+      }
+    } catch (_) {
     }
     if (typeof key === 'string' && _iframeRealmGlobalNameSet.has(key)) {
       return {
@@ -12839,6 +13536,41 @@ const _iframeWindowProxyHandler = {
     }
     return undefined;
   },
+  set(target, key, value) {
+    const state = _iframeWindowTargetStates.get(target);
+    if (state && !state.sameOrigin && typeof key === 'string'
+        && key !== 'location' && !_crossOriginWindowKeys.has(key)) {
+      return false;
+    }
+    if (key === 'self' || key === 'window' || key === 'frames' || key === 'globalThis') {
+      return true;
+    }
+    try {
+      if (state?.realmWindow) return Reflect.set(state.realmWindow, key, value);
+    } catch (_) {}
+    return Reflect.set(target, key, value, target);
+  },
+  deleteProperty(target, key) {
+    const state = _iframeWindowTargetStates.get(target);
+    if (state && !state.sameOrigin) return false;
+    try {
+      if (state?.realmWindow) return Reflect.deleteProperty(state.realmWindow, key);
+    } catch (_) {}
+    return Reflect.deleteProperty(target, key);
+  },
+  defineProperty(target, key, descriptor) {
+    const state = _iframeWindowTargetStates.get(target);
+    if (state && !state.sameOrigin) return false;
+    try {
+      if (state?.realmWindow) {
+        return Reflect.defineProperty(state.realmWindow, key, descriptor);
+      }
+    } catch (_) {}
+    // Navigation replaces the backing Window, so an author property may not
+    // pin the stable proxy target as non-configurable across that replacement.
+    return Reflect.defineProperty(target, key, { ...descriptor, configurable: true });
+  },
+  preventExtensions() { return false; },
 };
 
 // Cross-realm messaging.
@@ -12898,6 +13630,10 @@ globalThis.__obscura_publishFrameObjects = function(frameId, frameWindow, frameD
   frameId = frameId >>> 0;
   if (!frameId) return false;
   _obscuraFrameObjects[frameId] = { window: frameWindow, document: frameDocument };
+  // Publication replaces the Window backend, never the WindowProxy. This is
+  // what keeps an early `const w = iframe.contentWindow` useful after the
+  // managed realm commits.
+  _frameWindowFor(frameId);
   return true;
 };
 // The frames of this realm whose element is still in the document.
@@ -12930,6 +13666,9 @@ globalThis.__obscura_dispatchFrameOwnerLoad = function(frameId) {
     const element = _obscuraFrameElements[frameId];
     if (!element || !element.isConnected || element._frameId !== frameId) return false;
     if (element._iframeLoadDispatchedFrameId === frameId) return false;
+    if (_canonicalIframeAboutBlank(element._iframeLoadingUrl)) {
+      element._iframeBlankLoadPending = false;
+    }
     _dispatchTrustedElementEvent(element, "load");
     element._iframeLoadDispatchedFrameId = frameId;
     return true;
@@ -12941,9 +13680,10 @@ globalThis.__obscura_dispatchFrameOwnerLoad = function(frameId) {
 globalThis.__obscura_forgetFrame = function (frameId) {
   frameId = frameId >>> 0;
   const element = _obscuraFrameElements[frameId];
+  const proxy = element?._iframeWin || _obscuraFrameWindows[frameId];
+  _discardIframeWindowRealm(proxy);
   if (element && element._frameId === frameId) {
     element._frameId = 0;
-    if (element._iframeWin) element._iframeWin._frameId = 0;
   }
   delete _obscuraFrameElements[frameId];
   delete _obscuraFrameObjects[frameId];
@@ -12993,26 +13733,20 @@ function _frameObjectsFor(element) {
 // and receiver, losing the sender's origin and source.
 function _frameWindowFor(frameId) {
   if (!frameId) return null;
-  const real = _obscuraFrameObjects[frameId]?.window;
-  const existing = _obscuraFrameWindows[frameId];
+  const objects = _obscuraFrameObjects[frameId];
+  const real = objects?.window;
+  const element = _obscuraFrameElements[frameId];
+  const existing = element?._iframeWin || _obscuraFrameWindows[frameId];
   if (!real) return existing || null;
-  if (existing && existing.__obscura_wrapsRealm) return existing;
+  if (existing && _attachIframeWindowRealm(existing, real, objects?.document, frameId)) {
+    _obscuraFrameWindows[frameId] = existing;
+    return existing;
+  }
 
-  const post = _markNative(function (data, _targetOrigin, _transfer) {
-    _sendRealmMessage(frameId, data);
-  });
-  const win = new Proxy(real, {
-    get(target, prop) {
-      if (prop === 'postMessage') return post;
-      if (prop === '__obscura_wrapsRealm') return true;
-      // Not `receiver`: an accessor on a real global must run with the global
-      // itself as `this`, not with this proxy.
-      return Reflect.get(target, prop);
-    },
-    has(target, prop) {
-      return prop === '__obscura_wrapsRealm' || Reflect.has(target, prop);
-    },
-  });
+  // Defensive compatibility path for a host publication that did not start
+  // from an iframe element. Normal frame navigation always has a stable proxy.
+  const win = new _IframeWindow(objects?.document, 'about:blank', frameId, element);
+  _attachIframeWindowRealm(win, real, objects?.document, frameId);
   _obscuraFrameWindows[frameId] = win;
   return win;
 }
@@ -13106,12 +13840,12 @@ function _installFramingRelationships() {
 }
 
 class _IframeWindow {
-  constructor(doc, url) {
+  constructor(doc, url, frameId = 0, iframeElement = null) {
     this.document = doc;
     this._url = url;
     this.top = globalThis;
     this.parent = globalThis;
-    this.frameElement = null;
+    this.frameElement = iframeElement;
     this.length = 0;
     this.name = '';
     this.closed = false;
@@ -13129,22 +13863,23 @@ class _IframeWindow {
     this.console = globalThis.console;
     this.chrome = globalThis.chrome;
 
-    try {
-      const u = new URL(url);
-      this.location = {
-        href: url, origin: u.origin, protocol: u.protocol,
-        host: u.host, hostname: u.hostname, port: u.port,
-        pathname: u.pathname, search: u.search, hash: u.hash,
-        toString() { return url; }, assign(){}, reload(){}, replace(){},
-      };
-    } catch(e) {
-      this.location = { href: url, origin: '', protocol: '', host: '', hostname: '', port: '', pathname: '/', search: '', hash: '', toString() { return url; }, assign(){}, reload(){}, replace(){} };
-    }
+    this.location = _iframeWindowLocation(url, iframeElement);
 
     const proxy = new Proxy(this, _iframeWindowProxyHandler);
-    this.self = proxy;
-    this.window = proxy;
-    this.frames = proxy;
+    const state = {
+      realmWindow: null,
+      proxy,
+      frameId: frameId >>> 0,
+      iframeElement,
+      sameOrigin: _iframeWindowIsSameOrigin(url, iframeElement),
+      postMessage: null,
+      syntheticKeys: new Set(Reflect.ownKeys(this)),
+    };
+    state.postMessage = _markNative((data, _targetOrigin, _transfer) => {
+      if (state.frameId) _sendRealmMessage(state.frameId, data);
+    });
+    _iframeWindowProxyTargets.set(proxy, this);
+    _iframeWindowTargetStates.set(this, state);
     return proxy;
   }
 
@@ -13153,8 +13888,9 @@ class _IframeWindow {
     // event on the *parent's* window, so a page could never actually talk to
     // the document inside its iframe. A frame that has not loaded yet has no
     // browsing context to receive anything.
-    if (!this._frameId) return;
-    _sendRealmMessage(this._frameId, data);
+    const target = _iframeWindowProxyTargets.get(this) || this;
+    const state = _iframeWindowTargetStates.get(target);
+    if (state?.frameId) _sendRealmMessage(state.frameId, data);
   }
 
   setTimeout(fn, ms) { return globalThis.setTimeout(fn, ms); }
@@ -14755,11 +15491,20 @@ if (typeof Image === 'undefined') {
 }
 
 if (typeof Audio === 'undefined') {
-  globalThis.Audio = class Audio {
-    constructor(src) { this.src = src || ''; this.paused = true; this.volume = 1; this.currentTime = 0; this.duration = 0; }
-    play() { return Promise.resolve(); } pause() { this.paused = true; } load() {}
-    addEventListener() {} removeEventListener() {}
+  // Match the HTML constructor: `new Audio(url)` creates a real detached
+  // HTMLAudioElement. It begins resource selection once connected (or when
+  // load() is explicitly called), and shares the same load/error lifecycle as
+  // elements created through document.createElement().
+  globalThis.Audio = function Audio(src) {
+    const audio = document.createElement('audio');
+    audio.preload = 'auto';
+    if (src !== undefined && src !== null && String(src) !== '') {
+      audio.src = String(src);
+      audio._queueMediaRequest(true);
+    }
+    return audio;
   };
+  globalThis.Audio.prototype = globalThis.HTMLAudioElement.prototype;
 }
 
 if (typeof FileReader === 'undefined') {
@@ -15257,12 +16002,25 @@ if (typeof FontFace === 'undefined') {
       this._status = 'loading';
       this._changed();
       const loaded = this.loaded;
-      Promise.resolve().then(() => {
-        if (this._status !== 'loading') return;
-        this._status = 'loaded';
-        this._resolveLoaded?.(this);
-        this._changed();
-      });
+      const match = /url\(\s*(?:(["'])(.*?)\1|([^\s)]+))\s*\)/i.exec(this._source);
+      const rawUrl = match ? (match[2] || match[3] || '') : '';
+      const fetchPromise = rawUrl && !rawUrl.startsWith('data:')
+        ? _fetchMediaResource(_resolveResourceUrl(rawUrl))
+        : Promise.resolve();
+      Promise.resolve(fetchPromise).then(
+        () => {
+          if (this._status !== 'loading') return;
+          this._status = 'loaded';
+          this._resolveLoaded?.(this);
+          this._changed();
+        },
+        error => {
+          if (this._status !== 'loading') return;
+          this._status = 'error';
+          this._rejectLoaded?.(error);
+          this._changed();
+        },
+      );
       return loaded;
     }
   };
@@ -15544,6 +16302,84 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
   };
 }
 
+// Start resources that were created by the HTML parser rather than by an IDL
+// setter. Streaming hosts invoke this after each tokenizer yield, so a weak set
+// prevents completed media/track loads from being restarted while image and
+// frame queue methods retain their own generation guards as a second line of
+// defence. Every document gets a fresh realm and therefore a fresh set.
+function _startParserCreatedResources() {
+  const preparedMediaThisSweep = _parserResourcePreparation.newSweepTracker();
+  // Use the native shadow-including traversal for declarative shadow roots.
+  for (const nid of (_domParse('connected_images') || [])) {
+    const image = _wrapEl(nid);
+    if (image instanceof HTMLImageElement && image.loading !== 'lazy'
+        && !_parserResourcePreparation.has(image)) {
+      _parserResourcePreparation.mark(image);
+      image._queueImageRequest();
+    }
+  }
+
+  for (const nid of (_domParse('connected_media') || [])) {
+    const media = _wrapEl(nid);
+    if (_parserResourcePreparation.has(media)) continue;
+    _parserResourcePreparation.mark(media);
+    _parserResourcePreparation.trackerMark(preparedMediaThisSweep, media);
+    if (media instanceof HTMLMediaElement) media._queueMediaRequest(false);
+    if (media instanceof HTMLVideoElement) media._queuePosterRequest();
+  }
+  // A <source> can appear after a parser pause inside an already-seen media
+  // element. Re-run resource selection exactly once for each newly exposed
+  // source, unless the parent itself was first prepared in this same sweep.
+  for (const nid of (_domParse('connected_sources') || [])) {
+    const source = _wrapEl(nid);
+    if (_parserResourcePreparation.has(source)) continue;
+    _parserResourcePreparation.mark(source);
+    const media = source.parentNode;
+    if (media instanceof HTMLMediaElement && !media.currentSrc
+        && !_parserResourcePreparation.trackerHas(preparedMediaThisSweep, media)) {
+      _parserResourcePreparation.trackerMark(preparedMediaThisSweep, media);
+      media._mediaSourceChanged();
+    }
+  }
+  for (const nid of (_domParse('connected_tracks') || [])) {
+    const track = _wrapEl(nid);
+    if (track instanceof HTMLTrackElement && track.default
+        && !_parserResourcePreparation.has(track)) {
+      _parserResourcePreparation.mark(track);
+      track._queueTrackRequest();
+    }
+  }
+
+  // querySelectorAll intentionally cannot pierce declarative shadow roots,
+  // but their browsing contexts still load.  `srcdoc` has priority over `src`,
+  // including when its value is empty.
+  for (const nid of (_domParse('connected_iframes') || [])) {
+    const frame = _wrapEl(nid);
+    if (_parserResourcePreparation.has(frame)) continue;
+    _parserResourcePreparation.mark(frame);
+    if (frame.hasAttribute('srcdoc')) {
+      if (frame._iframeLoadingUrl !== 'about:srcdoc') {
+        frame._loadIframeSrcdoc(frame.getAttribute('srcdoc') || '');
+      }
+      continue;
+    }
+    const src = frame.getAttribute('src');
+    const blankUrl = _canonicalIframeAboutBlank(src);
+    if (blankUrl) {
+      if (frame._iframeLoadingUrl !== blankUrl) frame._loadIframeBlank(blankUrl);
+    } else {
+      frame._loadIframeSrc(src);
+    }
+  }
+}
+
+Object.defineProperty(globalThis, '__obscura_startParserCreatedResources', {
+  value: function() { return _startParserCreatedResources(); },
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
+
 globalThis.__obscura_init = function() {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
@@ -15614,30 +16450,11 @@ globalThis.__obscura_init = function() {
   // wrongly changes everything after it.
   _installFramingRelationships();
 
-  // Parser-created images never pass through an IDL setter. Start every eager
-  // request before parser scripts can finish the document so the top-level
-  // load gate includes images even when page JavaScript never touches them.
-  // Use the native shadow-including traversal for declarative shadow roots.
-  for (const nid of (_domParse('connected_images') || [])) {
-    const image = _wrapEl(nid);
-    if (image instanceof HTMLImageElement && image.loading !== 'lazy') {
-      image._queueImageRequest();
-    }
-  }
-
-  // Parser-created iframes never went through an IDL setter. Ask the native
-  // tree for a shadow-including list: querySelectorAll intentionally cannot
-  // pierce declarative shadow roots, but their browsing contexts still load.
-  // `srcdoc` has priority over `src`, including when its value is empty.
-  for (const nid of (_domParse('connected_iframes') || [])) {
-    const frame = _wrapEl(nid);
-    if (frame.hasAttribute('srcdoc')) {
-      frame._loadIframeSrcdoc(frame.getAttribute('srcdoc') || '');
-      continue;
-    }
-    const src = frame.getAttribute('src');
-    if (src && src !== 'about:blank') frame._loadIframeSrc(src);
-    else frame._loadIframeBlank();
+  // A buffered compatibility document is already complete here. A streaming
+  // child is temporarily backed by an inert discovery tree and must not start
+  // those resources before the live tokenizer reaches them.
+  if (!globalThis.__obscura_streamingDocumentInit) {
+    _startParserCreatedResources();
   }
 
   // Hide internals (_*, obscura, Obscura). The set of keys is static at

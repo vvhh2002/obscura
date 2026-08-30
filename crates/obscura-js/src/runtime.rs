@@ -247,6 +247,24 @@ fn with_sync_render_loading_disabled<R>(
     }
 }
 
+/// Browser documents fetch render resources through their asynchronous page
+/// transport. Once that transport exists, a synchronous CSSOM/layout read must
+/// never fall back to `HttpResourceLoader`: doing so from a current-thread
+/// runtime can wait on the same event loop which must serve the response.
+/// Standalone render runtimes without a page transport retain the compatibility
+/// loader used by focused renderer tests.
+#[cfg(feature = "render")]
+fn disable_sync_render_loading_for_page_transport(state: &mut ObscuraState) {
+    #[cfg(feature = "stealth")]
+    let has_page_transport = state.http_client.is_some() || state.stealth_client.is_some();
+    #[cfg(not(feature = "stealth"))]
+    let has_page_transport = state.http_client.is_some();
+
+    if has_page_transport {
+        state.render_resources.set_sync_loading_enabled(false);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteObjectInfo {
     pub js_type: String,
@@ -279,10 +297,6 @@ pub struct ObscuraJsRuntime {
     /// the same ModuleId is evaluated twice, so retain the first outcome for
     /// duplicate script tags and roots already seen by Obscura.
     module_evaluations: HashMap<deno_core::ModuleId, Result<(), String>>,
-    /// Append-only record owned by the module loader. A cursor around each
-    /// graph load identifies the dependency specifiers that become evaluated
-    /// with its root.
-    loaded_module_specifiers: Rc<RefCell<Vec<String>>>,
     /// Successful graph evaluation also evaluates every dependency. Remember
     /// those URLs so a dependency later encountered as a top-level script is a
     /// browser-style no-op instead of a second deno_core `mod_evaluate` call.
@@ -306,11 +320,12 @@ fn exception_text(
 
 /// A fetched and instantiated module graph whose evaluation is intentionally
 /// delayed until the HTML script scheduler reaches its post-parse turn.
+#[derive(Clone)]
 pub struct PreparedModule {
     module_id: deno_core::ModuleId,
     description: String,
     entry_specifier: Option<String>,
-    graph_specifiers: Vec<String>,
+    graph_modules: Vec<(deno_core::ModuleId, String)>,
 }
 
 fn remaining_deadline_ms(deadline: tokio::time::Instant) -> Option<u64> {
@@ -457,7 +472,6 @@ impl ObscuraJsRuntime {
         let module_loader =
             ObscuraModuleLoader::with_page_state(base_url, proxy_url, &state, import_map.clone());
         let module_load_activity = module_loader.activity();
-        let loaded_module_specifiers = module_loader.loaded_specifiers();
         let module_loader = Rc::new(module_loader);
 
         // Build the isolate under the process-wide creation lock so two
@@ -520,7 +534,6 @@ impl ObscuraJsRuntime {
             isolate_handle,
             heap_limit_state,
             module_evaluations: HashMap::new(),
-            loaded_module_specifiers,
             evaluated_module_specifiers: HashMap::new(),
             ops_handoff: None,
         };
@@ -530,38 +543,35 @@ impl ObscuraJsRuntime {
         instance
     }
 
-    /// Creates an additional realm in this isolate: a second `v8::Context`.
+    /// Creates an additional managed realm in this isolate.
     ///
     /// The startup snapshot already contains the whole bootstrap (see
     /// `build.rs`), so a context restored from it arrives with every DOM class
     /// and shim installed. Building a realm is therefore a context restore, not
     /// a re-parse of the whole bootstrap.
     ///
-    /// The new context has no ops: deno_core binds those into the main context
-    /// only. Use [`Self::share_ops_with_realm`] to give it the same `Deno.core`
-    /// object, which is legal because native function objects are shareable
-    /// between contexts of one isolate.
+    /// The realm owns an independent deno_core ModuleMap, while the browser
+    /// still shares the page's native op functions explicitly. Keeping module
+    /// ownership in deno_core is required for dynamic import: its V8 callback
+    /// resolves the current realm's ModuleMap through context embedder slots.
     pub(crate) fn create_realm_context(
         &mut self,
-    ) -> Option<deno_core::v8::Global<deno_core::v8::Context>> {
-        let context = {
-            let isolate = self.runtime.v8_isolate();
-            let scope = &mut deno_core::v8::HandleScope::new(isolate);
-            let context = deno_core::v8::Context::from_snapshot(
-                scope,
-                1,
-                deno_core::v8::ContextOptions::default(),
-            )
-            .or_else(|| {
-                deno_core::v8::Context::from_snapshot(
-                    scope,
-                    0,
-                    deno_core::v8::ContextOptions::default(),
-                )
-            })?;
-            deno_core::v8::Global::new(scope, context)
+        module_loader: Rc<dyn deno_core::ModuleLoader>,
+    ) -> Option<deno_core::ManagedJsRealm> {
+        let options = || deno_core::CreateRealmOptions {
+            module_loader: Some(module_loader.clone()),
         };
-        Some(context)
+        self.runtime
+            .create_managed_realm_from_snapshot(1, options())
+            .or_else(|| {
+                self.runtime
+                    .create_managed_realm_from_snapshot(0, options())
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn managed_realm_count(&self) -> usize {
+        self.runtime.managed_realm_count()
     }
 
     /// Takes the ops object bootstrap handed out, and removes the handoff from
@@ -920,6 +930,8 @@ impl ObscuraJsRuntime {
         {
             frame.stealth_client = parent.stealth_client.clone();
         }
+        #[cfg(feature = "render")]
+        disable_sync_render_loading_for_page_transport(frame);
     }
 
     /// The origin of the document this runtime is running, or `"null"` for a
@@ -1343,7 +1355,10 @@ impl ObscuraJsRuntime {
     }
 
     pub fn set_http_client(&self, client: std::sync::Arc<obscura_net::ObscuraHttpClient>) {
-        self.state.borrow_mut().http_client = Some(client);
+        let mut state = self.state.borrow_mut();
+        state.http_client = Some(client);
+        #[cfg(feature = "render")]
+        disable_sync_render_loading_for_page_transport(&mut state);
     }
 
     /// Install the owning page's passive on_request/on_response callback
@@ -1356,11 +1371,16 @@ impl ObscuraJsRuntime {
     /// through it in stealth mode (see op_fetch_url / stealth_fetch_all).
     #[cfg(feature = "stealth")]
     pub fn set_stealth_client(&self, client: std::sync::Arc<obscura_net::StealthHttpClient>) {
-        self.state.borrow_mut().stealth_client = Some(client);
+        let mut state = self.state.borrow_mut();
+        state.stealth_client = Some(client);
+        #[cfg(feature = "render")]
+        disable_sync_render_loading_for_page_transport(&mut state);
     }
 
     pub fn set_dom(&self, dom: DomTree) {
         let mut gs = self.state.borrow_mut();
+        gs.clear_streaming_parser();
+        *gs.write_stream.borrow_mut() = None;
         gs.dom = Some(dom);
         gs.document_generation = gs.document_generation.wrapping_add(1);
         gs.activity_generation = 0;
@@ -1377,6 +1397,7 @@ impl ObscuraJsRuntime {
             gs.animation_sampled_task_generation = 0;
             gs.pending_style_mutations.clear();
             gs.render_resources = obscura_render::RenderResourceCache::default();
+            disable_sync_render_loading_for_page_transport(&mut gs);
             gs.render_image_in_flight.clear();
             gs.stylesheet_cache = obscura_render::StylesheetCache::default();
             gs.dynamic_fonts.clear();
@@ -1386,6 +1407,22 @@ impl ObscuraJsRuntime {
             gs.scroll_generation = 0;
             gs.resolved_scroll = None;
         }
+    }
+
+    /// Share the browser-owned primary tokenizer with the document realm for
+    /// synchronous `document.write()` insertion. The state captures the
+    /// current document generation, so an old parser cannot accept writes
+    /// after navigation replaces its DOM.
+    pub fn install_streaming_document_parser(
+        &self,
+        parser: std::rc::Rc<std::cell::RefCell<obscura_dom::StreamingDocumentParser>>,
+    ) {
+        self.state.borrow_mut().install_streaming_parser(parser);
+    }
+
+    /// End the synchronous parser-insertion bridge at parser EOF.
+    pub fn clear_streaming_document_parser(&self) {
+        self.state.borrow_mut().clear_streaming_parser();
     }
 
     pub fn set_url(&self, url: &str) {
@@ -2736,6 +2773,113 @@ impl ObscuraJsRuntime {
         );
         self.object_store.clear();
     }
+
+    pub(crate) async fn load_module_in_realm(
+        &mut self,
+        realm: &deno_core::ManagedJsRealm,
+        url: &str,
+        source: Option<&str>,
+        unregistered_root: bool,
+        budget_ms: u64,
+    ) -> Result<(deno_core::ModuleId, Vec<(deno_core::ModuleId, String)>), String> {
+        let specifier = deno_core::ModuleSpecifier::parse(url)
+            .map_err(|error| format!("Invalid frame module URL {url}: {error}"))?;
+        let budget = tokio::time::Duration::from_millis(budget_ms);
+        let load = async {
+            match (source, unregistered_root) {
+                (Some(source), true) => {
+                    realm
+                        .load_unregistered_side_es_module_from_code(
+                            self.runtime.v8_isolate(),
+                            &specifier,
+                            deno_core::ModuleCodeString::from(source.to_string()),
+                        )
+                        .await
+                }
+                (Some(source), false) => {
+                    realm
+                        .load_side_es_module_from_code(
+                            self.runtime.v8_isolate(),
+                            &specifier,
+                            deno_core::ModuleCodeString::from(source.to_string()),
+                        )
+                        .await
+                }
+                (None, _) => {
+                    realm
+                        .load_side_es_module(self.runtime.v8_isolate(), &specifier)
+                        .await
+                }
+            }
+        };
+        match tokio::time::timeout(budget, load).await {
+            Ok(Ok(module_id)) => {
+                let graph = realm
+                    .module_graph_specifiers(module_id)
+                    .map_err(|error| format!("Frame module graph cache error: {error}"))?;
+                Ok((module_id, graph))
+            }
+            Ok(Err(error)) => Err(format!("Frame module load error: {error}")),
+            Err(_) => Err(format!(
+                "Frame module graph load timed out after {budget_ms}ms: {url}"
+            )),
+        }
+    }
+
+    pub(crate) async fn evaluate_module_in_realm(
+        &mut self,
+        realm: &deno_core::ManagedJsRealm,
+        module_id: deno_core::ModuleId,
+        budget_ms: u64,
+        what: &str,
+    ) -> Result<(), String> {
+        self.begin_javascript_task();
+        let watchdog = self.arm_watchdog(std::time::Duration::from_millis(budget_ms));
+        let evaluation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            realm.mod_evaluate(self.runtime.v8_isolate(), module_id)
+        }));
+        let mut evaluation = match evaluation {
+            Ok(evaluation) => Box::pin(evaluation),
+            Err(payload) => {
+                let message = panic_payload_message(payload.as_ref());
+                let _ = self.disarm_watchdog(watchdog);
+                return if message.contains("Module already evaluated") {
+                    Ok(())
+                } else {
+                    Err(format!("{what} evaluation panicked: {message}"))
+                };
+            }
+        };
+
+        let budget = tokio::time::Duration::from_millis(budget_ms);
+        let outcome = tokio::time::timeout(budget, async {
+            let event_loop = self
+                .runtime
+                .run_event_loop(deno_core::PollEventLoopOptions::default());
+            tokio::pin!(event_loop);
+            tokio::select! {
+                biased;
+                event = &mut event_loop => {
+                    event?;
+                    (&mut evaluation).await
+                },
+                result = &mut evaluation => result,
+            }
+        })
+        .await;
+        let watchdog_fired = self.disarm_watchdog(watchdog);
+        let outcome = if watchdog_fired {
+            Err(format!("{what} evaluation timed out after {budget_ms}ms"))
+        } else {
+            match outcome {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(format!("{what} eval error: {error}")),
+                Err(_) => Err(format!("{what} evaluation timed out after {budget_ms}ms")),
+            }
+        };
+        self.finish_heap_checked(outcome)
+    }
+
     pub async fn load_module(&mut self, url: &str, budget_ms: u64) -> Result<(), String> {
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(budget_ms);
         let prepared = self.prepare_module(url, budget_ms).await?;
@@ -2756,8 +2900,6 @@ impl ObscuraJsRuntime {
         let budget = tokio::time::Duration::from_millis(budget_ms);
         let specifier = deno_core::ModuleSpecifier::parse(url)
             .map_err(|e| format!("Invalid module URL {}: {}", url, e))?;
-        let loaded_start = self.loaded_module_specifiers.borrow().len();
-
         // Bound the recursive import-graph fetch. deno_core fetches the graph
         // concurrently through the one page-scoped module loader. Loading the
         // entry from that loader too is important: cookies, configured request
@@ -2784,16 +2926,16 @@ impl ObscuraJsRuntime {
         // Return as soon as the module finishes evaluating rather than waiting
         // for the loop to go fully idle: a page timer (setInterval) keeps the
         // loop busy forever and would otherwise burn the whole budget (#374).
-        let mut graph_specifiers = self.loaded_module_specifiers.borrow()[loaded_start..].to_vec();
-        graph_specifiers.push(specifier.to_string());
-        graph_specifiers.sort_unstable();
-        graph_specifiers.dedup();
+        let graph_modules = self
+            .runtime
+            .module_graph_specifiers(module_id)
+            .map_err(|error| format!("Module graph cache error: {error}"))?;
 
         Ok(PreparedModule {
             module_id,
             description: format!("Module {}", url),
             entry_specifier: Some(specifier.to_string()),
-            graph_specifiers,
+            graph_modules,
         })
     }
 
@@ -2897,16 +3039,14 @@ impl ObscuraJsRuntime {
         let budget = tokio::time::Duration::from_millis(budget_ms);
         // Inline modules use the document base URL as their module URL. This is
         // observable through import.meta.url and is also the referrer used for
-        // relative imports and import-map scope matching. deno_core permits
-        // multiple side modules with this name; the returned ModuleId keeps
-        // each prepared module distinct until its scheduled evaluation.
+        // relative imports and import-map scope matching. The vendored
+        // explicit-root API keeps each source under its own ModuleId without
+        // registering that shared URL as an importable module name.
         let specifier = deno_core::ModuleSpecifier::parse(base_url)
             .unwrap_or_else(|_| deno_core::ModuleSpecifier::parse("about:blank").unwrap());
-        let loaded_start = self.loaded_module_specifiers.borrow().len();
-
         let module_id = match tokio::time::timeout(
             budget,
-            self.runtime.load_side_es_module_from_code(
+            self.runtime.load_unregistered_side_es_module_from_code(
                 &specifier,
                 deno_core::ModuleCodeString::from(code.to_string()),
             ),
@@ -2928,9 +3068,10 @@ impl ObscuraJsRuntime {
         // keeps the loop busy forever, and waiting for idle burned the whole
         // budget on this preamble module and starved the module that mounts the
         // app, leaving #root empty (issue #374).
-        let mut graph_specifiers = self.loaded_module_specifiers.borrow()[loaded_start..].to_vec();
-        graph_specifiers.sort_unstable();
-        graph_specifiers.dedup();
+        let graph_modules = self
+            .runtime
+            .module_graph_specifiers(module_id)
+            .map_err(|error| format!("Inline module graph cache error: {error}"))?;
 
         Ok(PreparedModule {
             module_id,
@@ -2938,7 +3079,7 @@ impl ObscuraJsRuntime {
             // Multiple inline modules intentionally share the document URL,
             // but each has its own source and ModuleId.
             entry_specifier: None,
-            graph_specifiers,
+            graph_modules,
         })
     }
 
@@ -2951,7 +3092,7 @@ impl ObscuraJsRuntime {
             module_id,
             description,
             entry_specifier,
-            graph_specifiers,
+            graph_modules,
         } = prepared;
         if let Some(outcome) = entry_specifier
             .as_ref()
@@ -2977,13 +3118,17 @@ impl ObscuraJsRuntime {
             result
         };
 
+        let has_external_entry = entry_specifier.is_some();
         if let Some(entry_specifier) = entry_specifier {
             self.evaluated_module_specifiers
                 .insert(entry_specifier, result.clone());
         }
         if result.is_ok() {
-            for specifier in graph_specifiers {
-                self.evaluated_module_specifiers.insert(specifier, Ok(()));
+            for (graph_module_id, specifier) in graph_modules {
+                self.module_evaluations.insert(graph_module_id, Ok(()));
+                if graph_module_id != module_id || has_external_entry {
+                    self.evaluated_module_specifiers.insert(specifier, Ok(()));
+                }
             }
         }
         result
@@ -3189,6 +3334,15 @@ impl ObscuraJsRuntime {
         self.state.borrow().activity_generation
     }
 
+    /// Generation of observable mutations in one live child-frame realm.
+    /// Page-wide readiness uses this alongside the top document generation so
+    /// a post-load frame timer cannot make the page appear prematurely quiet.
+    pub fn frame_activity_generation(&self, frame_id: u32) -> Option<u64> {
+        let state = self.realm_states().borrow().by_frame_id(frame_id)?;
+        let generation = state.borrow().activity_generation;
+        Some(generation)
+    }
+
     /// Number of page-network operations which have started but have not yet
     /// produced a response or error. Child realms share this counter with the
     /// top-level realm, so it is also a cheap page-wide resource barrier for
@@ -3354,9 +3508,7 @@ impl ObscuraJsRuntime {
                 std::task::Poll::Ready(Err(error)) => {
                     std::task::Poll::Ready(Err(format!("Event loop error: {error}")))
                 }
-                std::task::Poll::Pending if waiting_for_wake => {
-                    std::task::Poll::Ready(Ok(false))
-                }
+                std::task::Poll::Pending if waiting_for_wake => std::task::Poll::Ready(Ok(false)),
                 std::task::Poll::Pending => {
                     waiting_for_wake = true;
                     std::task::Poll::Pending
@@ -3426,9 +3578,9 @@ impl ObscuraJsRuntime {
                     tracing::warn!("page task error, continuing the event loop: {error}");
                     std::task::Poll::Ready(Ok(false))
                 }
-                std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
-                    "Event loop error: {error}"
-                ))),
+                std::task::Poll::Ready(Err(error)) => {
+                    std::task::Poll::Ready(Err(format!("Event loop error: {error}")))
+                }
                 std::task::Poll::Pending if waiting_for_wake => std::task::Poll::Ready(Ok(false)),
                 std::task::Poll::Pending => {
                     waiting_for_wake = true;
@@ -3675,6 +3827,7 @@ impl ObscuraJsRuntime {
             state.prepared_render = None;
             state.pending_style_mutations.clear();
             state.render_resources = obscura_render::RenderResourceCache::default();
+            disable_sync_render_loading_for_page_transport(&mut state);
             state.stylesheet_cache = obscura_render::StylesheetCache::default();
             state.dynamic_fonts.clear();
             state.element_scroll_offsets.clear();
@@ -4190,12 +4343,73 @@ mod tests {
         .unwrap();
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn lazy_iframe_starts_after_parent_load_without_delaying_that_load() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let initial = rt
+            .evaluate_with_ops_for_test(
+                r#"(() => {
+                   globalThis.__documentReadyState__ = 'loading';
+                   const frame = document.createElement('iframe');
+                   frame.loading = 'lazy';
+                   frame.srcdoc = '<!doctype html><body>lazy child</body>';
+                   document.body.appendChild(frame);
+                   globalThis.__lazyFrame = frame;
+                   return [
+                     frame.loading,
+                     globalThis.__obscura_hasPendingLoadDelayingResources(),
+                   ];
+                 })()"#,
+            )
+            .unwrap();
+        assert_eq!(initial, serde_json::json!(["lazy", false]));
+        assert_eq!(
+            rt.pending_frame_document_queue(),
+            (0, 0),
+            "a lazy iframe must not hold the parent load boundary open",
+        );
+
+        rt.evaluate(
+            "(() => { globalThis.__documentReadyState__ = 'complete'; \
+             globalThis.__obscura_dispatchWindowLoad(); })()",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.pending_frame_document_queue().0,
+            1,
+            "the post-load lazy navigation remains observable to capture-ready",
+        );
+    }
+
+    #[test]
+    fn changing_a_deferred_lazy_iframe_to_eager_starts_it_immediately() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate(
+            r#"(() => {
+               globalThis.__documentReadyState__ = 'loading';
+               const frame = document.createElement('iframe');
+               frame.loading = 'lazy';
+               frame.srcdoc = '<!doctype html><body>promoted child</body>';
+               document.body.appendChild(frame);
+               globalThis.__promotedFrame = frame;
+             })()"#,
+        )
+        .unwrap();
+        assert_eq!(rt.pending_frame_document_queue(), (0, 0));
+
+        rt.evaluate("globalThis.__promotedFrame.loading = 'eager'")
+            .unwrap();
+        assert_eq!(rt.pending_frame_document_queue().0, 1);
+    }
+
     #[test]
     fn cancelled_frame_attachment_restores_only_the_current_document() {
         let rt = setup_runtime("<html><body></body></html>");
         let pending = |frame_id, parent_frame_id, html: &str| crate::ops::PendingFrame {
             frame_id,
             url: format!("https://example.test/{frame_id}"),
+            scripts_allowed: true,
             inherited_base_url: None,
             inherited_origin: None,
             html: html.to_string(),
@@ -7095,9 +7309,16 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn font_face_load_updates_status_set_readiness_and_matching() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        rt.execute_script(
+        rt.execute_script_with_ops_for_test(
             "font-face-lifecycle",
             r#"
+                globalThis.__originalFontFetchOp = globalThis.__obscura_test_ops.op_fetch_url;
+                globalThis.__obscura_test_ops.op_fetch_url = async url => JSON.stringify({
+                    status: 200,
+                    headers: { "content-type": "font/woff2" },
+                    body: "fixture-font",
+                    url,
+                });
                 globalThis.__fontEvents = [];
                 const face = new FontFace("Lifecycle", "url('/lifecycle.woff2')", {
                     weight: "700"
@@ -7125,6 +7346,11 @@ mod tests {
         let result = rt
             .evaluate("return [__fontBefore, __fontLoadResult, __fontReady, __fontEvents];")
             .unwrap();
+        rt.evaluate_with_ops_for_test(
+            "(() => { globalThis.__obscura_test_ops.op_fetch_url = \
+             globalThis.__originalFontFetchOp; delete globalThis.__originalFontFetchOp; })()",
+        )
+        .unwrap();
         assert_eq!(
             result,
             serde_json::json!([
@@ -13195,6 +13421,80 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
+    #[test]
+    fn connected_inner_html_geometry_never_uses_sync_loader_with_page_transport() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_calls = calls.clone();
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.state.borrow_mut().render_resources =
+            obscura_render::RenderResourceCache::with_loader(move |_url: &str| {
+                loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                None
+            });
+
+        // This is the browser ordering for a live realm: once an asynchronous
+        // page transport owns resource fetches, an innerHTML insertion which
+        // creates an eager image followed by a blank iframe reaches
+        // `_loadIframeBlank -> getBoundingClientRect` synchronously. Layout may
+        // use already-seeded bytes, but it must not call the render loader.
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    document.body.innerHTML =
+                      '<img src="/never-sync.png"><iframe id="child"></iframe>';
+                    const child = document.getElementById('child');
+                    return [
+                      child.isConnected,
+                      child._frameId > 0,
+                      Number.isFinite(child.getBoundingClientRect().width)
+                    ];
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!([true, true, true]),
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a lifecycle geometry read entered the synchronous render loader",
+        );
+
+        // Page installs its transport before set_dom(). A document reset
+        // replaces RenderResourceCache, so the replacement must inherit the
+        // disabled policy instead of silently restoring HttpResourceLoader.
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        {
+            let mut state = rt.state.borrow_mut();
+            let sync_was_enabled = state.render_resources.set_sync_loading_enabled(false);
+            state
+                .render_resources
+                .set_sync_loading_enabled(sync_was_enabled);
+            assert!(!sync_was_enabled, "set_dom re-enabled synchronous loading");
+        }
+
+        // Managed frames own a fresh cache but share the same browser
+        // transport, so parser and load handlers in a child realm need the
+        // identical non-blocking policy.
+        let mut frame_state = ObscuraState::new();
+        rt.share_resources_with(&mut frame_state);
+        let sync_was_enabled = frame_state.render_resources.set_sync_loading_enabled(false);
+        frame_state
+            .render_resources
+            .set_sync_loading_enabled(sync_was_enabled);
+        assert!(
+            !sync_was_enabled,
+            "sharing page resources re-enabled the frame's synchronous loader",
+        );
+    }
+
+    #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn parser_images_load_concurrently_without_blocking_the_event_loop() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -17896,8 +18196,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unsupported_media_capabilities_and_readiness_are_honest() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsupported_media_capabilities_and_readiness_are_honest() {
         let mut rt = setup_runtime(
             r#"<video id="media" src="https://example.test/movie.mp4"
                 poster="https://example.test/poster.png"></video>"#,
@@ -17930,10 +18230,63 @@ mod tests {
                 0,
                 0,
                 true,
-                "",
+                "https://example.test/movie.mp4",
                 "https://example.test/poster.png"
             ])
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn started_media_and_poster_requests_delay_load_until_fetch_settles() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let initial = rt
+            .evaluate_with_ops_for_test(
+                r#"(() => {
+                globalThis.__originalMediaFetchOp = globalThis.__obscura_test_ops.op_fetch_url;
+                globalThis.__obscura_test_ops.op_fetch_url = async () => {
+                    await new Promise(resolve => setTimeout(resolve, 20));
+                    return JSON.stringify({
+                        status: 200,
+                        headers: {"content-type": "application/octet-stream"},
+                        body: "fixture",
+                        url: "https://media.example/fixture",
+                    });
+                };
+                const video = document.createElement("video");
+                video.src = "https://media.example/movie.mp4";
+                video.poster = "https://media.example/poster.png";
+                document.body.appendChild(video);
+                return [
+                    globalThis.__obscura_hasPendingLoadDelayingResources(),
+                    video.networkState,
+                    video.readyState,
+                    video.currentSrc,
+                ];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            initial,
+            serde_json::json!([true, 2, 0, "https://media.example/movie.mp4"])
+        );
+
+        rt.run_event_loop().await.unwrap();
+        let settled = rt
+            .evaluate_with_ops_for_test(
+                r#"
+                const video = document.querySelector("video");
+                globalThis.__obscura_test_ops.op_fetch_url = globalThis.__originalMediaFetchOp;
+                delete globalThis.__originalMediaFetchOp;
+                return [
+                    globalThis.__obscura_hasPendingLoadDelayingResources(),
+                    video.networkState,
+                    video.readyState,
+                    video.error,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(settled, serde_json::json!([false, 1, 1, null]));
     }
 
     #[test]
@@ -18392,9 +18745,7 @@ mod tests {
         std::env::set_var("LANG", "de-DE");
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
-            .evaluate(
-                "Intl.DateTimeFormat().resolvedOptions().locale + '|' + navigator.language",
-            )
+            .evaluate("Intl.DateTimeFormat().resolvedOptions().locale + '|' + navigator.language")
             .unwrap();
         assert_eq!(
             result,

@@ -58,6 +58,11 @@ base64 = "0.22"
 sha2 = "0.10"
 
 [patch.crates-io]
+# deno_core 0.350 removed its public secondary-realm API while still leaving
+# V8's dynamic-import callback dependent on realm-local embedder slots. Keep a
+# minimal, pinned patch in-tree so iframe contexts have independent ModuleMaps
+# instead of dereferencing an uninitialized slot.
+deno_core = { path = "vendor/deno-core" }
 # Keep the grid shrink-to-fit correction local until it lands upstream.
 taffy = { path = "vendor/taffy" }
 # Carry the same canonical variable-font coordinates through shaping and

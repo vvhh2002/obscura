@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use deno_core::ModuleSpecifier;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ImportMap {
     imports: SpecifierMap,
     scopes: Vec<(String, SpecifierMap)>,
@@ -14,9 +14,10 @@ struct ResolvedModule {
     referrer: String,
     specifier: String,
     as_url_is_special: bool,
+    resolution: Result<ModuleSpecifier, String>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct SpecifierMap {
     entries: HashMap<String, Option<ModuleSpecifier>>,
     prefixes: Vec<String>,
@@ -130,29 +131,98 @@ impl ImportMap {
             .unwrap_or_else(|| specifier.to_string());
         let serialized_referrer = referrer.to_string();
 
+        // The browser's resolved-module set is a cache, not merely a list of
+        // import-map keys which later maps are forbidden to overwrite. Once a
+        // (referrer, specifier) pair has been observed, both successful and
+        // failed resolutions must stay stable for the document lifetime.
+        if let Some(record) = self
+            .resolved_modules
+            .iter()
+            .find(|record| record.referrer == serialized_referrer && record.specifier == normalized)
+        {
+            return record.resolution.clone();
+        }
+
         for (scope_prefix, scope_imports) in &self.scopes {
             if scope_applies(scope_prefix, &serialized_referrer) {
-                if let Some(resolved) = scope_imports.resolve_match(&normalized, as_url.as_ref())? {
-                    self.remember_resolution(serialized_referrer, normalized, as_url.as_ref());
-                    return Ok(resolved);
+                match scope_imports.resolve_match(&normalized, as_url.as_ref()) {
+                    Ok(Some(resolved)) => {
+                        return self.remember_resolution(
+                            serialized_referrer,
+                            normalized,
+                            as_url.as_ref(),
+                            Ok(resolved),
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        return self.remember_resolution(
+                            serialized_referrer,
+                            normalized,
+                            as_url.as_ref(),
+                            Err(error),
+                        );
+                    }
                 }
             }
         }
 
-        if let Some(resolved) = self.imports.resolve_match(&normalized, as_url.as_ref())? {
-            self.remember_resolution(serialized_referrer, normalized, as_url.as_ref());
-            return Ok(resolved);
-        }
-        match as_url {
-            Some(resolved) => {
-                self.remember_resolution(serialized_referrer, normalized, Some(&resolved));
-                Ok(resolved)
+        match self.imports.resolve_match(&normalized, as_url.as_ref()) {
+            Ok(Some(resolved)) => {
+                return self.remember_resolution(
+                    serialized_referrer,
+                    normalized,
+                    as_url.as_ref(),
+                    Ok(resolved),
+                );
             }
+            Ok(None) => {}
+            Err(error) => {
+                return self.remember_resolution(
+                    serialized_referrer,
+                    normalized,
+                    as_url.as_ref(),
+                    Err(error),
+                );
+            }
+        }
+
+        let resolution = match as_url.as_ref() {
+            Some(resolved) => Ok(resolved.clone()),
             None => Err(format!(
                 "Bare module specifier \"{}\" was not remapped by the import map",
                 specifier
             )),
+        };
+        self.remember_resolution(serialized_referrer, normalized, as_url.as_ref(), resolution)
+    }
+
+    /// Resolve against a graph-start snapshot, then publish that result into
+    /// the document-wide resolved-module cache. This is what prevents an
+    /// import map encountered while a slow graph is fetching from changing
+    /// that graph retroactively, without hiding the later map from a new graph.
+    pub(crate) fn resolve_from_snapshot(
+        &mut self,
+        snapshot: &mut ImportMap,
+        specifier: &str,
+        referrer: &ModuleSpecifier,
+    ) -> Result<ModuleSpecifier, String> {
+        let as_url = resolve_url_like(specifier, referrer);
+        let normalized = as_url
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| specifier.to_string());
+        let serialized_referrer = referrer.to_string();
+        if let Some(record) = self
+            .resolved_modules
+            .iter()
+            .find(|record| record.referrer == serialized_referrer && record.specifier == normalized)
+        {
+            return record.resolution.clone();
         }
+
+        let resolution = snapshot.resolve(specifier, referrer);
+        self.remember_resolution(serialized_referrer, normalized, as_url.as_ref(), resolution)
     }
 
     fn remember_resolution(
@@ -160,15 +230,21 @@ impl ImportMap {
         referrer: String,
         specifier: String,
         as_url: Option<&ModuleSpecifier>,
-    ) {
+        resolution: Result<ModuleSpecifier, String>,
+    ) -> Result<ModuleSpecifier, String> {
+        let outcome = resolution.clone();
         let resolution = ResolvedModule {
             referrer,
             specifier,
             as_url_is_special: as_url.is_none_or(is_special_url),
+            resolution: resolution.clone(),
         };
-        if !self.resolved_modules.contains(&resolution) {
+        if !self.resolved_modules.iter().any(|record| {
+            record.referrer == resolution.referrer && record.specifier == resolution.specifier
+        }) {
             self.resolved_modules.push(resolution);
         }
+        outcome
     }
 }
 
@@ -393,6 +469,70 @@ mod tests {
         assert_eq!(
             map.resolve("later", &referrer).unwrap().as_str(),
             "https://example.test/later.js",
+        );
+    }
+
+    #[test]
+    fn successful_and_failed_resolutions_are_document_lifetime_cache_entries() {
+        let mut map = ImportMap::default();
+        let referrer =
+            deno_core::ModuleSpecifier::parse("https://example.test/app/main.js").unwrap();
+
+        let first_error = map.resolve("missing", &referrer).unwrap_err();
+        map.merge(
+            ImportMap::parse(
+                r#"{"imports":{"missing":"/too-late.js"}}"#,
+                "https://example.test/app/index.html",
+            )
+            .unwrap(),
+        );
+        assert_eq!(map.resolve("missing", &referrer).unwrap_err(), first_error);
+
+        assert_eq!(
+            map.resolve("./stable.js", &referrer).unwrap().as_str(),
+            "https://example.test/app/stable.js",
+        );
+        map.merge(
+            ImportMap::parse(
+                r#"{"imports":{"./stable.js":"/too-late-stable.js"}}"#,
+                "https://example.test/app/main.js",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            map.resolve("./stable.js", &referrer).unwrap().as_str(),
+            "https://example.test/app/stable.js",
+        );
+    }
+
+    #[test]
+    fn a_graph_snapshot_publishes_its_resolution_to_the_document_cache() {
+        let mut document = ImportMap::default();
+        let mut graph_snapshot = document.clone();
+        let referrer =
+            deno_core::ModuleSpecifier::parse("https://example.test/slow/main.js").unwrap();
+
+        document.merge(
+            ImportMap::parse(
+                r#"{"imports":{"late":"/late.js"}}"#,
+                "https://example.test/index.html",
+            )
+            .unwrap(),
+        );
+        assert!(document
+            .resolve_from_snapshot(&mut graph_snapshot, "late", &referrer)
+            .is_err());
+        assert!(
+            document.resolve("late", &referrer).is_err(),
+            "a map merged after graph start changed that graph's cached result",
+        );
+
+        let later_referrer =
+            deno_core::ModuleSpecifier::parse("https://example.test/later/main.js").unwrap();
+        assert_eq!(
+            document.resolve("late", &later_referrer).unwrap().as_str(),
+            "https://example.test/late.js",
+            "the same later map must remain visible to a new graph",
         );
     }
 

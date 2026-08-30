@@ -33,14 +33,21 @@ obscura-browser/page.rs         navigate_with_wait
         │
         ├──► obscura-net/client.rs        HTTP fetch
         │
-        ├──► obscura-dom/tree.rs          parse HTML into the tree
+        ├──► obscura-dom/tree_sink.rs     retain the pausable html5ever parser
         │
-        └──► obscura-js/runtime.rs        run inline scripts
+        └──► obscura-js/runtime.rs        run scripts against the live tree
                   │
                   └──► bootstrap.js + ops.rs    DOM bindings
 ```
 
-The dispatcher emits CDP events (`Network.requestWillBeSent`, `Page.frameNavigated`, `Page.lifecycleEvent`) back to the client through the same WebSocket.
+The dispatcher forwards the main-frame commit (`Page.frameNavigated`), main
+lifecycle events (`Page.lifecycleEvent`), and transport-timed `Network.*`
+request/header/data/terminal phases through the same WebSocket while navigation continues. Raw
+`Page.navigate` returns at commit when its optional Obscura `waitUntil`
+extension is absent. The observer belongs to the target rather than one command,
+so later fetch/XHR and response-body continuation reuse the same real-time path.
+Child-frame lifecycle delivery is described below and retains the snapshot
+drain as a compatibility fallback for pages without an observer.
 
 ## Rendering flow
 
@@ -107,10 +114,11 @@ ordinary top-level HTTP, HTTPS, or data document, the DOM-facing sequence is:
 
 ```text
 Document.readyState = "loading"
-    parser-discovered scripts run
+    parser-blocking scripts run
+    parser reaches EOF
 Document.readyState = "interactive"
     Document readystatechange
-    deferred classic scripts and non-async modules finish
+    defer classics and non-async modules finish
     Document DOMContentLoaded
     child documents and load-delaying resources finish
 Document.readyState = "complete"
@@ -150,11 +158,16 @@ entry points from page code cannot suppress or forge their completion.
 
 ### Parser script completion events
 
-The top document is parsed into a DOM before `obscura-browser` drives its
-parser-discovered scripts. Each supported script element is marked as already
-started, then its element completion event is dispatched through `EventTarget`,
-so a content/IDL handler and `addEventListener` listeners observe one event
-path rather than two independent callbacks.
+The top document uses a retained html5ever parser and the same live `DomTree`
+as V8. Parser-inserted classic scripts yield the tokenizer; source after the
+script is not visible until the host executes or schedules that script and
+resumes parsing. External classic `defer` and `async` fetches start at their
+encounter, defer scripts execute after EOF in encounter order, and async
+classics execute in response-completion order while delaying load rather than
+DOMContentLoaded. Each supported script element is marked as already started,
+then its element completion event is dispatched through `EventTarget`, so a
+content/IDL handler and `addEventListener` listeners observe one event path
+rather than two independent callbacks.
 
 | Parser-discovered script | Element completion event |
 | --- | --- |
@@ -164,24 +177,53 @@ path rather than two independent callbacks.
 | External or inline module whose graph preparation, dependency fetch, parsing, evaluation, or budget check fails | `error`. A top-level exception is therefore different from a classic-script exception. |
 | Inline classic script | No element `load` or `error`; its evaluation exception is reported without changing the document sequence. |
 
-These parser script `load`/`error` events are non-bubbling and non-cancelable
-and finish before `DOMContentLoaded`. Deferred external classics and non-async
-modules run while `readyState` is `interactive` but still gate
-`DOMContentLoaded`.
+These parser script `load`/`error` events are non-bubbling and non-cancelable.
+Deferred external classics and non-async modules gate `DOMContentLoaded`. At
+EOF the host changes `readyState` to `interactive` and dispatches its
+`readystatechange` before evaluating that ordered post-parse queue. Parser
+async classic completion may occur after DCL but must precede Window load.
 
-Top and child realms freeze their parser script and stylesheet node lists,
-encounter order, the effective base URL at each individual encounter, and
-stable native node ids before any new-document preload runs. A resource before
-the first `<base href>` therefore keeps the document URL while resources after
-it use that first base; later base elements do not retroactively retarget
-already encountered work. Linked-sheet snapshots also retain the raw `href`
-and resolved request URL. A preload that rewrites the raw `href` starts new
-dynamic work, while a late response for the old parser request is discarded
-before CSS installation or owner completion. Original script nodes are marked
-as already started at the same boundary. Consequently a preload can insert a
-dynamic script or stylesheet, change `<base>`, rewrite a link, or move an
-original parser script without enrolling new parser work, duplicating a
-request, or executing the original node twice.
+Parser-owned requests retain their encounter order, effective base URL, stable
+native node id, and top-document generation. A resource before the first
+`<base href>` therefore keeps the document URL while later resources use that
+first base; later base elements do not retroactively retarget started work.
+Linked-sheet snapshots also retain the raw `href` and resolved request URL. A
+rewrite starts dynamic work, while a late response for the old request is
+discarded before CSS installation or owner completion.
+
+At every live-tokenizer yield, a realm-local, weak-set-guarded resource sweep
+starts the parser-created eager images, selected media/poster/default-track
+requests, and non-lazy child browsing contexts exposed so far. This runs before
+the parser-blocking script at that boundary. Streaming child realms skip the
+initial inert discovery tree, so those requests are neither started ahead of
+the tokenizer nor restarted by the EOF sweep.
+
+While a parser-inserted script is running, `document.write()`/`writeln()` feed
+the browser-owned primary tokenizer at that script's insertion point. The
+parser temporarily removes the unread response tail, parses the written input
+with the existing tokenizer/tree-builder state, synchronously returns and runs
+nested inline parser scripts, then restores the outer script pause and unread
+tail. Recursively written markup therefore stays in the same live DOM and
+cannot expose later response source. Once the document parser has reached EOF,
+the existing persistent write-stream compatibility path remains available; it
+does not implement full `document.open()`/`close()` document replacement.
+
+The ordinary HTTP client retains an owned response stream across commit.
+Charset selection uses an authoritative HTTP charset or at most a 1024-byte
+HTML sniff, after which one incremental `encoding_rs` decoder feeds transport
+chunks to the retained parser. Raw bytes are accumulated simultaneously for
+response-body and archive consumers. The stealth transport, `data:`, and
+synthetic documents remain buffered. Import maps and module preparation run at
+their parser positions. Each static graph receives a graph-start import-map snapshot;
+resolved pairs are then frozen in the document cache, so a later import map
+cannot alter work already started. deno_core 0.350 `RecursiveModuleLoad`, not a
+`deno_graph` dependency, discovers and concurrently fetches the static graph
+through the realm loader's completed/in-flight source cache. Stylesheet roots
+are fetched at the next blocking-classic gate or EOF, not at link encounter,
+and module graph preparation currently holds the parser instead of racing
+alongside it. See [Document loading and
+capture readiness](Document-loading-and-capture-ready.md#parser-and-script-scheduling)
+for these precise implementation boundaries.
 
 ### Load-event delay set
 
@@ -205,12 +247,17 @@ set contains:
   removal or rewrite cannot consume the replacement request's event.
 - Child document fetches which are reserved or queued, and live child realms
   whose own load sequence is unfinished.
+- A selected audio/video source whose preload/autoplay policy starts a metadata
+  request, a video poster request, and a selected default text-track request.
+  Obscura stops media at metadata and does not decode or play it.
 
 The membership decision is made when a dynamic resource is prepared. Scripts
 created by a Window load handler are therefore post-load work and do not reopen
-the completed document. `import()`, arbitrary timers, `fetch()`/XHR, fonts,
-media, and CSS `url()` subresources are not added to this DOM load-delay set;
-callers that need those results must request a settle or resource warm-up.
+the completed document. Arbitrary timers, `fetch()`/XHR, `FontFace`, and
+ordinary CSS/SVG `url()` subresources are not direct DOM load blockers. They
+are observed by the separate capture-ready/resource-preparation policy when
+they actually start work. A timer alone does not keep that policy busy, but a
+timer-caused request or connected-DOM mutation resets its quiet window.
 
 ### Frame completion order
 
@@ -244,16 +291,55 @@ subtree replacement are still cancelled normally.
 A failed iframe fetch has no child realm and follows the compatibility path
 which dispatches the owner `load` directly.
 
+Child V8 contexts are created as managed snapshot realms. The in-tree
+`deno_core 0.350.0` patch gives each realm a separate `ModuleMap`, initializes
+the context embedder slots used by V8's dynamic-import and import-meta
+callbacks, retains the realm while attached, and includes each attached realm's
+module map in the runtime event-loop poll. Detach/replacement explicitly
+retires the registration before stale work can run. Consequently a dynamic
+`import()` is loaded and evaluated by the frame which initiated it. Static
+graphs use deno_core's `RecursiveModuleLoad` plus Obscura's graph-start import
+map snapshot and source cache; after instantiation, graph ids are read from the
+actual realm `ModuleMap` so evaluating a root also populates the host cache for
+its descendants. Each inline module root is retained by its explicit ModuleId
+but omitted from the URL name map, so multiple inline elements can share the
+document URL without sharing source or evaluation state; V8 still observes the
+canonical document URL through `import.meta.url` and relative resolution.
+Parent and sibling realms retain independent import maps,
+module maps, source caches, and evaluation caches. The ordinary
+frame-attachment path invokes the combined classic/module scheduler. This path
+has focused regression coverage for DCL interaction, detach/generation
+cancellation, activity accounting, rejection propagation, and realm
+retirement. Fully concurrent async ordering and complete CORS/final-URL
+attribution remain bounded compatibility areas. Any unexecuted module remains
+an archive diagnostic.
+
 ### Wait conditions, deadlines, and current limits
 
-`WaitUntil::DomContentLoaded` returns after the top DOMContentLoaded transition
-and initial bounded frame attachment. It does not wait for the load-delay set.
-The continuously owned CDP page, or a library caller that keeps driving browser
-turns, can later complete the pending `complete`/Window load transition.
-`WaitUntil::Load` waits for that transition. `networkidle0` and `networkidle2`
-run after load and require at most 0 or 2 active requests for 500 ms; the
-current network-idle poll is a best-effort five-second window and advances the
-internal lifecycle even if that window expires.
+`WaitUntil::Commit` returns after response metadata, URL, the live empty parser
+tree, V8 realm, and preloads are installed. The raw CDP owner deliberately
+keeps driving that parser continuation toward Load after sending its early
+response. A directly embedded page retains the continuation but needs the
+autonomous owner or a subsequent settle call to resume it. The CLI's normal
+post-navigation settle follows the same path;
+`--wait 0` deliberately leaves the document at commit.
+`WaitUntil::DomContentLoaded` returns after the top DCL transition and initial
+bounded frame attachment. It does not wait for the load-delay set.
+`WaitUntil::Load` waits for Window load.
+`networkidle0` and `networkidle2` run after load and require at most 0 or 2
+active requests for 500 ms. The network-idle poll has a five-second ceiling; if
+the threshold is not observed, navigation returns an error and does not publish
+the network-idle milestone. Capture-ready reports timeout and pending state
+separately when callers need a diagnostic observation instead of navigation
+failure.
+
+`WaitUntil::CaptureReady` first reaches Load and then applies a second bounded
+policy. `CaptureReadyOptions` defaults to a five-second total timeout and a
+500 ms quiet window. Its report separates `quiescent`, `timed_out`, and
+`archive_complete`, includes pending network/resource/frame counters, and
+returns sorted incompleteness reasons. This is deliberately not another DOM
+lifecycle event. See [Document loading and capture
+readiness](Document-loading-and-capture-ready.md#rust-api).
 
 CDP `Runtime.evaluate` with `awaitPromise: true` alternates runtime tasks with
 the same page-owned frame driver. This matters when the awaited promise is
@@ -266,6 +352,26 @@ evaluation, autonomous browser turns, and promise settlement. Likewise,
 its returned promise. A V8 termination watchdog bounds synchronous code, while
 deadline cleanup removes the temporary promise sentinel so a timed-out command
 does not poison the retained realm.
+
+The connection-owned CDP pump retains one pinned autonomous Page turn while it
+forwards the live network events produced by that turn. Merely observing
+`requestWillBeSent`, response data, or a terminal phase therefore cannot drop
+and restart the parser script, stylesheet graph, module, or frame request which
+emitted it. Such host-owned resource awaits are marked non-cancelable and an
+unrelated protocol command is deferred until that await returns; a matching
+Fetch-domain continue/fulfill/fail response is resolved in place without
+cancelling the turn.
+
+Other autonomous work, including the primary body-stream continuation, is
+cancellation-safe. If a higher-priority CDP command interrupts it, an
+`Rc`-backed lease restores the exact `PendingDocumentLoad`: decoder and byte
+offset, tokenizer pause, ordered post-parse index, and response stream. The
+command can inspect the committed DOM immediately and a later turn resumes the
+same parse. This scheduling cancellation is not a network failure and does not
+emit `Network.loadingFailed`. A replacement navigation is different: before
+resetting the observer generation, CDP emits exactly one canceled terminal for
+every still-active request owned by the outgoing loader. Generation checks then
+suppress any stale evaluation or element/lifecycle event.
 
 The load wait shares the absolute script-phase deadline and V8 watchdog; it
 does not receive a fresh budget after DOMContentLoaded. This includes script
@@ -293,34 +399,50 @@ the full script deadline. A bounded renderer host-call grace can be configured
 with `OBSCURA_MODULE_HOSTCALL_GRACE_MS`, but the page-wide script deadline
 remains authoritative.
 
-The current model is deliberately bounded and is not yet a complete streaming
-HTML scheduler:
+The current model is deliberately bounded:
 
-- Parser-discovered top-level scripts are driven after the DOM has been built,
-  and their completion events all precede DOMContentLoaded. Full parser pause,
-  async-script race, and streaming-network ordering are not modeled.
-- Child realms currently execute parser-discovered classic scripts in document
-  order and synthesize their element `load`/`error` completion. Frame module
-  scripts are not evaluated and instead receive `error`. Frame `async` and
-  `defer` scheduling is not yet separated from document-order execution.
+- The ordinary top-level HTTP path is transport-streamed and incrementally
+  decoded. The stealth transport remains buffered. Stylesheet fetches start at
+  the next blocking-classic gate or EOF rather than link encounter; module
+  preparation occurs at parser position but holds the parser instead of racing
+  alongside it. Writes from the currently paused parser-inserted script use the
+  primary tokenizer; writes after parser EOF use the separate compatibility
+  write stream.
+- Browser-owned child documents use the live pausable parser, managed realms,
+  generation cancellation, ordered defer classics, and real module
+  evaluation. Their already-fetched response is supplied to the tokenizer as
+  one buffer, while external entry sources and stylesheets are prefetched;
+  ready async work therefore has simplified encounter-order timing.
+- Managed frame-module loading has focused coverage for static graphs,
+  dynamic import, import-map freezing, TLA, realm isolation, duplicate
+  evaluation, and detach/replacement cancellation. CORS/final-URL attribution
+  and fully concurrent async timing remain narrower than a complete browser.
 - Only `body.onload` has the body-to-Window event-handler alias in this path;
   the other body/frameset Window handler aliases are not implemented here.
 - Parser-created eager images are DOM load blockers even when page script never
-  observes them; `loading="lazy"` images are not. The JavaScript linked-sheet
-  `@import` materializer remains bounded at depth 4.
-- The `about:blank` fast path commits directly as loaded rather than replaying
-  the ordinary event sequence.
-- CDP navigation notifications are still emitted as a batched compatibility
-  sequence. Raw `Page.navigate` defaults to server-side
-  `DomContentLoaded` when `waitUntil` is omitted, so its batched CDP `load`
-  notification can precede the DOM Window load described above. Treat
-  `document.readyState`, the DOM events, or an explicit server-side
-  `waitUntil: "load"` as the authoritative DOM boundary.
+  observes them; `loading="lazy"` images are not. The linked-sheet `@import`
+  materializer remains bounded at depth 4. Eager connected iframes enter the
+  load driver; `iframe[loading=lazy]` starts on a post-load turn and remains
+  visible to capture-ready. Viewport-distance-based lazy selection is not yet
+  implemented.
+- Explicit top-level `about:blank` now follows the normal synthetic lifecycle
+  without a network request. Iframes keep one stable WindowProxy while blank,
+  managed, and replacement document backends are swapped; removal detaches the
+  backend without invalidating page-held proxy references.
+- CDP lifecycle milestones are sent while navigation continues. Raw
+  `Page.navigate` defaults to commit when `waitUntil` is omitted, and
+  `Page.lifecycleEvent` is only sent to sessions that enabled it. A persistent
+  target observer forwards request start, headers, data chunks, and exactly one
+  success/failure terminal phase; completed response snapshots are not replayed
+  as a duplicate request sequence.
+- Media resource selection and metadata loading are modeled, but media
+  decoding and playback are not. Service Workers and full re-entrant
+  `document.open()`/`close()` are also outside the current scope.
 
-The CDP-facing progression remains:
+The observable milestone order is:
 
 ```text
-init → commit → domcontentloaded → load → networkidle2 → networkidle0
+request start/headers → init/commit → data/parser → DOMContentLoaded → load → requested network-idle
 ```
 
 ## Storage
