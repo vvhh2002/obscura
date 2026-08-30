@@ -120,7 +120,8 @@ tag. It also supports `workflow_dispatch` for a guarded manual build:
 
 1. Open **Actions → Release → Run workflow** and select the exact branch whose
    current commit should be released.
-2. Enter a SemVer tag with a leading `v`, such as `v0.2.0`.
+2. Enter a SemVer version such as `0.2.0` or `v0.2.0`. The workflow adds the
+   leading `v` when it is omitted.
 3. Select **build** to create downloadable workflow artifacts only, or
    **publish** to create or update a public GitHub Release after every build
    succeeds.
