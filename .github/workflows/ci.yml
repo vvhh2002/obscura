@@ -145,29 +145,29 @@ jobs:
           save-if: false
 
       - name: Build render release
-        run: cargo build --release -p obscura-cli --bins --features render
+        run: cargo build --locked --release -p obscura-cli --bins --features render
 
       - name: Test render configuration
-        run: cargo nextest run --release --features render --no-fail-fast
+        run: cargo nextest run --locked --release --features render --no-fail-fast
 
       - name: Stage candidate binary for comparison
         run: install -D -m 0755 target/release/obscura "$RUNNER_TEMP/obscura-ci/obscura-pr"
 
       - name: Build render and stealth release
-        run: cargo build --release -p obscura-cli --bins --features render,stealth
+        run: cargo build --locked --release -p obscura-cli --bins --features render,stealth
 
       - name: Test the stealth transport
         run: |
           # The gzip fixture binds loopback. Keep the ordinary suite under the
           # default SSRF policy, then opt in only for that single focused test.
-          cargo nextest run --release -p obscura-net --features stealth \
+          cargo nextest run --locked --release -p obscura-net --features stealth \
             --no-fail-fast -- --skip stealth_client_decodes_gzip_response
-          OBSCURA_ALLOW_PRIVATE_NETWORK=1 cargo nextest run --release \
+          OBSCURA_ALLOW_PRIVATE_NETWORK=1 cargo nextest run --locked --release \
             -p obscura-net --features stealth \
             stealth_client_decodes_gzip_response --no-fail-fast
 
       - name: Build no-render release
-        run: cargo build --release -p obscura-cli --bins --no-default-features
+        run: cargo build --locked --release -p obscura-cli --bins --no-default-features
 
       - name: Test no-render configuration
         run: |
@@ -177,14 +177,14 @@ jobs:
           # disabled. `obscura-render` has paint-only test fixtures, so verify
           # its feature-minimal library separately without compiling those
           # fixtures.
-          cargo nextest run --release -p obscura --no-fail-fast
-          cargo nextest run --release --workspace --exclude obscura \
+          cargo nextest run --locked --release -p obscura --no-fail-fast
+          cargo nextest run --locked --release --workspace --exclude obscura \
             --exclude obscura-render \
             --no-default-features --no-fail-fast
-          cargo check --release -p obscura-render --no-default-features
+          cargo check --locked --release -p obscura-render --no-default-features
 
       - name: Build no-render and stealth release
-        run: cargo build --release -p obscura-cli --bins --no-default-features --features stealth
+        run: cargo build --locked --release -p obscura-cli --bins --no-default-features --features stealth
 
       - name: Upload candidate binary
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -253,7 +253,7 @@ jobs:
           (
             cd "$base_root"
             CARGO_TARGET_DIR="$RUNNER_TEMP/obscura-base-target" \
-              cargo build --release -p obscura-cli --bins --features render
+              cargo build --locked --release -p obscura-cli --bins --features render
           )
           install -D -m 0755 \
             "$RUNNER_TEMP/obscura-base-target/release/obscura" \

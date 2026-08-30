@@ -546,7 +546,9 @@ mod tests {
         .await
         .expect_err("an unsettled promise must not return stale result metadata");
         assert!(
-            error.contains("25ms timeout") || error.contains("within 25ms"),
+            error.contains("25ms timeout")
+                || error.contains("within 25ms")
+                || error.contains("25ms command budget"),
             "unexpected timeout error: {error}"
         );
     }

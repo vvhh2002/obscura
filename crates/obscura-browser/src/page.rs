@@ -8667,6 +8667,7 @@ mod tests {
         format!("http://{address}")
     }
 
+    #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn srcdoc_frames_inherit_base_capture_resources_and_replace_their_realm() {
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
@@ -8768,6 +8769,7 @@ mod tests {
             }));
     }
 
+    #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn frame_render_warmup_captures_static_and_dynamic_final_dom_resources() {
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
@@ -8903,6 +8905,7 @@ mod tests {
         assert!(page.resource_archive_incomplete_reasons().is_empty());
     }
 
+    #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn top_render_warmup_captures_dynamic_inline_stylesheet_import_graph() {
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
@@ -8960,6 +8963,7 @@ mod tests {
         assert!(page.resource_archive_incomplete_reasons().is_empty());
     }
 
+    #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn top_dynamic_inline_stylesheet_http_failure_is_archive_incomplete() {
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
@@ -8990,6 +8994,7 @@ mod tests {
             }));
     }
 
+    #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn shadow_render_warmup_archives_closed_nested_resources_with_ownership() {
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
@@ -9059,6 +9064,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn unsupported_shadow_stylesheet_owners_are_archive_incomplete() {
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
@@ -9087,6 +9093,7 @@ mod tests {
         }));
     }
 
+    #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn dynamic_frame_stylesheet_http_failure_is_archive_incomplete() {
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
