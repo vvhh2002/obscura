@@ -68,6 +68,8 @@ async fn eval(ctx: &mut CdpContext, id: u64, expr: &str, session_id: &str) -> Va
 
 async fn setup() -> (CdpContext, String) {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
+    std::env::set_var("no_proxy", "127.0.0.1,localhost");
     let url = serve().await;
     let mut ctx = CdpContext::new();
     let page_id = ctx.create_page();
@@ -166,5 +168,43 @@ async fn iframe_load_reaches_onload_and_addeventlistener() {
         val["events"],
         json!(["property", "listener"]),
         "both onload property and addEventListener('load') run exactly once, in order"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn call_function_on_awaits_a_promise_that_depends_on_iframe_load() {
+    let (mut ctx, sid) = setup().await;
+    let value = cdp(
+        &mut ctx,
+        2,
+        "Runtime.callFunctionOn",
+        json!({
+            "functionDeclaration": r#"function () {
+                return new Promise((resolve) => {
+                    const iframe = document.createElement('iframe');
+                    iframe.onload = () => resolve(JSON.stringify({
+                        loaded: true,
+                        readyState: iframe.contentDocument.readyState,
+                        url: iframe.contentDocument.URL
+                    }));
+                    iframe.src = location.href;
+                    document.body.appendChild(iframe);
+                });
+            }"#,
+            "returnByValue": true,
+            "awaitPromise": true,
+            "timeout": 2_000
+        }),
+        &sid,
+    )
+    .await;
+
+    let result = serde_json::from_str::<Value>(value["result"]["value"].as_str().unwrap())
+        .expect("callFunctionOn result JSON");
+    assert_eq!(result["loaded"], true, "iframe owner load did not settle: {result:#?}");
+    assert_eq!(result["readyState"], "complete", "{result:#?}");
+    assert!(
+        result["url"].as_str().is_some_and(|url| url.starts_with("http://127.0.0.1:")),
+        "unexpected child URL: {result:#?}",
     );
 }

@@ -158,6 +158,14 @@ async fn a_removed_binding_is_not_called() {
     .await;
     cdp(
         &mut ctx,
+        20,
+        "Runtime.evaluate",
+        json!({"expression": "globalThis.savedProbe = obscuraProbe"}),
+        Some(&session),
+    )
+    .await;
+    cdp(
+        &mut ctx,
         3,
         "Runtime.removeBinding",
         json!({"name": "obscuraProbe"}),
@@ -174,8 +182,110 @@ async fn a_removed_binding_is_not_called() {
     )
     .await;
     assert_eq!(gone["result"]["value"], "undefined");
+
+    // A page may have retained the old callable before removeBinding. It can
+    // still execute that ordinary JS function, but the now-unregistered name
+    // must not be broadcast as a Runtime.bindingCalled event.
+    cdp(
+        &mut ctx,
+        5,
+        "Runtime.evaluate",
+        json!({"expression": "savedProbe('LATE')"}),
+        Some(&session),
+    )
+    .await;
     assert!(
         binding_calls(&ctx).is_empty(),
         "a removed binding still delivered a call"
     );
+}
+
+/// A binding registered once is installed in the next document before its
+/// parser scripts execute, without exposing Deno or a generic op bridge.
+#[tokio::test(flavor = "current_thread")]
+async fn binding_is_private_and_preloaded_before_page_scripts() {
+    let mut ctx = CdpContext::new();
+    let (_, session) = created_and_attached(&mut ctx).await;
+
+    cdp(&mut ctx, 1, "Runtime.enable", json!({}), Some(&session)).await;
+    cdp(
+        &mut ctx,
+        2,
+        "Runtime.addBinding",
+        json!({"name": "obscuraProbe"}),
+        Some(&session),
+    )
+    .await;
+    cdp(
+        &mut ctx,
+        3,
+        "Page.navigate",
+        json!({
+            "url": "data:text/html,<script>obscuraProbe('EARLY')</script>",
+            "waitUntil": "load"
+        }),
+        Some(&session),
+    )
+    .await;
+
+    let called = binding_calls(&ctx);
+    assert_eq!(called.len(), 1, "parser script did not call the binding: {called:?}");
+    assert_eq!(called[0].0, session);
+    assert_eq!(called[0].1["name"], "obscuraProbe");
+    assert_eq!(called[0].1["payload"], "EARLY");
+
+    let visibility = cdp(
+        &mut ctx,
+        4,
+        "Runtime.evaluate",
+        json!({
+            "expression": "({deno:typeof Deno, source:Function.prototype.toString.call(obscuraProbe)})",
+            "returnByValue": true
+        }),
+        Some(&session),
+    )
+    .await;
+    assert_eq!(visibility["result"]["value"]["deno"], "undefined");
+    assert!(
+        !visibility["result"]["value"]["source"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Deno.core"),
+        "binding source exposed the native op table"
+    );
+}
+
+/// Runtime bindings are realm-wide CDP instrumentation and therefore exist in
+/// child documents before those documents' parser scripts run as well.
+#[tokio::test(flavor = "current_thread")]
+async fn binding_is_preloaded_in_child_frame_scripts() {
+    let mut ctx = CdpContext::new();
+    let (_, session) = created_and_attached(&mut ctx).await;
+
+    cdp(&mut ctx, 1, "Runtime.enable", json!({}), Some(&session)).await;
+    cdp(
+        &mut ctx,
+        2,
+        "Runtime.addBinding",
+        json!({"name": "obscuraProbe"}),
+        Some(&session),
+    )
+    .await;
+    cdp(
+        &mut ctx,
+        3,
+        "Page.navigate",
+        json!({
+            "url": "data:text/html,<iframe srcdoc=\"<script>obscuraProbe('FRAME')</script>\"></iframe>",
+            "waitUntil": "load"
+        }),
+        Some(&session),
+    )
+    .await;
+
+    let called = binding_calls(&ctx);
+    assert_eq!(called.len(), 1, "frame parser script did not call the binding: {called:?}");
+    assert_eq!(called[0].0, session);
+    assert_eq!(called[0].1["name"], "obscuraProbe");
+    assert_eq!(called[0].1["payload"], "FRAME");
 }

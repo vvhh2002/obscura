@@ -2,7 +2,11 @@ use std::cell::RefCell;
 use std::time::Duration;
 
 use obscura_browser::lifecycle::WaitUntil;
-use obscura_browser::{InterceptedRequest, Page as InnerPage};
+use obscura_browser::{
+    InterceptedRequest, Page as InnerPage, ResourceCapture, ResourceCaptureLimits,
+};
+#[cfg(feature = "render")]
+use obscura_browser::ScreenshotResourceWarmupReport;
 use obscura_net::{RequestCallback, ResponseCallback};
 use serde_json::Value;
 
@@ -53,6 +57,11 @@ impl Page {
     /// URLs of the page's child frames, in creation order.
     pub fn frame_urls(&self) -> Vec<String> {
         self.inner.borrow().frame_urls()
+    }
+
+    /// Absolute resource URLs fetched by the page and its child frames.
+    pub fn fetched_urls(&self) -> Vec<String> {
+        self.inner.borrow().fetched_urls()
     }
 
     /// Execute JS inside one of the page's child frames. Each frame is its own
@@ -113,6 +122,66 @@ impl Page {
     /// resolve scheduled microtasks/macrotasks before the next `evaluate()`.
     pub async fn settle(&mut self, max_ms: u64) {
         self.inner.get_mut().settle(max_ms).await
+    }
+
+    /// Settle for a fixed duration while following top-level navigations
+    /// requested by page JavaScript.
+    pub async fn settle_following_navigations(&mut self, duration_ms: u64) -> Result<(), Error> {
+        self.inner
+            .get_mut()
+            .settle_for_duration_following_navigations(duration_ms)
+            .await
+            .map_err(|error| Error::Navigation(error.to_string()))
+    }
+
+    /// Start byte-exact response capture for the current and subsequent final
+    /// documents. Navigating replaces the previous document's archive.
+    pub fn enable_resource_capture(&mut self, limits: ResourceCaptureLimits) {
+        self.inner.get_mut().enable_resource_capture(limits);
+    }
+
+    /// Drain the final document's captured responses while leaving capture on.
+    pub fn take_resource_capture(&mut self) -> Option<ResourceCapture> {
+        self.inner.get_mut().take_resource_capture()
+    }
+
+    /// Number of top-level or child-frame requests which have not yet
+    /// produced a response or error.
+    pub fn pending_network_request_count(&self) -> u32 {
+        self.inner.borrow().pending_network_request_count()
+    }
+
+    /// Whether network or dynamically inserted script work can still add
+    /// response bodies to the current document generation.
+    pub fn has_pending_resource_work(&mut self) -> bool {
+        self.inner.get_mut().has_pending_resource_work()
+    }
+
+    /// Sorted human-readable reasons the current final-document response
+    /// archive is known to be incomplete. Navigation replaces the previous
+    /// document's reasons; diagnostic wording is not a versioned schema.
+    pub fn resource_archive_incomplete_reasons(&mut self) -> Vec<String> {
+        self.inner
+            .get_mut()
+            .resource_archive_incomplete_reasons()
+    }
+
+    /// Seed renderer image/font resources and return a complete diagnostic for
+    /// this bounded pass, including deferred, timed-out, and failed requests.
+    #[cfg(feature = "render")]
+    pub async fn prepare_screenshot_resources_with_report(
+        &mut self,
+        max_ms: u64,
+    ) -> ScreenshotResourceWarmupReport {
+        self.inner
+            .get_mut()
+            .prepare_screenshot_resources_with_report(max_ms)
+            .await
+    }
+
+    /// Stop response capture and return the final document's archive.
+    pub fn disable_resource_capture(&mut self) -> Option<ResourceCapture> {
+        self.inner.get_mut().disable_resource_capture()
     }
 
     /// Register a script that runs before any of the page's own `<script>` tags,

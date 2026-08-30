@@ -4,13 +4,10 @@ use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
 
-/// Whether a binding name is a plain JS identifier and therefore safe to
-/// interpolate into the generated shim / teardown scripts. Chromium bindings
-/// are identifiers; anything else (quotes, brackets, spaces, operators) could
-/// break out of the surrounding string literal and inject arbitrary JS into the
-/// page. `Runtime.addBinding` always enforced this, but `Runtime.removeBinding`
-/// did not, so a crafted name escaped `delete globalThis['{name}']` and ran in
-/// the page context. Both handlers now share this guard.
+/// Whether a binding name is a plain JS identifier accepted by Obscura's CDP
+/// compatibility surface. Installation now uses V8 values and teardown uses a
+/// JSON-encoded property key, but both handlers deliberately retain the same
+/// narrow name contract so add/remove cannot disagree on which binding exists.
 fn is_valid_binding_name(name: &str) -> bool {
     !name.is_empty()
         && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
@@ -128,25 +125,20 @@ pub async fn handle(
             let page = ctx
                 .get_session_page_mut(session_id)
                 .ok_or("No page")?;
-            let info = match tokio::time::timeout(
-                std::time::Duration::from_millis(timeout_ms),
-                page.evaluate_for_cdp_with_timeout(
+            // Page owns the single timeout/deadline so its await sentinel is
+            // always cleaned before this command returns. An equal-duration
+            // outer Tokio timeout starts first and can otherwise cancel Page
+            // one poll before its cleanup branch, leaking a global sentinel
+            // and the still-running async continuation on every normal client
+            // timeout.
+            let info = page
+                .evaluate_for_cdp_with_timeout(
                     expression,
                     return_by_value,
                     await_promise,
                     timeout_ms,
-                ),
-            )
-            .await
-            {
-                Ok(Ok(info)) => info,
-                Ok(Err(error)) => return Err(error),
-                Err(_) => {
-                    return Err(format!(
-                        "Runtime.evaluate exceeded {timeout_ms}ms timeout"
-                    ));
-                }
-            };
+                )
+                .await?;
             emit_post_eval_nav(ctx, session_id).await?;
 
             Ok(json!({ "result": remote_object_from_info(&info) }))
@@ -190,27 +182,16 @@ pub async fn handle(
             let page = ctx
                 .get_session_page_mut(session_id)
                 .ok_or("No page")?;
-            let info = match tokio::time::timeout(
-                std::time::Duration::from_millis(timeout_ms),
-                page.call_function_on_for_cdp_with_timeout(
+            let info = page
+                .call_function_on_for_cdp_with_timeout(
                     function_declaration,
                     object_id,
                     &arguments,
                     return_by_value,
                     await_promise,
                     timeout_ms,
-                ),
-            )
-            .await
-            {
-                Ok(Ok(info)) => info,
-                Ok(Err(error)) => return Err(error),
-                Err(_) => {
-                    return Err(format!(
-                        "Runtime.callFunctionOn exceeded {timeout_ms}ms timeout"
-                    ));
-                }
-            };
+                )
+                .await?;
             emit_post_eval_nav(ctx, session_id).await?;
 
             Ok(json!({ "result": remote_object_from_info(&info) }))
@@ -356,30 +337,12 @@ pub async fn handle(
         "addBinding" => {
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             if is_valid_binding_name(name) {
-                // The shim forwards every call back to Rust through
-                // op_binding_called; the CDP dispatcher then drains the
-                // queue and emits Runtime.bindingCalled events the same
-                // way Chromium does. Chromium's V8InspectorImpl rejects
-                // calls without exactly one argument and ToString-coerces
-                // that argument before emitting it as the payload — we
-                // match the coercion (`String(arg)`) and silently drop
-                // calls with wrong arity, which is what Chrome does.
-                let shim = format!(
-                    "globalThis['{name}'] = function (arg) {{\
-                        if (arguments.length !== 1) return;\
-                        try {{\
-                            const payload = typeof arg === 'string' ? arg : String(arg);\
-                            Deno.core.ops.op_binding_called('{name}', payload);\
-                        }} catch (e) {{ /* swallow: binding must not throw into page */ }}\
-                    }};",
-                    name = name,
-                );
-                // Re-install on every navigation: globalThis is wiped on
-                // each new document, and puppeteer registers bindings
-                // once-per-page rather than once-per-document.
-                let key = format!("__obscura_binding__{}", name);
-                ctx.preload_scripts.retain(|(k, _)| k != &key);
-                ctx.preload_scripts.push((key, shim.clone()));
+                // Re-install on every navigation, but do not put a Deno/op
+                // reference in author-visible preload source. The JS runtime
+                // creates a V8 closure over only op_binding_called and this
+                // immutable name; page script can invoke the public binding
+                // without reaching the generic native op table.
+                ctx.binding_names.insert(name.to_string());
                 // Remember who subscribed, so the call goes back to this
                 // session rather than to whichever session of the page a
                 // HashMap happens to yield first. A client discards an event
@@ -395,7 +358,9 @@ pub async fn handle(
                 // Install on the current page so the binding is usable
                 // immediately, without waiting for the next navigation.
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
-                    page.evaluate(&shim);
+                    if let Err(error) = page.add_preload_binding(name) {
+                        tracing::debug!("could not install Runtime binding {name}: {error}");
+                    }
                 }
             }
             Ok(json!({}))
@@ -403,18 +368,21 @@ pub async fn handle(
         "removeBinding" => {
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             if is_valid_binding_name(name) {
-                let key = format!("__obscura_binding__{}", name);
-                ctx.preload_scripts.retain(|(k, _)| k != &key);
+                let mut remove_globally = session_id.is_none();
                 if let Some(session_id) = session_id {
                     if let Some(owners) = ctx.binding_sessions.get_mut(name) {
                         owners.retain(|owner| owner != session_id);
                         if owners.is_empty() {
                             ctx.binding_sessions.remove(name);
+                            remove_globally = true;
                         }
                     }
                 }
-                if let Some(page) = ctx.get_session_page_mut(session_id) {
-                    page.evaluate(&format!("delete globalThis['{}'];", name));
+                if remove_globally {
+                    ctx.binding_names.remove(name);
+                    if let Some(page) = ctx.get_session_page_mut(session_id) {
+                        page.remove_preload_binding(name);
+                    }
                 }
             }
             Ok(json!({}))
@@ -578,7 +546,9 @@ mod tests {
         .await
         .expect_err("an unsettled promise must not return stale result metadata");
         assert!(
-            error.contains("25ms timeout") || error.contains("within 25ms"),
+            error.contains("25ms timeout")
+                || error.contains("within 25ms")
+                || error.contains("25ms command budget"),
             "unexpected timeout error: {error}"
         );
     }

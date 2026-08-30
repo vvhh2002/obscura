@@ -1328,6 +1328,8 @@ async fn process_with_interception(
     let nav_body = req.params.get("__body").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
     let preload_scripts: Vec<String> = ctx.preload_scripts.iter().map(|(_, s)| s.clone()).collect();
+    let mut preload_bindings: Vec<String> = ctx.binding_names.iter().cloned().collect();
+    preload_bindings.sort_unstable();
 
     if let Some(tx) = &ctx.intercept_tx {
         page.set_intercept_tx(tx.clone());
@@ -1348,10 +1350,11 @@ async fn process_with_interception(
         // both sides coordinate on one page's isolate at a time on this thread.
         // The lock is per-connection, so other connections are unaffected (#430).
         let _v8_guard = nav_v8_lock.lock_owned().await;
-        // Preloads (addBinding shims, addScriptToEvaluateOnNewDocument sources)
+        // Preloads (Runtime bindings and addScriptToEvaluateOnNewDocument sources)
         // must run BEFORE the page's own scripts (CDP contract). Hand them
         // to the page so navigate_single can inject them at the right point.
         page.set_preload_scripts(preload_scripts);
+        page.set_preload_bindings(preload_bindings);
         let result = if nav_method == "POST" && !nav_body.is_empty() {
             page.navigate_with_wait_post(&url_owned, wait_until, &nav_method, &nav_body).await
         } else {

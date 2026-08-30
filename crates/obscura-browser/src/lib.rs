@@ -14,7 +14,12 @@ pub use obscura_js::{
     validate_capture_region, AnimationSample, AnimationSampleMode, AnimationSampleTime,
     CaptureError, CaptureRegion,
 };
-pub use page::{NetworkEvent, Page, PageError};
+pub use page::{
+    CapturedResource, FrameResourceDiagnostic, FrameSnapshot, NetworkEvent, Page, PageError,
+    ResourceCapture, ResourceCaptureLimits,
+};
+#[cfg(feature = "render")]
+pub use page::ScreenshotResourceWarmupReport;
 #[cfg(feature = "render")]
 pub use pdf::{RasterPdfError, RasterPdfOptions, RasterPdfPageRange};
 // Re-exported so the embeddable `obscura` crate (which depends on obscura-browser,

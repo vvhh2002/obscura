@@ -1,17 +1,28 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
-use obscura_js::frame::FrameRealm;
-use obscura_js::runtime::ObscuraJsRuntime;
+use obscura_js::frame::{FrameLifecycleState, FrameRealm};
+use obscura_js::runtime::{ObscuraJsRuntime, WatchdogToken};
 use obscura_net::{
-    CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
-    ResourceType, Response, ResponseCallback,
+    CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, RequestInfo,
+    ResourceRequest, ResourceType, Response, ResponseCallback,
 };
 use url::Url;
 
 use crate::context::BrowserContext;
 use crate::lifecycle::LifecycleState;
+
+struct ScriptLoadPhase {
+    deadline: tokio::time::Instant,
+    watchdog: Option<WatchdogToken>,
+}
+
+const LIFECYCLE_CALLBACK_WATCHDOG_MS: u64 = 5_500;
+static NEXT_CDP_PAGE_AWAIT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Parse `OBSCURA_GEOLOCATION="lat,lon"` for the navigator.geolocation shim.
 /// Returns None when unset or malformed, leaving the built-in default in place.
@@ -208,6 +219,173 @@ pub struct StoredResponseBody {
     pub base64_encoded: bool,
 }
 
+/// Stable identity and final document URL of one currently live child frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameSnapshot {
+    pub frame_id: u32,
+    pub url: String,
+}
+
+/// Unsupported resource work still visible in one live child frame.
+/// Callers producing resource archives can use any returned entry to mark the
+/// result incomplete rather than silently omitting it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameResourceDiagnostic {
+    pub frame_id: u32,
+    pub url: String,
+    pub unsupported_module_scripts: usize,
+    pub unsupported_stylesheet_imports: usize,
+    pub pending_navigation_url: Option<String>,
+    pub pending_dynamic_scripts: bool,
+    /// Realm evaluation/listing failure. When present, the numeric and boolean
+    /// fields above are not evidence of an empty resource set.
+    pub diagnostic_error: Option<String>,
+}
+
+/// Outcome of one bounded renderer-resource warmup pass.
+///
+/// `remaining` includes both requests that exceeded the pass deadline and
+/// candidates deferred by the per-pass request cap. A caller which needs a
+/// complete resource archive must therefore require all of `remaining`,
+/// `timed_out`, and `failed` to be zero (or retain the non-zero diagnostic as
+/// an incomplete reason while retrying later passes).
+#[cfg(feature = "render")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScreenshotResourceWarmupReport {
+    /// Cache-missing renderer resources discovered at the start of this pass.
+    pub discovered: usize,
+    /// Resources actually scheduled in this pass (currently capped at 128).
+    pub attempted: usize,
+    /// Successful 2xx responses inserted into the renderer cache.
+    pub loaded: usize,
+    /// Completed requests which failed transport or returned a non-2xx status.
+    pub failed: usize,
+    /// Scheduled requests still unfinished when the deadline expired.
+    pub timed_out: usize,
+    /// Discovered resources not completed by this pass, including deferred and
+    /// timed-out requests. Completed failures are reported only by `failed`.
+    pub remaining: usize,
+}
+
+#[cfg(feature = "render")]
+impl ScreenshotResourceWarmupReport {
+    /// Whether this pass discovered no unresolved or failed resource work.
+    pub fn is_complete(self) -> bool {
+        self.remaining == 0 && self.timed_out == 0 && self.failed == 0
+    }
+}
+
+/// Memory bounds for lossless page resource capture. The capture API is
+/// opt-in because keeping every response body is intentionally more expensive
+/// than the bounded CDP response-body cache.
+#[derive(Clone, Copy, Debug)]
+pub struct ResourceCaptureLimits {
+    pub max_resources: usize,
+    pub max_total_bytes: usize,
+}
+
+impl Default for ResourceCaptureLimits {
+    fn default() -> Self {
+        Self {
+            max_resources: 4_096,
+            max_total_bytes: 512 * 1024 * 1024,
+        }
+    }
+}
+
+/// One byte-exact response initiated by the current top-level document or one
+/// of its child frames.
+#[derive(Clone, Debug)]
+pub struct CapturedResource {
+    pub requested_url: Url,
+    pub final_url: Url,
+    pub method: String,
+    pub resource_type: ResourceType,
+    pub document_generation: u64,
+    pub frame_id: u32,
+    pub initiator: Option<Url>,
+    pub status: u16,
+    pub request_headers: std::collections::HashMap<String, String>,
+    pub response_headers: std::collections::HashMap<String, String>,
+    pub redirected_from: Vec<Url>,
+    pub body: Vec<u8>,
+}
+
+/// Lossless responses retained for the final top-level document. A non-zero
+/// omitted count means the configured safety bounds were reached and callers
+/// must not describe the archive as complete.
+#[derive(Debug, Default)]
+pub struct ResourceCapture {
+    pub document_generation: u64,
+    pub resources: Vec<CapturedResource>,
+    pub total_bytes: usize,
+    pub omitted_resources: usize,
+    pub omitted_bytes: usize,
+}
+
+struct ResourceCaptureState {
+    limits: ResourceCaptureLimits,
+    capture: ResourceCapture,
+}
+
+impl ResourceCaptureState {
+    fn new(limits: ResourceCaptureLimits, document_generation: u64) -> Self {
+        Self {
+            limits,
+            capture: ResourceCapture {
+                document_generation,
+                ..ResourceCapture::default()
+            },
+        }
+    }
+
+    fn begin_document(&mut self, document_generation: u64) {
+        self.capture = ResourceCapture {
+            document_generation,
+            ..ResourceCapture::default()
+        };
+    }
+
+    fn record(&mut self, request: &RequestInfo, response: &Response) {
+        if request.document_generation != self.capture.document_generation {
+            return;
+        }
+        let body_bytes = response.body.len();
+        let over_count = self.capture.resources.len() >= self.limits.max_resources;
+        let over_bytes = self
+            .capture
+            .total_bytes
+            .checked_add(body_bytes)
+            .is_none_or(|total| total > self.limits.max_total_bytes);
+        if over_count || over_bytes {
+            self.capture.omitted_resources = self.capture.omitted_resources.saturating_add(1);
+            self.capture.omitted_bytes = self.capture.omitted_bytes.saturating_add(body_bytes);
+            return;
+        }
+
+        let requested_url = response
+            .redirected_from
+            .first()
+            .cloned()
+            .unwrap_or_else(|| request.url.clone());
+        self.capture.total_bytes += body_bytes;
+        self.capture.resources.push(CapturedResource {
+            requested_url,
+            final_url: response.url.clone(),
+            method: request.method.clone(),
+            resource_type: request.resource_type,
+            document_generation: request.document_generation,
+            frame_id: request.frame_id,
+            initiator: request.initiator.clone(),
+            status: response.status,
+            request_headers: request.headers.clone(),
+            response_headers: response.headers.clone(),
+            redirected_from: response.redirected_from.clone(),
+            body: response.body.clone(),
+        });
+    }
+}
+
 #[derive(Clone, Copy)]
 struct DeviceMetricsBaseline {
     viewport: (f32, f32),
@@ -225,6 +403,10 @@ pub struct Page {
     pub frames: Vec<FrameRealm>,
     pub js: Option<ObscuraJsRuntime>,
     pub lifecycle: LifecycleState,
+    /// The top document has fired DOMContentLoaded but still has load-event
+    /// blockers. Autonomous browser turns may complete it after a caller that
+    /// waited only for DOMContentLoaded has already returned.
+    top_load_pending: bool,
     pub http_client: Arc<ObscuraHttpClient>,
     pub context: Arc<BrowserContext>,
     pub title: String,
@@ -279,9 +461,18 @@ pub struct Page {
     intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>>,
     // Scripts to execute in the page's JS context BEFORE any of the page's
     // own scripts run — the CDP `Page.addScriptToEvaluateOnNewDocument`
-    // contract. Includes `Runtime.addBinding` shims so puppeteer's
-    // `exposeFunction` bindings exist before inline `<script>` tags execute.
+    // contract.
     preload_scripts: Vec<String>,
+    // CDP Runtime binding names are kept separately from author-visible
+    // preload source. The runtime installs their functions with a private V8
+    // closure over the single binding op, so hiding `Deno.core.ops` does not
+    // break exposeFunction or reopen the full native op table.
+    preload_bindings: Vec<String>,
+    /// Fetched parser stylesheet completions waiting for their encounter point
+    /// in the HTML script runner. Fetching may happen eagerly, but installing
+    /// the sheet or dispatching its owner event must not jump ahead of an
+    /// earlier parser-blocking script.
+    pending_parser_stylesheet_events: std::collections::BTreeMap<u32, (usize, String)>,
     /// Document-owned HTML script preparation flags saved while the V8 realm
     /// is suspended for CDP/MCP tab switching.  These are restored only when
     /// the same surviving DomTree is resumed; navigation clears them.
@@ -290,6 +481,12 @@ pub struct Page {
     /// #408): they fire only for requests this page drives and die with it.
     /// Arc because the JS runtime state holds a second handle for fetch()/XHR.
     callbacks: Arc<CallbackRegistry>,
+    resource_capture: Option<Arc<std::sync::Mutex<ResourceCaptureState>>>,
+    resource_capture_callback_id: Option<u64>,
+    /// Final-document resource omissions detected outside the response
+    /// callback. A sorted set gives archive manifests deterministic ordering
+    /// and prevents repeated settle/diagnostic passes from multiplying text.
+    resource_archive_incomplete_reasons: std::collections::BTreeSet<String>,
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
 }
@@ -332,16 +529,70 @@ struct LoadedStylesheet {
     rules: String,
 }
 
+struct FetchedStylesheets {
+    materialized: Vec<(AuthorStylesheetTarget, String)>,
+    failed_links: Vec<(u32, usize, String, Option<String>)>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StylesheetImport {
     url: String,
     media: Option<String>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum AuthorStylesheetTarget {
-    Linked(usize),
-    InlineImport(usize),
+    Linked {
+        nid: u32,
+        parser_order: usize,
+        raw_href: String,
+        request_href: String,
+    },
+    InlineImport {
+        nid: u32,
+    },
+}
+
+#[derive(Clone)]
+struct ParserStylesheetLinkSnapshot {
+    nid: u32,
+    parser_order: usize,
+    raw_href: String,
+    base_url: Url,
+}
+
+#[derive(Clone)]
+struct ParserInlineImportSnapshot {
+    nid: u32,
+    import: StylesheetImport,
+    base_url: Url,
+}
+
+struct ParserStylesheetSnapshot {
+    links: Vec<ParserStylesheetLinkSnapshot>,
+    inline_imports: Vec<ParserInlineImportSnapshot>,
+    body_parser_order: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ScriptKind {
+    Classic,
+    Module,
+    ImportMap,
+}
+
+#[derive(Debug)]
+struct ScriptInfo {
+    src: Option<String>,
+    inline: String,
+    is_defer: bool,
+    is_async: bool,
+    kind: ScriptKind,
+    nid: u32,
+    after_body_start: bool,
+    /// Document base URL at this element's parser encounter point.
+    base_url: String,
+    parser_order: usize,
 }
 
 fn canonical_stylesheet_url(mut url: Url) -> (String, Url) {
@@ -743,13 +994,44 @@ fn parse_import_url(stmt: &str) -> Option<StylesheetImport> {
 /// CSS cascade even when the external fetches themselves complete in order.
 /// The synthetic style retains the link's effective media query so the same
 /// fetched bytes can enter print layout without leaking into screen layout.
-fn materialize_linked_stylesheet_script(link_index: usize, css: &str) -> String {
+fn materialize_stylesheet_for_owner_script(
+    owner_expression: &str,
+    css: &str,
+    request_href: Option<&str>,
+    expected_raw_href: Option<&str>,
+) -> String {
     let escaped_css = escape_for_js_template_literal(css);
+    let request_href = request_href
+        .and_then(|value| serde_json::to_string(value).ok())
+        .unwrap_or_else(|| "null".to_string());
+    let expected_raw_href = expected_raw_href
+        .and_then(|value| serde_json::to_string(value).ok())
+        .unwrap_or_else(|| "null".to_string());
     format!(
         r#"(function() {{
-            var links = document.querySelectorAll('link[rel~="stylesheet"]');
-            var link = links[{link_index}];
+            var link = {owner_expression};
             if (!link || !link.parentNode) return;
+            var requestHref = {request_href};
+            var expectedRawHref = {expected_raw_href};
+            // Parser transport owns the request captured at the element's
+            // encounter point. A later href rewrite starts distinct dynamic
+            // work; the stale parser response must not install CSS or complete
+            // that newer request. Compare the raw token rather than baseURI,
+            // because a later <base> legitimately changes the live resolver
+            // without changing the already-started parser request.
+            if (expectedRawHref !== null
+                && link.getAttribute('href') !== expectedRawHref) return;
+            // href/rel removal invalidates the parser request even if script
+            // restores the same raw href before its response arrives. The
+            // closure-owned marker distinguishes that new processing epoch;
+            // raw-string equality alone cannot.
+            if (expectedRawHref !== null
+                && (!globalThis.__obscura_isParserStylesheetPending
+                    || !globalThis.__obscura_isParserStylesheetPending(link))) return;
+            // The JS loader may have completed while the page transport was
+            // fetching the same candidate. Its sheet and owner event win;
+            // materializing again would duplicate both CSS and load.
+            if (link.sheet != null) return;
             var style = null;
             function effectiveMedia() {{
                 // Until the generic Element shim reflects HTMLLinkElement.media,
@@ -765,7 +1047,8 @@ fn materialize_linked_stylesheet_script(link_index: usize, css: &str) -> String 
                     style = document.createElement('style');
                     style.setAttribute('data-obscura-external-stylesheets', '');
                     style.textContent = `{escaped_css}`;
-                    globalThis.__obscura_registerLinkedStylesheet(link, style);
+                    globalThis.__obscura_registerLinkedStylesheet(
+                        link, style, requestHref === null ? undefined : requestHref);
                 }}
                 var enabled = link.parentNode
                     && !link.disabled
@@ -786,9 +1069,205 @@ fn materialize_linked_stylesheet_script(link_index: usize, css: &str) -> String 
             // may then make the sheet applicable (the common
             // media=print/onload="this.media='all'" async-CSS pattern).
             syncSheet();
-            try {{ link.dispatchEvent(new Event('load')); }}
+            try {{
+                globalThis.__obscura_completeLinkedStylesheet(
+                    link,
+                    'load',
+                    requestHref === null ? undefined : requestHref,
+                    expectedRawHref === null ? undefined : expectedRawHref);
+            }}
             finally {{ syncSheet(); }}
         }})()"#
+    )
+}
+
+fn materialize_linked_stylesheet_script(link_index: usize, css: &str) -> String {
+    materialize_stylesheet_for_owner_script(
+        &format!("document.querySelectorAll('link[rel~=\"stylesheet\"]')[{link_index}]"),
+        css,
+        None,
+        None,
+    )
+}
+
+/// Parser stylesheet completion addressed by the owner's stable native node
+/// id. Earlier parser scripts may insert, remove, or reorder other links, so a
+/// querySelectorAll index captured before script execution is not an identity.
+fn materialize_parser_stylesheet_script_with_token(
+    link_nid: u32,
+    css: &str,
+    request_href: &str,
+    expected_raw_href: &str,
+) -> String {
+    materialize_stylesheet_for_owner_script(
+        &format!("globalThis._wrap && globalThis._wrap({link_nid})"),
+        css,
+        Some(request_href),
+        Some(expected_raw_href),
+    )
+}
+
+fn materialize_parser_stylesheet_script(link_nid: u32, css: &str) -> String {
+    materialize_stylesheet_for_owner_script(
+        &format!("globalThis._wrap && globalThis._wrap({link_nid})"),
+        css,
+        None,
+        None,
+    )
+}
+
+fn complete_parser_stylesheet_script_with_token(
+    link_nid: u32,
+    event_type: &str,
+    request_href: Option<&str>,
+    expected_raw_href: &str,
+) -> String {
+    debug_assert!(matches!(event_type, "load" | "error"));
+    let request_href = request_href
+        .and_then(|value| serde_json::to_string(value).ok())
+        .unwrap_or_else(|| "undefined".to_string());
+    let expected_raw_href =
+        serde_json::to_string(expected_raw_href).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(function() {{
+            var link = globalThis._wrap && globalThis._wrap({link_nid});
+            if (link && typeof globalThis.__obscura_completeLinkedStylesheet === 'function') {{
+                globalThis.__obscura_completeLinkedStylesheet(
+                    link, '{event_type}', {request_href}, {expected_raw_href});
+            }}
+        }})()"#
+    )
+}
+
+fn complete_parser_stylesheet_script(link_nid: u32, event_type: &str) -> String {
+    debug_assert!(matches!(event_type, "load" | "error"));
+    format!(
+        r#"(function() {{
+            var link = globalThis._wrap && globalThis._wrap({link_nid});
+            if (link && typeof globalThis.__obscura_completeLinkedStylesheet === 'function') {{
+                globalThis.__obscura_completeLinkedStylesheet(link, '{event_type}');
+            }}
+        }})()"#
+    )
+}
+
+/// Turn a fetched frame stylesheet's leading `@import` rules into ordinary
+/// pending `<link rel=stylesheet>` owners. The next bounded archive/render
+/// warmup fetches those links through the same frame-aware page transport,
+/// which naturally handles arbitrary import graphs one depth at a time while
+/// keeping every response attributable to the child frame.
+fn queue_stylesheet_imports_for_owner_script(
+    owner_expression: &str,
+    imports: &[StylesheetImport],
+    response_url: &Url,
+    next_depth: u8,
+) -> String {
+    let imports = imports
+        .iter()
+        .filter_map(|import| {
+            response_url.join(&import.url).ok().map(|url| {
+                serde_json::json!({
+                    "href": url,
+                    "media": import.media,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let imports = serde_json::to_string(&imports).unwrap_or_else(|_| "[]".to_string());
+    format!(
+        r#"(function() {{
+            var owner = {owner_expression};
+            if (!owner || !owner.parentNode) throw new Error('stylesheet owner disappeared');
+            var inherited = (owner.getAttribute('media') || '').trim();
+            var imports = {imports};
+            for (var i = 0; i < imports.length; i++) {{
+                var pending = document.createElement('link');
+                pending.setAttribute('rel', 'stylesheet');
+                pending.setAttribute('href', imports[i].href);
+                pending.setAttribute('data-obscura-import-depth', '{next_depth}');
+                pending.setAttribute('data-obscura-page-transport', '');
+                var own = String(imports[i].media || '').trim();
+                var media = inherited && own
+                    ? '(' + inherited + ') and (' + own + ')'
+                    : (inherited || own);
+                if (media) pending.setAttribute('media', media);
+                owner.parentNode.insertBefore(pending, owner);
+            }}
+        }})()"#,
+    )
+}
+
+/// Queue imports for a stylesheet discovered after parser execution. Archive
+/// warmup re-scans the live document on each pass, so its current selector
+/// index intentionally identifies the owner in that same pass.
+fn queue_stylesheet_imports_script(
+    link_index: usize,
+    imports: &[StylesheetImport],
+    response_url: &Url,
+    next_depth: u8,
+) -> String {
+    queue_stylesheet_imports_for_owner_script(
+        &format!("document.querySelectorAll('link[rel~=\"stylesheet\"]')[{link_index}]"),
+        imports,
+        response_url,
+        next_depth,
+    )
+}
+
+/// Replace one frame-owned inline stylesheet's leading `@import` rules with
+/// pending link owners. They are deliberately ordinary stylesheet links so
+/// the frame-aware warmup can reuse its byte-exact transport, attribution,
+/// depth cap, recursive import handling, and failure diagnostics.
+fn queue_inline_stylesheet_imports_script(
+    style_index: usize,
+    rules: &str,
+    imports: &[StylesheetImport],
+    document_base: &Url,
+    import_depth: u8,
+) -> String {
+    let escaped_rules = escape_for_js_template_literal(rules);
+    let imports = imports
+        .iter()
+        .filter_map(|import| {
+            document_base.join(&import.url).ok().map(|url| {
+                serde_json::json!({
+                    "href": url,
+                    "media": import.media,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let imports = serde_json::to_string(&imports).unwrap_or_else(|_| "[]".to_string());
+    format!(
+        r#"(function() {{
+            var styles = [...document.querySelectorAll('style')].filter(function(node) {{
+                if (node.hasAttribute('data-obscura-adopted')
+                    || node.hasAttribute('data-obscura-linked')
+                    || node.hasAttribute('data-obscura-external-stylesheets')
+                    || node.hasAttribute('data-obscura-inline-import')
+                    || node.hasAttribute('data-obscura-imports-materialized')) return false;
+                var type = (node.getAttribute('type') || '').trim().toLowerCase();
+                return !type || type === 'text/css';
+            }});
+            var source = styles[{style_index}];
+            if (!source || !source.parentNode) throw new Error('inline stylesheet owner disappeared');
+            source.textContent = `{escaped_rules}`;
+            var inherited = (source.getAttribute('media') || '').trim();
+            var imports = {imports};
+            for (var i = 0; i < imports.length; i++) {{
+                var pending = document.createElement('link');
+                pending.setAttribute('rel', 'stylesheet');
+                pending.setAttribute('href', imports[i].href);
+                pending.setAttribute('data-obscura-import-depth', '{import_depth}');
+                pending.setAttribute('data-obscura-page-transport', '');
+                var own = String(imports[i].media || '').trim();
+                var media = inherited && own
+                    ? '(' + inherited + ') and (' + own + ')'
+                    : (inherited || own);
+                if (media) pending.setAttribute('media', media);
+                source.parentNode.insertBefore(pending, source);
+            }}
+        }})()"#,
     )
 }
 
@@ -796,21 +1275,13 @@ fn materialize_linked_stylesheet_script(link_index: usize, css: &str) -> String 
 /// `<style>`. Imported rules precede the importing sheet in the author cascade,
 /// and inherit the source sheet's own media condition in addition to the
 /// import rule's media wrapper.
-fn materialize_inline_import_script(style_index: usize, css: &str) -> String {
+fn materialize_inline_import_script(style_nid: u32, css: &str) -> String {
     let escaped_css = escape_for_js_template_literal(css);
     format!(
         r#"(function() {{
-            var styles = document.querySelectorAll('style');
-            var source = null;
-            var authorIndex = -1;
-            for (var i = 0; i < styles.length; i++) {{
-                var candidate = styles[i];
-                if (candidate.hasAttribute('data-obscura-external-stylesheets')
-                    || candidate.hasAttribute('data-obscura-inline-import')) continue;
-                authorIndex++;
-                if (authorIndex === {style_index}) {{ source = candidate; break; }}
-            }}
+            var source = globalThis._wrap && globalThis._wrap({style_nid});
             if (!source || !source.parentNode) return;
+            source.setAttribute('data-obscura-imports-materialized', '');
             var imported = document.createElement('style');
             imported.setAttribute('data-obscura-inline-import', '');
             var media = source.getAttribute('media') || '';
@@ -821,11 +1292,108 @@ fn materialize_inline_import_script(style_index: usize, css: &str) -> String {
     )
 }
 
+/// Parser stylesheet requests with stable owner ids and encounter order. Page
+/// freezes these before new-document preload code can insert, move, or rewrite
+/// live style/link nodes in the already-parsed backing tree.
+fn parser_stylesheet_requests(
+    dom: &DomTree,
+    document_url: &Url,
+) -> (
+    Vec<ParserStylesheetLinkSnapshot>,
+    Vec<ParserInlineImportSnapshot>,
+    Option<usize>,
+) {
+    let mut order = std::collections::HashMap::new();
+    let mut bases_at_node = std::collections::HashMap::new();
+    let mut active_base = document_url.clone();
+    let mut found_base = false;
+    let mut body_parser_order = None;
+    for (parser_order, nid) in dom.descendants(dom.document()).into_iter().enumerate() {
+        order.insert(nid.raw(), parser_order);
+        let Some(node) = dom.get_node(nid) else {
+            continue;
+        };
+        let Some(name) = node.as_element() else {
+            continue;
+        };
+        let local_name = name.local.as_ref();
+        if local_name == "base" && !found_base {
+            if let Some(href) = node.get_attribute("href") {
+                found_base = true;
+                if let Ok(resolved) = active_base.join(href) {
+                    active_base = resolved;
+                }
+            }
+            continue;
+        }
+        if local_name == "body" && body_parser_order.is_none() {
+            body_parser_order = Some(parser_order);
+        }
+        if matches!(local_name, "link" | "style") {
+            bases_at_node.insert(nid.raw(), active_base.clone());
+        }
+    }
+
+    let mut links = Vec::new();
+    for lid in dom
+        .query_selector_all("link[rel~=\"stylesheet\"]")
+        .unwrap_or_default()
+    {
+        let Some(node) = dom.get_node(lid) else {
+            continue;
+        };
+        if node.get_attribute("disabled").is_some() {
+            continue;
+        }
+        if let Some(href) = node.get_attribute("href") {
+            links.push(ParserStylesheetLinkSnapshot {
+                nid: lid.raw(),
+                parser_order: order.get(&lid.raw()).copied().unwrap_or(usize::MAX),
+                raw_href: href.to_string(),
+                base_url: bases_at_node
+                    .get(&lid.raw())
+                    .cloned()
+                    .unwrap_or_else(|| document_url.clone()),
+            });
+        }
+    }
+
+    let mut inline_imports = Vec::new();
+    for style_id in dom.query_selector_all("style").unwrap_or_default() {
+        let Some(node) = dom.get_node(style_id) else {
+            continue;
+        };
+        if node
+            .get_attribute("data-obscura-external-stylesheets")
+            .is_some()
+            || node.get_attribute("data-obscura-inline-import").is_some()
+        {
+            continue;
+        }
+        let (style_imports, _) = split_css_imports(&dom.text_content(style_id));
+        let base_url = bases_at_node
+            .get(&style_id.raw())
+            .cloned()
+            .unwrap_or_else(|| document_url.clone());
+        inline_imports.extend(
+            style_imports
+                .into_iter()
+                .map(|import| ParserInlineImportSnapshot {
+                    nid: style_id.raw(),
+                    import,
+                    base_url: base_url.clone(),
+                }),
+        );
+    }
+    (links, inline_imports, body_parser_order)
+}
+
 /// Discover linked author sheets in document order.
 ///
 /// Media queries control whether a loaded sheet participates in the cascade;
 /// they do not suppress its fetch or `load` event. Keep the index among all
 /// stylesheet links so the materialization script addresses the same node.
+#[cfg(test)]
 fn linked_stylesheet_requests(dom: &DomTree) -> Vec<(usize, String)> {
     let link_ids = dom
         .query_selector_all("link[rel~=\"stylesheet\"]")
@@ -844,35 +1412,6 @@ fn linked_stylesheet_requests(dom: &DomTree) -> Vec<(usize, String)> {
         }
     }
     links
-}
-
-/// Discover fetchable `@import` rules in inline author sheets. The source
-/// index excludes Obscura's own materialized sheets so it remains stable while
-/// imports are inserted before their source nodes.
-fn inline_stylesheet_import_requests(dom: &DomTree) -> Vec<(usize, StylesheetImport)> {
-    let style_ids = dom.query_selector_all("style").unwrap_or_default();
-    let mut imports = Vec::new();
-    let mut author_index = 0usize;
-    for style_id in style_ids {
-        let Some(node) = dom.get_node(style_id) else {
-            continue;
-        };
-        if node
-            .get_attribute("data-obscura-external-stylesheets")
-            .is_some()
-            || node.get_attribute("data-obscura-inline-import").is_some()
-        {
-            continue;
-        }
-        let (style_imports, _) = split_css_imports(&dom.text_content(style_id));
-        imports.extend(
-            style_imports
-                .into_iter()
-                .map(|import| (author_index, import)),
-        );
-        author_index += 1;
-    }
-    imports
 }
 
 impl Page {
@@ -908,6 +1447,7 @@ impl Page {
             frames: Vec::new(),
             js: None,
             lifecycle: LifecycleState::Idle,
+            top_load_pending: false,
             http_client,
             context,
             title: String::new(),
@@ -932,8 +1472,13 @@ impl Page {
             blocked_url_patterns: Vec::new(),
             intercept_tx: None,
             preload_scripts: Vec::new(),
+            preload_bindings: Vec::new(),
+            pending_parser_stylesheet_events: std::collections::BTreeMap::new(),
             suspended_started_script_ids: Vec::new(),
             callbacks: Arc::new(CallbackRegistry::new()),
+            resource_capture: None,
+            resource_capture_callback_id: None,
+            resource_archive_incomplete_reasons: std::collections::BTreeSet::new(),
             #[cfg(feature = "stealth")]
             stealth_client,
         }
@@ -950,6 +1495,24 @@ impl Page {
     pub fn navigation_timeout(&self) -> std::time::Duration {
         self.navigation_timeout
             .unwrap_or_else(default_navigation_timeout)
+    }
+
+    fn mark_resource_archive_incomplete(&mut self, reason: impl Into<String>) {
+        self.resource_archive_incomplete_reasons
+            .insert(reason.into());
+    }
+
+    fn begin_top_document(&mut self) {
+        self.top_load_pending = false;
+        self.pending_parser_stylesheet_events.clear();
+        self.resource_archive_incomplete_reasons.clear();
+        let document_generation = self.callbacks.begin_document();
+        if let Some(capture) = &self.resource_capture {
+            capture
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .begin_document(document_generation);
+        }
     }
 
     fn should_block_url(&self, url: &str) -> bool {
@@ -976,15 +1539,37 @@ impl Page {
     /// event loop turns. Reports whether anything was attached, so a caller can
     /// settle and come back for frames that these frames created.
     async fn attach_pending_frames(&mut self) -> bool {
-        let pending = match self.js.as_ref() {
-            Some(js) => js.take_pending_frames(),
+        let mut pending = match self.js.as_ref() {
+            Some(js) => js.take_pending_frame_drain(),
             None => return false,
         };
         if pending.is_empty() {
             return false;
         }
 
-        for frame in pending {
+        while let Some(frame) = pending.next() {
+            // The queue was moved into this cancellation-safe drain before we
+            // started attaching it. An earlier child can synchronously remove
+            // a later iframe while its PendingFrame is already in the drain,
+            // beyond the reach of op_cancel_frame_document. Revalidate the
+            // owner id and composed-tree connection at the attachment boundary.
+            match self.frame_owner_is_live(frame.parent_frame_id, frame.frame_id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.forget_frame_references(frame.frame_id, frame.parent_frame_id);
+                    pending.finish_current();
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "could not verify owner liveness for frame {}: {error}",
+                        frame.frame_id
+                    );
+                    self.top_load_pending = false;
+                    self.lifecycle = LifecycleState::Failed;
+                    return false;
+                }
+            }
             // A realm is a live v8::Context plus a DOM tree, and the page realm
             // holds its window and document, so nothing here can be collected
             // while the document lives. Frames are released when the document
@@ -998,23 +1583,380 @@ impl Page {
                     frame.url,
                     cap,
                 );
+                self.mark_resource_archive_incomplete(format!(
+                    "live frame cap reached ({cap} realms)"
+                ));
+                self.dispatch_frame_owner_load(frame.parent_frame_id, frame.frame_id);
                 self.forget_frame_references(frame.frame_id, frame.parent_frame_id);
+                pending.finish_current();
                 continue;
             }
             let realm = match self.js.as_mut().and_then(|js| {
-                FrameRealm::new(js, frame.frame_id, frame.parent_frame_id, &frame.url, &frame.html)
+                FrameRealm::new_staged_with_inherited_context(
+                    js,
+                    frame.frame_id,
+                    frame.parent_frame_id,
+                    &frame.url,
+                    frame.inherited_base_url.as_deref(),
+                    frame.inherited_origin.as_deref(),
+                    &frame.html,
+                )
             }) {
                 Some(realm) => realm,
                 None => {
                     tracing::warn!("could not build a realm for frame {}", frame.url);
+                    self.mark_resource_archive_incomplete(format!(
+                        "frame realm creation failed: {}",
+                        frame.url,
+                    ));
+                    self.dispatch_frame_owner_load(frame.parent_frame_id, frame.frame_id);
                     self.forget_frame_references(frame.frame_id, frame.parent_frame_id);
+                    pending.finish_current();
                     continue;
                 }
             };
 
-            // A frame's scripts resolve and are fetched against the frame's own
-            // URL, so they need fetching before run_document_scripts, which
-            // resolves sources synchronously.
+            // A frame's static resources resolve and are fetched against the
+            // frame's own final document URL. Fetch linked stylesheets before
+            // document scripts, matching parser-time stylesheet loading and
+            // making the CSS available to synchronous getComputedStyle calls.
+            let initiator =
+                Url::parse(realm.url()).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+            let style_base = match self.js.as_mut() {
+                Some(js) => realm
+                    .document_base_url(js)
+                    .unwrap_or_else(|| initiator.clone()),
+                None => initiator.clone(),
+            };
+            let inline_stylesheets = realm.parser_inline_stylesheet_sources();
+            for (style_index, css, _, base_url) in inline_stylesheets {
+                let style_encounter_base =
+                    Url::parse(&base_url).unwrap_or_else(|_| style_base.clone());
+                let (imports, rules) = split_css_imports(&css);
+                if imports.is_empty() {
+                    continue;
+                }
+                for import in &imports {
+                    if style_encounter_base.join(&import.url).is_err() {
+                        self.mark_resource_archive_incomplete(format!(
+                            "frame {} inline stylesheet import URL could not be resolved: {}",
+                            realm.frame_id(),
+                            import.url,
+                        ));
+                    }
+                }
+                let queued = match self.js.as_mut() {
+                    Some(js) => realm.execute_script(
+                        js,
+                        &queue_inline_stylesheet_imports_script(
+                            style_index,
+                            &rules,
+                            &imports,
+                            &style_encounter_base,
+                            1,
+                        ),
+                    ),
+                    None => Err("frame JavaScript runtime disappeared".to_string()),
+                };
+                if let Err(error) = queued {
+                    self.mark_resource_archive_incomplete(format!(
+                        "frame {} inline stylesheet import setup failed: {}",
+                        realm.frame_id(),
+                        error,
+                    ));
+                }
+            }
+            let mut wanted_stylesheets = realm
+                .parser_stylesheet_urls()
+                .into_iter()
+                .map(|(link_index, link_nid, url, import_depth, raw_href)| {
+                    (link_index, link_nid, url, import_depth, Some(raw_href))
+                })
+                .collect::<Vec<_>>();
+            if let Some(js) = self.js.as_mut() {
+                wanted_stylesheets.extend(realm.external_stylesheet_urls(js).into_iter().map(
+                    |(link_index, link_nid, url, import_depth)| {
+                        (link_index, link_nid, url, import_depth, None)
+                    },
+                ));
+            }
+            let inline_style_sources = match self.js.as_mut() {
+                Some(js) => realm.style_sources(js),
+                None => Vec::new(),
+            };
+            let mut stylesheet_assets = std::collections::BTreeMap::new();
+            for css in &inline_style_sources {
+                for resource_url in css_resource_urls(css, &style_base) {
+                    if let Ok(parsed) = Url::parse(&resource_url) {
+                        stylesheet_assets
+                            .entry(resource_url)
+                            .or_insert_with(|| render_resource_type(&parsed));
+                    }
+                }
+            }
+            // Fetch the complete parser stylesheet graph before any owner
+            // completion is queued. A linked sheet is not ready when only its
+            // root response has arrived: every leading @import must reach a
+            // terminal response first, and the root link's load/error event
+            // must remain at its parser position after that work completes.
+            let mut stylesheet_roots = Vec::new();
+            let mut stylesheet_sheets = std::collections::HashMap::new();
+            let mut stylesheet_aliases = std::collections::HashMap::new();
+            let mut scheduled_stylesheets = std::collections::HashSet::new();
+            let mut pending_stylesheets = Vec::new();
+            let mut failed_stylesheet_links = Vec::new();
+            for (link_index, link_nid, url, import_depth, raw_href) in wanted_stylesheets {
+                // Non-zero depths identify synthetic links created above for
+                // inline @import rules. Fetch those through this same graph,
+                // but materialize them directly later: unlike depth-zero
+                // parser links, they are not in the frame's parser snapshot.
+                let is_parser_owner = raw_href.is_some();
+                let Ok(parsed) = Url::parse(&url) else {
+                    failed_stylesheet_links.push((
+                        link_index,
+                        link_nid,
+                        is_parser_owner,
+                        raw_href,
+                        None,
+                    ));
+                    continue;
+                };
+                if self.should_block_url(&url)
+                    || !subresource_allowed(Some(&initiator), parsed.as_str())
+                {
+                    failed_stylesheet_links.push((
+                        link_index,
+                        link_nid,
+                        is_parser_owner,
+                        raw_href,
+                        Some(url),
+                    ));
+                    continue;
+                }
+                let (key, parsed) = canonical_stylesheet_url(parsed);
+                stylesheet_roots.push((
+                    link_index,
+                    link_nid,
+                    key.clone(),
+                    is_parser_owner,
+                    raw_href,
+                    url,
+                ));
+                if scheduled_stylesheets.insert(key.clone()) {
+                    if scheduled_stylesheets.len() <= MAX_STYLESHEET_RESOURCES {
+                        pending_stylesheets.push((key, parsed, import_depth));
+                    } else {
+                        self.mark_resource_archive_incomplete(format!(
+                            "frame {} stylesheet resource cap reached ({MAX_STYLESHEET_RESOURCES} resources)",
+                            realm.frame_id(),
+                        ));
+                    }
+                }
+            }
+
+            while let Some((key, parsed, import_depth)) = pending_stylesheets.pop() {
+                let request = ResourceRequest::subresource(ResourceType::Stylesheet, &initiator)
+                    .in_frame(realm.frame_id());
+                match self.do_fetch_resource(&parsed, request).await {
+                    Ok(response) => {
+                        self.record_network_event_with_body(
+                            response.url.as_str(),
+                            "GET",
+                            "Stylesheet",
+                            response.status,
+                            &response.headers,
+                            &response.body,
+                            false,
+                        );
+                        if !(200..300).contains(&response.status) {
+                            self.mark_resource_archive_incomplete(format!(
+                                "frame {} stylesheet {} returned HTTP {}",
+                                realm.frame_id(),
+                                parsed,
+                                response.status,
+                            ));
+                            continue;
+                        }
+                        let css =
+                            obscura_net::decode_non_html(&response.body, response.content_type());
+                        for resource_url in css_resource_urls(&css, &response.url) {
+                            if let Ok(parsed) = Url::parse(&resource_url) {
+                                stylesheet_assets
+                                    .entry(resource_url)
+                                    .or_insert_with(|| render_resource_type(&parsed));
+                            }
+                        }
+                        let (response_key, response_url) =
+                            canonical_stylesheet_url(response.url.clone());
+                        if let Some(existing) = stylesheet_aliases.get(&response_key).cloned() {
+                            stylesheet_aliases.insert(key, existing);
+                            continue;
+                        }
+                        let (discovered_imports, rules) = split_css_imports(&css);
+                        if import_depth >= MAX_STYLESHEET_IMPORT_DEPTH
+                            && !discovered_imports.is_empty()
+                        {
+                            self.mark_resource_archive_incomplete(format!(
+                                "frame {} stylesheet import depth cap reached ({MAX_STYLESHEET_IMPORT_DEPTH}): {}",
+                                realm.frame_id(), response_url,
+                            ));
+                        }
+                        let imports = if import_depth < MAX_STYLESHEET_IMPORT_DEPTH {
+                            discovered_imports
+                        } else {
+                            Vec::new()
+                        };
+                        stylesheet_aliases.insert(key.clone(), key.clone());
+                        stylesheet_aliases.insert(response_key, key.clone());
+                        stylesheet_sheets.insert(
+                            key,
+                            LoadedStylesheet {
+                                response_url: response_url.clone(),
+                                imports: imports.clone(),
+                                rules,
+                            },
+                        );
+
+                        if import_depth >= MAX_STYLESHEET_IMPORT_DEPTH {
+                            continue;
+                        }
+                        // Reverse before pushing onto the LIFO worklist so
+                        // network observation remains in CSS source order.
+                        for import in imports.into_iter().rev() {
+                            let Ok(import_url) = response_url.join(&import.url) else {
+                                self.mark_resource_archive_incomplete(format!(
+                                    "frame {} stylesheet import URL could not be resolved: {}",
+                                    realm.frame_id(),
+                                    import.url,
+                                ));
+                                continue;
+                            };
+                            let (import_key, import_url) = canonical_stylesheet_url(import_url);
+                            if stylesheet_aliases.contains_key(&import_key)
+                                || scheduled_stylesheets.contains(&import_key)
+                            {
+                                continue;
+                            }
+                            if self.should_block_url(import_url.as_str())
+                                || !subresource_allowed(Some(&initiator), import_url.as_str())
+                            {
+                                self.mark_resource_archive_incomplete(format!(
+                                    "frame {} stylesheet import was blocked: {}",
+                                    realm.frame_id(),
+                                    import_url,
+                                ));
+                                continue;
+                            }
+                            if scheduled_stylesheets.len() >= MAX_STYLESHEET_RESOURCES {
+                                self.mark_resource_archive_incomplete(format!(
+                                    "frame {} stylesheet resource cap reached ({MAX_STYLESHEET_RESOURCES} resources)",
+                                    realm.frame_id(),
+                                ));
+                                continue;
+                            }
+                            scheduled_stylesheets.insert(import_key.clone());
+                            pending_stylesheets.push((
+                                import_key,
+                                import_url,
+                                import_depth.saturating_add(1),
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!("frame stylesheet {} failed: {}", parsed, error);
+                        self.mark_resource_archive_incomplete(format!(
+                            "frame {} stylesheet fetch failed: {}: {}",
+                            realm.frame_id(),
+                            parsed,
+                            error,
+                        ));
+                    }
+                }
+            }
+
+            let mut stylesheets = Vec::new();
+            for (link_index, link_nid, key, is_parser_owner, raw_href, request_href) in
+                stylesheet_roots
+            {
+                match materialize_stylesheet_graph(
+                    &key,
+                    &stylesheet_sheets,
+                    &stylesheet_aliases,
+                    &mut std::collections::HashSet::new(),
+                ) {
+                    Some(css) => stylesheets.push((
+                        link_index,
+                        link_nid,
+                        css,
+                        is_parser_owner,
+                        raw_href,
+                        request_href,
+                    )),
+                    None => failed_stylesheet_links.push((
+                        link_index,
+                        link_nid,
+                        is_parser_owner,
+                        raw_href,
+                        Some(request_href),
+                    )),
+                }
+            }
+
+            for (url, resource_type) in stylesheet_assets {
+                let Ok(parsed) = Url::parse(&url) else {
+                    continue;
+                };
+                if self.should_block_url(&url)
+                    || !subresource_allowed(Some(&initiator), parsed.as_str())
+                {
+                    continue;
+                }
+                let request = ResourceRequest::subresource(resource_type, &initiator)
+                    .in_frame(realm.frame_id());
+                match self.do_fetch_resource(&parsed, request).await {
+                    Ok(response) => {
+                        self.record_network_event_with_body(
+                            response.url.as_str(),
+                            "GET",
+                            match resource_type {
+                                ResourceType::Font => "Font",
+                                _ => "Image",
+                            },
+                            response.status,
+                            &response.headers,
+                            &response.body,
+                            true,
+                        );
+                        #[cfg(feature = "render")]
+                        realm.seed_render_resource(
+                            url,
+                            (200..300)
+                                .contains(&response.status)
+                                .then(|| response.body.clone()),
+                        );
+                        if !(200..300).contains(&response.status) {
+                            self.mark_resource_archive_incomplete(format!(
+                                "frame {} stylesheet resource {} returned HTTP {}",
+                                realm.frame_id(),
+                                response.url,
+                                response.status,
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!("frame stylesheet resource {} failed: {}", url, error);
+                        self.mark_resource_archive_incomplete(format!(
+                            "frame {} stylesheet resource fetch failed: {}: {}",
+                            realm.frame_id(),
+                            url,
+                            error,
+                        ));
+                    }
+                }
+            }
+
+            // External classic script loading is synchronous from the realm's
+            // point of view, so collect their source text before execution.
             let wanted = match self.js.as_mut() {
                 Some(js) => realm.external_script_urls(js),
                 None => Vec::new(),
@@ -1022,21 +1964,98 @@ impl Page {
             let mut sources: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
             for url in wanted {
-                let Ok(parsed) = Url::parse(&url) else { continue };
+                let Ok(parsed) = Url::parse(&url) else {
+                    self.mark_resource_archive_incomplete(format!(
+                        "frame {} classic script URL could not be resolved: {}",
+                        realm.frame_id(),
+                        url,
+                    ));
+                    continue;
+                };
                 if self.should_block_url(&url) {
+                    self.mark_resource_archive_incomplete(format!(
+                        "frame {} classic script was blocked: {}",
+                        realm.frame_id(),
+                        url,
+                    ));
                     continue;
                 }
-                match self.do_fetch(&parsed).await {
+                let request = ResourceRequest::subresource(ResourceType::Script, &initiator)
+                    .in_frame(realm.frame_id());
+                match self.do_fetch_resource(&parsed, request).await {
                     Ok(response) => {
-                        sources.insert(url, String::from_utf8_lossy(&response.body).into_owned());
+                        if script_response_is_executable(response.status) {
+                            sources
+                                .insert(url, String::from_utf8_lossy(&response.body).into_owned());
+                        } else {
+                            self.mark_resource_archive_incomplete(format!(
+                                "frame {} classic script {} returned HTTP {}",
+                                realm.frame_id(),
+                                response.url,
+                                response.status,
+                            ));
+                        }
                     }
                     Err(error) => {
                         tracing::warn!("frame script {} failed: {}", url, error);
+                        self.mark_resource_archive_incomplete(format!(
+                            "frame {} classic script fetch failed: {}: {}",
+                            realm.frame_id(),
+                            url,
+                            error,
+                        ));
                     }
                 }
             }
 
-            if let Some(js) = self.js.as_mut() {
+            let lifecycle_watchdog = self.js.as_mut().map(|js| {
+                js.arm_watchdog(std::time::Duration::from_millis(
+                    LIFECYCLE_CALLBACK_WATCHDOG_MS,
+                ))
+            });
+            let lifecycle_result = if let Some(js) = self.js.as_mut() {
+                // Page.addScriptToEvaluateOnNewDocument applies before any
+                // page-authored callback in a child document, including the
+                // load/error owner event of a parser stylesheet.
+                for name in &self.preload_bindings {
+                    if let Err(error) = realm.install_cdp_binding(js, name) {
+                        tracing::debug!(
+                            "frame {} binding {} setup failed: {error}",
+                            frame.url,
+                            name,
+                        );
+                    }
+                }
+                for source in &self.preload_scripts {
+                    if let Err(error) = realm.execute_script(js, source) {
+                        tracing::debug!("frame {} preload failed: {error}", frame.url);
+                    }
+                }
+                let mut parser_stylesheet_events = std::collections::BTreeMap::new();
+                failed_stylesheet_links.sort_unstable();
+                failed_stylesheet_links.dedup();
+                for (_, link_nid, is_parser_owner, raw_href, request_href) in
+                    failed_stylesheet_links
+                {
+                    let completion = if let Some(raw_href) = raw_href.as_deref() {
+                        complete_parser_stylesheet_script_with_token(
+                            link_nid,
+                            "error",
+                            request_href.as_deref(),
+                            raw_href,
+                        )
+                    } else {
+                        complete_parser_stylesheet_script(link_nid, "error")
+                    };
+                    if is_parser_owner {
+                        parser_stylesheet_events.insert(link_nid, completion);
+                    } else if let Err(error) = realm.execute_script(js, &completion) {
+                        tracing::debug!(
+                            "frame {} inline import owner error dispatch failed: {error}",
+                            frame.url,
+                        );
+                    }
+                }
                 if let Err(error) = realm.set_viewport(
                     js,
                     frame.viewport_width as f64,
@@ -1044,25 +2063,96 @@ impl Page {
                 ) {
                     tracing::debug!("frame {} viewport setup failed: {error}", frame.url);
                 }
-                // Page.addScriptToEvaluateOnNewDocument applies to every new
-                // document, including child frames. Debug hooks and browser
-                // automation setup must be present before frame scripts run.
-                for source in &self.preload_scripts {
-                    if let Err(error) = realm.execute_script(js, source) {
-                        tracing::debug!("frame {} preload failed: {error}", frame.url);
+                if !stylesheets.is_empty() {
+                    let combined_css = stylesheets
+                        .iter()
+                        .map(|(_, _, css, _, _, _)| css.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let code = format!(
+                        "globalThis.__obscura_css = `{}`;",
+                        escape_for_js_template_literal(&combined_css),
+                    );
+                    if let Err(error) = realm.execute_script(js, &code) {
+                        tracing::debug!("frame {} CSS setup failed: {error}", frame.url);
+                    }
+                    for (_, link_nid, css, is_parser_owner, raw_href, request_href) in &stylesheets
+                    {
+                        let completion = if let Some(raw_href) = raw_href.as_deref() {
+                            materialize_parser_stylesheet_script_with_token(
+                                *link_nid,
+                                css,
+                                request_href,
+                                raw_href,
+                            )
+                        } else {
+                            materialize_parser_stylesheet_script(*link_nid, css)
+                        };
+                        if *is_parser_owner {
+                            parser_stylesheet_events.insert(*link_nid, completion);
+                        } else if let Err(error) = realm.execute_script(js, &completion) {
+                            tracing::debug!(
+                                "frame {} inline import materialization failed: {error}",
+                                frame.url,
+                            );
+                        }
                     }
                 }
-                for problem in realm.run_document_scripts(js, |url| sources.get(url).cloned()) {
+                for problem in realm.run_document_scripts_with_stylesheet_events(
+                    js,
+                    |url| sources.get(url).cloned(),
+                    parser_stylesheet_events,
+                ) {
                     tracing::debug!("frame {}: {}", frame.url, problem);
                 }
-                // The frame's scripts have run, so its document is loaded. Say
-                // so: everything a widget defers to DOMContentLoaded or load
-                // hangs on this, which is most of its interface.
-                if let Err(error) = realm.dispatch_load_events(js) {
-                    tracing::debug!("frame {} load events failed: {error}", frame.url);
+                // Parsing and parser scripts are complete, but descendant
+                // frames and load-delaying dynamic resources still gate load.
+                realm.dispatch_dom_content_loaded(js)
+            } else {
+                Err("JavaScript runtime disappeared".to_string())
+            };
+            let watchdog_fired = match (self.js.as_mut(), lifecycle_watchdog) {
+                (Some(js), Some(watchdog)) => js.disarm_watchdog(watchdog),
+                _ => false,
+            };
+            if watchdog_fired || lifecycle_result.is_err() {
+                tracing::warn!(
+                    "frame {} parser lifecycle failed: {}",
+                    frame.url,
+                    lifecycle_result
+                        .err()
+                        .unwrap_or_else(|| "lifecycle task budget exceeded".to_string()),
+                );
+                realm.mark_load_failed();
+                self.top_load_pending = false;
+                self.lifecycle = LifecycleState::Failed;
+            }
+            let publish_watchdog = self.js.as_mut().map(|js| {
+                js.arm_watchdog(std::time::Duration::from_millis(
+                    LIFECYCLE_CALLBACK_WATCHDOG_MS,
+                ))
+            });
+            let published = self
+                .js
+                .as_mut()
+                .is_some_and(|js| realm.publish_to_owners(js));
+            let publish_watchdog_fired = match (self.js.as_mut(), publish_watchdog) {
+                (Some(js), Some(watchdog)) => js.disarm_watchdog(watchdog),
+                _ => false,
+            };
+            if publish_watchdog_fired || !published {
+                tracing::warn!("frame {} realm publication failed", frame.url);
+                if let Some(js) = self.js.as_ref() {
+                    js.cancel_frame_documents_owned_by(&[realm.frame_id()]);
                 }
+                self.forget_frame_references(realm.frame_id(), realm.parent_frame_id());
+                self.top_load_pending = false;
+                self.lifecycle = LifecycleState::Failed;
+                pending.finish_current();
+                continue;
             }
             self.frames.push(realm);
+            pending.finish_current();
         }
         true
     }
@@ -1081,17 +2171,34 @@ impl Page {
             return false;
         }
 
+        let mut retry = Vec::new();
         for message in pending {
             let escaped_data = serde_json::to_string(&message.data_json).unwrap_or_default();
             let escaped_origin = serde_json::to_string(&message.origin).unwrap_or_default();
             if message.target_frame_id == 0 {
+                let watchdog = self.js.as_mut().map(|js| {
+                    js.arm_watchdog(std::time::Duration::from_millis(
+                        LIFECYCLE_CALLBACK_WATCHDOG_MS,
+                    ))
+                });
                 let Some(js) = self.js.as_mut() else { continue };
                 let script = format!(
                     "globalThis.__obscura_deliverMessage({escaped_data}, {escaped_origin}, {});",
                     message.source_frame_id,
                 );
-                if let Err(error) = js.execute_script("<frame-message>", &script) {
+                let result = js.execute_script("<frame-message>", &script);
+                let watchdog_fired = match (self.js.as_mut(), watchdog) {
+                    (Some(js), Some(watchdog)) => js.disarm_watchdog(watchdog),
+                    _ => false,
+                };
+                if watchdog_fired || result.is_err() {
+                    let error = result
+                        .err()
+                        .unwrap_or_else(|| "message handler task budget exceeded".to_string());
                     tracing::debug!("message to the page failed: {error}");
+                    self.top_load_pending = false;
+                    self.lifecycle = LifecycleState::Failed;
+                    break;
                 }
                 continue;
             }
@@ -1101,18 +2208,58 @@ impl Page {
                 .iter()
                 .position(|frame| frame.frame_id() == message.target_frame_id)
             else {
-                // The frame was torn down between the send and the drain.
-                tracing::debug!("message for frame {} which is gone", message.target_frame_id);
+                // A parent parser script can post to a child it just created.
+                // Its fetched document is queued during this same attachment
+                // pass and receives a realm on the next pass; retain that
+                // message rather than mistaking the not-yet-attached target
+                // for a browsing context which was torn down.
+                if self
+                    .js
+                    .as_ref()
+                    .is_some_and(|js| js.frame_document_is_pending(message.target_frame_id))
+                {
+                    retry.push(message);
+                } else {
+                    tracing::debug!(
+                        "message for frame {} which is gone",
+                        message.target_frame_id
+                    );
+                }
                 continue;
             };
+            let watchdog = self.js.as_mut().map(|js| {
+                js.arm_watchdog(std::time::Duration::from_millis(
+                    LIFECYCLE_CALLBACK_WATCHDOG_MS,
+                ))
+            });
             let Some(js) = self.js.as_mut() else { continue };
-            if let Err(error) = self.frames[index].deliver_message(
+            let result = self.frames[index].deliver_message(
                 js,
                 &message.data_json,
                 &message.origin,
                 message.source_frame_id,
-            ) {
-                tracing::debug!("message to frame {} failed: {error}", message.target_frame_id);
+            );
+            let watchdog_fired = match (self.js.as_mut(), watchdog) {
+                (Some(js), Some(watchdog)) => js.disarm_watchdog(watchdog),
+                _ => false,
+            };
+            if watchdog_fired || result.is_err() {
+                let error = result
+                    .err()
+                    .unwrap_or_else(|| "message handler task budget exceeded".to_string());
+                tracing::debug!(
+                    "message to frame {} failed: {error}",
+                    message.target_frame_id
+                );
+                self.frames[index].mark_load_failed();
+                self.top_load_pending = false;
+                self.lifecycle = LifecycleState::Failed;
+                break;
+            }
+        }
+        if !retry.is_empty() {
+            if let Some(js) = self.js.as_ref() {
+                js.restore_pending_frame_messages(retry);
             }
         }
         true
@@ -1122,22 +2269,25 @@ impl Page {
     /// page's same-origin frame table. This also covers a frame rejected before
     /// a `FrameRealm` exists, so the normal drop path cannot be skipped.
     fn forget_frame_references(&mut self, frame_id: u32, parent_frame_id: u32) {
-        let script = format!(
-            "if (globalThis.__obscura_frameElements[{frame_id}] &&\
-             globalThis.__obscura_frameElements[{frame_id}]._frameId === {frame_id}) {{\
-               globalThis.__obscura_frameElements[{frame_id}]._frameId = 0;\
-               if (globalThis.__obscura_frameElements[{frame_id}]._iframeWin)\
-                 globalThis.__obscura_frameElements[{frame_id}]._iframeWin._frameId = 0;\
-             }}\
-             delete globalThis.__obscura_frameObjects[{frame_id}];\
-             delete globalThis.__obscura_frameWindows[{frame_id}];\
-             delete globalThis.__obscura_frameElements[{frame_id}];"
-        );
-        self.execute_frame_owner_script(parent_frame_id, &script);
+        let script = format!("globalThis.__obscura_forgetFrame({frame_id});");
+        let watchdog = self.js.as_mut().map(|js| {
+            js.arm_watchdog(std::time::Duration::from_millis(
+                LIFECYCLE_CALLBACK_WATCHDOG_MS,
+            ))
+        });
+        let owner_result = self.execute_frame_owner_script(parent_frame_id, &script);
+        let watchdog_fired = match (self.js.as_mut(), watchdog) {
+            (Some(js), Some(watchdog)) => js.disarm_watchdog(watchdog),
+            _ => false,
+        };
+        if watchdog_fired {
+            self.top_load_pending = false;
+            self.lifecycle = LifecycleState::Failed;
+        } else if let Err(error) = owner_result {
+            tracing::debug!("releasing owner references for frame {frame_id} failed: {error}");
+        }
         if parent_frame_id != 0 {
-            let page_script = format!(
-                "delete globalThis.__obscura_frameObjects[{frame_id}];"
-            );
+            let page_script = format!("globalThis.__obscura_forgetFrame({frame_id});");
             if let Some(js) = self.js.as_mut() {
                 if let Err(error) = js.execute_script("<frame-detach>", &page_script) {
                     tracing::debug!("releasing page frame reference failed: {error}");
@@ -1148,14 +2298,17 @@ impl Page {
 
     /// Executes cleanup in the realm that owns the iframe element. Nested
     /// iframe registries live in their parent frame, not in the page realm.
-    fn execute_frame_owner_script(&mut self, parent_frame_id: u32, script: &str) {
+    fn execute_frame_owner_script(
+        &mut self,
+        parent_frame_id: u32,
+        script: &str,
+    ) -> Result<(), String> {
         if parent_frame_id == 0 {
-            if let Some(js) = self.js.as_mut() {
-                if let Err(error) = js.execute_script("<frame-detach>", script) {
-                    tracing::debug!("releasing frame references failed: {error}");
-                }
-            }
-            return;
+            return self
+                .js
+                .as_mut()
+                .ok_or_else(|| "JavaScript runtime disappeared".to_string())?
+                .execute_script("<frame-owner>", script);
         }
 
         let Some(index) = self
@@ -1163,11 +2316,130 @@ impl Page {
             .iter()
             .position(|frame| frame.frame_id() == parent_frame_id)
         else {
-            return;
+            return Err(format!("frame owner realm {parent_frame_id} disappeared"));
         };
-        let Some(js) = self.js.as_mut() else { return };
-        if let Err(error) = self.frames[index].execute_script(js, script) {
-            tracing::debug!("releasing nested frame references failed: {error}");
+        let js = self
+            .js
+            .as_mut()
+            .ok_or_else(|| "JavaScript runtime disappeared".to_string())?;
+        self.frames[index].execute_script(js, script)
+    }
+
+    fn evaluate_lifecycle_probe(
+        &mut self,
+        realm_frame_id: Option<u32>,
+        expression: &str,
+    ) -> Result<serde_json::Value, String> {
+        if self.js.is_none() {
+            return Err("JavaScript runtime disappeared".to_string());
+        }
+        let realm_index = match realm_frame_id {
+            Some(frame_id) => Some(
+                self.frames
+                    .iter()
+                    .position(|frame| frame.frame_id() == frame_id)
+                    .ok_or_else(|| format!("frame owner realm {frame_id} disappeared"))?,
+            ),
+            None => None,
+        };
+        let watchdog = self
+            .js
+            .as_mut()
+            .unwrap()
+            .arm_watchdog(std::time::Duration::from_millis(
+                LIFECYCLE_CALLBACK_WATCHDOG_MS,
+            ));
+        let result = if let Some(index) = realm_index {
+            self.frames[index].evaluate(self.js.as_mut().unwrap(), expression)
+        } else {
+            self.js.as_mut().unwrap().evaluate_host_probe(expression)
+        };
+        let fired = self
+            .js
+            .as_mut()
+            .is_some_and(|js| js.disarm_watchdog(watchdog));
+        if fired {
+            self.top_load_pending = false;
+            self.lifecycle = LifecycleState::Failed;
+            return Err("lifecycle probe task budget exceeded".to_string());
+        }
+        result
+    }
+
+    fn direct_frame_owner_is_live(
+        &mut self,
+        parent_frame_id: u32,
+        frame_id: u32,
+    ) -> Result<bool, String> {
+        let expression = format!("globalThis.__obscura_frameOwnerIsLive({frame_id})");
+        let value = self.evaluate_lifecycle_probe(
+            (parent_frame_id != 0).then_some(parent_frame_id),
+            &expression,
+        )?;
+        value.as_bool().ok_or_else(|| {
+            format!("frame owner liveness probe in realm {parent_frame_id} returned a non-boolean")
+        })
+    }
+
+    fn frame_owner_is_live(
+        &mut self,
+        mut parent_frame_id: u32,
+        mut frame_id: u32,
+    ) -> Result<bool, String> {
+        loop {
+            if !self.direct_frame_owner_is_live(parent_frame_id, frame_id)? {
+                return Ok(false);
+            }
+            if parent_frame_id == 0 {
+                return Ok(true);
+            }
+            let Some(parent) = self
+                .frames
+                .iter()
+                .find(|frame| frame.frame_id() == parent_frame_id)
+            else {
+                return Ok(false);
+            };
+            frame_id = parent_frame_id;
+            parent_frame_id = parent.parent_frame_id();
+        }
+    }
+
+    fn dispatch_frame_owner_load(&mut self, parent_frame_id: u32, frame_id: u32) {
+        let watchdog = self.js.as_mut().map(|js| {
+            js.arm_watchdog(std::time::Duration::from_millis(
+                LIFECYCLE_CALLBACK_WATCHDOG_MS,
+            ))
+        });
+        let dispatch_result = self.execute_frame_owner_script(
+            parent_frame_id,
+            &format!(
+                "if (typeof globalThis.__obscura_dispatchFrameOwnerLoad === 'function') \
+                 globalThis.__obscura_dispatchFrameOwnerLoad({frame_id});"
+            ),
+        );
+        let watchdog_fired = match (self.js.as_mut(), watchdog) {
+            (Some(js), Some(watchdog)) => js.disarm_watchdog(watchdog),
+            _ => false,
+        };
+        if watchdog_fired || dispatch_result.is_err() {
+            tracing::warn!(
+                "iframe owner load dispatch failed: {}",
+                dispatch_result
+                    .err()
+                    .unwrap_or_else(|| "lifecycle task budget exceeded".to_string()),
+            );
+            if parent_frame_id != 0 {
+                if let Some(parent) = self
+                    .frames
+                    .iter()
+                    .find(|frame| frame.frame_id() == parent_frame_id)
+                {
+                    parent.mark_load_failed();
+                }
+            }
+            self.top_load_pending = false;
+            self.lifecycle = LifecycleState::Failed;
         }
     }
 
@@ -1180,43 +2452,78 @@ impl Page {
     /// object, so a page that replaces an iframe repeatedly would otherwise
     /// accumulate contexts and DOM trees for the life of the document.
     ///
-    /// A frame nested inside a discarded frame is reached on a later pass,
-    /// once its own parent is gone.
-    fn release_detached_frames(&mut self) {
+    /// A detached parent discards its complete browsing-context subtree in the
+    /// same pass, before a descendant can be mistaken for a load candidate.
+    fn release_detached_frames(&mut self) -> bool {
+        self.release_detached_frames_with_probe("__obscura_liveFrameIds()")
+    }
+
+    fn release_detached_frames_with_probe(&mut self, live_frame_ids_probe: &str) -> bool {
         if self.frames.is_empty() {
-            return;
+            return false;
         }
         // Each realm reports its own frames whose element is still connected.
         // Liveness is asked of the element rather than of a document query,
         // because an iframe inside a shadow root is absent from
         // `document.querySelectorAll('iframe')` — the shape a challenge widget
         // uses — and treating it as detached tears down a live frame.
-        const LIVE_FRAME_IDS: &str = "__obscura_liveFrameIds()";
-
         let mut live: Vec<u32> = Vec::new();
-        let Some(js) = self.js.as_mut() else { return };
-        match js.evaluate(LIVE_FRAME_IDS) {
-            Ok(value) => live.extend(serde_json::from_value::<Vec<u32>>(value).unwrap_or_default()),
-            // A query that did not run says nothing about which frames are
-            // gone, and an empty answer here reads as "all of them". Holding
-            // them is bounded by the live-frame cap; discarding a live frame
-            // is not recoverable, so leave the tree alone.
+        match self.evaluate_lifecycle_probe(None, live_frame_ids_probe) {
+            Ok(value) => match serde_json::from_value::<Vec<u32>>(value) {
+                Ok(ids) => live.extend(ids),
+                Err(error) => {
+                    tracing::warn!("page live-frame probe returned an invalid value: {error}");
+                    self.top_load_pending = false;
+                    self.lifecycle = LifecycleState::Failed;
+                    return false;
+                }
+            },
             Err(error) => {
-                tracing::debug!("could not list the page's live frames: {error}");
-                return;
+                tracing::warn!("could not list the page's live frames: {error}");
+                self.top_load_pending = false;
+                self.lifecycle = LifecycleState::Failed;
+                return false;
             }
         }
         // A frame's own children are in that frame's document, not the page's.
         for index in 0..self.frames.len() {
-            let Some(js) = self.js.as_mut() else { return };
-            match self.frames[index].evaluate(js, LIVE_FRAME_IDS) {
-                Ok(value) => {
-                    live.extend(serde_json::from_value::<Vec<u32>>(value).unwrap_or_default())
-                }
+            let frame_id = self.frames[index].frame_id();
+            match self.evaluate_lifecycle_probe(Some(frame_id), live_frame_ids_probe) {
+                Ok(value) => match serde_json::from_value::<Vec<u32>>(value) {
+                    Ok(ids) => live.extend(ids),
+                    Err(error) => {
+                        tracing::warn!(
+                            "frame {frame_id} live-frame probe returned an invalid value: {error}"
+                        );
+                        self.frames[index].mark_load_failed();
+                        self.top_load_pending = false;
+                        self.lifecycle = LifecycleState::Failed;
+                        return false;
+                    }
+                },
                 Err(error) => {
-                    tracing::debug!("could not list a frame's live frames: {error}");
-                    return;
+                    tracing::warn!("could not list frame {frame_id}'s live frames: {error}");
+                    self.frames[index].mark_load_failed();
+                    self.top_load_pending = false;
+                    self.lifecycle = LifecycleState::Failed;
+                    return false;
                 }
+            }
+        }
+
+        let reported_live = live.into_iter().collect::<std::collections::HashSet<_>>();
+        let mut retained = std::collections::HashSet::new();
+        loop {
+            let before = retained.len();
+            for frame in &self.frames {
+                if reported_live.contains(&frame.frame_id())
+                    && (frame.parent_frame_id() == 0 || retained.contains(&frame.parent_frame_id()))
+                {
+                    retained.insert(frame.frame_id());
+                }
+            }
+            if retained.len() == before {
+                break;
             }
         }
 
@@ -1224,10 +2531,18 @@ impl Page {
             .frames
             .iter()
             .map(|frame| (frame.frame_id(), frame.parent_frame_id()))
-            .filter(|(id, _)| !live.contains(id))
+            .filter(|(id, _)| !retained.contains(id))
             .collect();
         if discarded.is_empty() {
-            return;
+            return false;
+        }
+
+        let discarded_ids = discarded
+            .iter()
+            .map(|(frame_id, _)| *frame_id)
+            .collect::<Vec<_>>();
+        if let Some(js) = self.js.as_ref() {
+            js.cancel_frame_documents_owned_by(&discarded_ids);
         }
 
         // Clean owner realms before dropping any parent. This matters for a
@@ -1236,8 +2551,196 @@ impl Page {
         for &(frame_id, parent_frame_id) in &discarded {
             self.forget_frame_references(frame_id, parent_frame_id);
         }
-        self.frames.retain(|frame| live.contains(&frame.frame_id()));
+        self.frames
+            .retain(|frame| retained.contains(&frame.frame_id()));
         tracing::debug!("discarded {} detached frame realm(s)", discarded.len());
+        true
+    }
+
+    /// Complete child documents from the leaves upward. A frame's Window load
+    /// precedes the load event on its owner iframe element, and an ancestor
+    /// remains blocked while any direct descendant or queued child document is
+    /// unfinished.
+    fn complete_ready_frames(&mut self) -> bool {
+        let mut progressed = false;
+        loop {
+            let blockers = self
+                .js
+                .as_ref()
+                .map(ObscuraJsRuntime::frame_document_load_blockers_by_parent)
+                .unwrap_or_default();
+            let candidates = self
+                .frames
+                .iter()
+                .filter(|frame| {
+                    frame.lifecycle_state() == FrameLifecycleState::DomContentLoaded
+                        && blockers.get(&frame.frame_id()).copied().unwrap_or(0) == 0
+                        && !self.frames.iter().any(|child| {
+                            child.parent_frame_id() == frame.frame_id() && !child.is_load_complete()
+                        })
+                })
+                .map(|frame| frame.frame_id())
+                .collect::<Vec<_>>();
+            if candidates.is_empty() {
+                break;
+            }
+
+            let mut completed_this_pass = false;
+            for frame_id in candidates {
+                let Some(index) = self
+                    .frames
+                    .iter()
+                    .position(|frame| frame.frame_id() == frame_id)
+                else {
+                    continue;
+                };
+                let parent_frame_id = self.frames[index].parent_frame_id();
+                match self.frame_owner_is_live(parent_frame_id, frame_id) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.release_detached_frames();
+                        completed_this_pass = true;
+                        progressed = true;
+                        continue;
+                    }
+                    Err(error) => {
+                        self.frames[index].mark_load_failed();
+                        self.top_load_pending = false;
+                        self.lifecycle = LifecycleState::Failed;
+                        tracing::warn!(
+                            "could not verify owner liveness for frame {frame_id}: {error}"
+                        );
+                        return true;
+                    }
+                }
+                let pending_resources = match self.js.as_mut() {
+                    Some(js) => self.frames[index].has_pending_load_delaying_resources(js),
+                    None => true,
+                };
+                if pending_resources {
+                    continue;
+                }
+                let watchdog = self.js.as_mut().map(|js| {
+                    js.arm_watchdog(std::time::Duration::from_millis(
+                        LIFECYCLE_CALLBACK_WATCHDOG_MS,
+                    ))
+                });
+                let result = match self.js.as_mut() {
+                    Some(js) => self.frames[index].dispatch_load(js),
+                    None => Err("JavaScript runtime disappeared".to_string()),
+                };
+                let watchdog_fired = match (self.js.as_mut(), watchdog) {
+                    (Some(js), Some(watchdog)) => js.disarm_watchdog(watchdog),
+                    _ => false,
+                };
+                if watchdog_fired {
+                    self.frames[index].mark_load_failed();
+                    self.top_load_pending = false;
+                    self.lifecycle = LifecycleState::Failed;
+                    tracing::warn!(
+                        "frame {frame_id} load handler exceeded the lifecycle task budget"
+                    );
+                    return true;
+                }
+                if let Err(error) = result {
+                    self.frames[index].mark_load_failed();
+                    self.top_load_pending = false;
+                    self.lifecycle = LifecycleState::Failed;
+                    tracing::warn!("frame {frame_id} load events failed: {error}");
+                    return true;
+                }
+
+                // A frame's own Window.load can synchronously remove its
+                // iframe, an ancestor owner, or a later sibling. Do not follow
+                // it with a stale owner-element load dispatch.
+                match self.frame_owner_is_live(parent_frame_id, frame_id) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.release_detached_frames();
+                        completed_this_pass = true;
+                        progressed = true;
+                        continue;
+                    }
+                    Err(error) => {
+                        self.frames[index].mark_load_failed();
+                        self.top_load_pending = false;
+                        self.lifecycle = LifecycleState::Failed;
+                        tracing::warn!(
+                            "could not revalidate owner liveness for frame {frame_id}: {error}"
+                        );
+                        return true;
+                    }
+                }
+                self.dispatch_frame_owner_load(parent_frame_id, frame_id);
+                completed_this_pass = true;
+                progressed = true;
+            }
+            if !completed_this_pass {
+                break;
+            }
+        }
+        progressed
+    }
+
+    fn try_dispatch_top_load(&mut self) -> bool {
+        if !self.top_load_pending {
+            return false;
+        }
+        let frame_blocked = self.js.as_ref().is_some_and(|js| {
+            js.frame_document_load_blockers_by_parent()
+                .get(&0)
+                .copied()
+                .unwrap_or(0)
+                != 0
+        });
+        if frame_blocked
+            || self
+                .frames
+                .iter()
+                .any(|frame| frame.parent_frame_id() == 0 && !frame.is_load_complete())
+        {
+            return false;
+        }
+        let resource_blocked = self
+            .js
+            .as_mut()
+            .is_some_and(ObscuraJsRuntime::has_pending_load_delaying_resources);
+        if resource_blocked {
+            return false;
+        }
+
+        let watchdog = self.js.as_mut().map(|js| {
+            js.arm_watchdog(std::time::Duration::from_millis(
+                LIFECYCLE_CALLBACK_WATCHDOG_MS,
+            ))
+        });
+        let result = self.js.as_mut().map(|js| {
+            js.execute_script(
+                "<load-event>",
+                "globalThis.__documentReadyState__ = 'complete';\
+                 try { globalThis.__obscura_dispatchDocumentLifecycleEvent('readystatechange'); } catch (_) {}\
+                 try { globalThis.__obscura_dispatchWindowLoad(); } catch (_) {}",
+            )
+        });
+        let watchdog_fired = match (self.js.as_mut(), watchdog) {
+            (Some(js), Some(watchdog)) => js.disarm_watchdog(watchdog),
+            _ => false,
+        };
+        if watchdog_fired {
+            tracing::warn!("top-level load handler exceeded the lifecycle task budget");
+            self.top_load_pending = false;
+            self.lifecycle = LifecycleState::Failed;
+            return true;
+        }
+        if !matches!(result, Some(Ok(()))) {
+            tracing::warn!("top document load event dispatch failed: {result:?}");
+            self.top_load_pending = false;
+            self.lifecycle = LifecycleState::Failed;
+            return true;
+        }
+        self.top_load_pending = false;
+        self.lifecycle = LifecycleState::Loaded;
+        true
     }
 
     /// Moves the frame tree forward by one step: give any fetched frame
@@ -1247,10 +2750,18 @@ impl Page {
     /// frame runs scripts that can post, and a message usually causes a reply,
     /// so neither queue is finished until both are quiet.
     async fn advance_frames(&mut self) -> bool {
+        // A timer or earlier browser task may have removed a complete parent
+        // browsing-context subtree. Release it before taking the pending
+        // document snapshot, so queued descendants cannot execute in a realm
+        // whose direct owner still looks connected only inside that detached
+        // parent's private document.
+        let released_before = self.release_detached_frames();
         let attached = self.attach_pending_frames().await;
         let delivered = self.deliver_frame_messages();
-        self.release_detached_frames();
-        attached || delivered
+        let released_after = self.release_detached_frames();
+        let completed = self.complete_ready_frames();
+        let top_loaded = self.try_dispatch_top_load();
+        released_before || attached || delivered || released_after || completed || top_loaded
     }
 
     /// URLs of the page's live child frames, in creation order.
@@ -1259,6 +2770,217 @@ impl Page {
             .iter()
             .map(|frame| frame.url().to_string())
             .collect()
+    }
+
+    /// Snapshot the native ids and final document URLs of live child frames in
+    /// creation order. Unlike deriving ids from vector positions, these ids
+    /// remain correct after frames are detached or nested frames are attached.
+    pub fn frame_snapshots(&self) -> Vec<FrameSnapshot> {
+        self.frames
+            .iter()
+            .map(|frame| FrameSnapshot {
+                frame_id: frame.frame_id(),
+                url: frame.url().to_string(),
+            })
+            .collect()
+    }
+
+    /// Report live frames whose resource set is known to be incomplete.
+    pub fn frame_resource_diagnostics(&mut self) -> Vec<FrameResourceDiagnostic> {
+        let diagnostics = {
+            let Some(js) = self.js.as_mut() else {
+                return Vec::new();
+            };
+            self.frames
+                .iter()
+                .filter_map(|frame| {
+                    let pending_navigation_url = frame.pending_navigation_url();
+                    match frame.resource_archive_probe(js) {
+                        Ok(probe) => {
+                            let unsupported_stylesheet_imports = probe
+                                .style_sources
+                                .iter()
+                                .map(|css| split_css_imports(css).0.len())
+                                .sum();
+                            (probe.unsupported_module_scripts > 0
+                                || unsupported_stylesheet_imports > 0
+                                || pending_navigation_url.is_some()
+                                || probe.pending_dynamic_scripts)
+                                .then(|| FrameResourceDiagnostic {
+                                    frame_id: frame.frame_id(),
+                                    url: frame.url().to_string(),
+                                    unsupported_module_scripts: probe.unsupported_module_scripts,
+                                    unsupported_stylesheet_imports,
+                                    pending_navigation_url,
+                                    pending_dynamic_scripts: probe.pending_dynamic_scripts,
+                                    diagnostic_error: None,
+                                })
+                        }
+                        Err(error) => Some(FrameResourceDiagnostic {
+                            frame_id: frame.frame_id(),
+                            url: frame.url().to_string(),
+                            unsupported_module_scripts: 0,
+                            unsupported_stylesheet_imports: 0,
+                            pending_navigation_url,
+                            pending_dynamic_scripts: false,
+                            diagnostic_error: Some(error),
+                        }),
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        for diagnostic in &diagnostics {
+            if diagnostic.diagnostic_error.is_some() {
+                self.mark_resource_archive_incomplete(format!(
+                    "frame resource diagnostic failed for frame {} ({})",
+                    diagnostic.frame_id, diagnostic.url,
+                ));
+            }
+        }
+        diagnostics
+    }
+
+    /// De-duplicated, sorted human-readable reasons the current final-document
+    /// resource archive must not claim completeness. The text is diagnostic,
+    /// not a versioned machine-readable schema. The set resets at every
+    /// committed top-level document, including JavaScript navigation chains.
+    pub fn resource_archive_incomplete_reasons(&mut self) -> Vec<String> {
+        let frame_diagnostics = self.frame_resource_diagnostics();
+        let mut reasons = self.resource_archive_incomplete_reasons.clone();
+        if let Some(js) = self.js.as_ref() {
+            reasons.extend(js.resource_archive_incomplete_reasons());
+            #[cfg(feature = "render")]
+            {
+                let import_count = js
+                    .shadow_inline_stylesheet_sources()
+                    .iter()
+                    .map(|css| split_css_imports(css).0.len())
+                    .sum::<usize>();
+                if import_count != 0 {
+                    reasons.insert(format!(
+                        "top-level shadow-root inline stylesheets contain {import_count} unsupported @import rule(s)",
+                    ));
+                }
+            }
+            #[cfg(feature = "render")]
+            for href in js.unresolved_shadow_stylesheet_hrefs() {
+                reasons.insert(format!(
+                    "top-level shadow-root stylesheet has no materialized response owner: {href}",
+                ));
+            }
+            let (documents, bytes) = js.pending_frame_document_queue();
+            if documents != 0 {
+                reasons.insert(format!(
+                    "pending frame documents awaiting realms: {documents} documents, {bytes} bytes"
+                ));
+            }
+            let (messages, bytes) = js.pending_frame_message_queue();
+            if messages != 0 {
+                reasons.insert(format!(
+                    "pending frame postMessage deliveries: {messages} message(s), {bytes} bytes"
+                ));
+            }
+        }
+        let pending_network_requests = self.pending_network_request_count();
+        if pending_network_requests != 0 {
+            reasons.insert(format!(
+                "pending page network requests: {pending_network_requests}"
+            ));
+        }
+        if self.has_pending_top_level_dynamic_scripts() {
+            reasons.insert("top-level dynamic scripts still pending".to_string());
+        }
+        #[cfg(feature = "render")]
+        for frame in &self.frames {
+            let import_count = frame
+                .shadow_inline_stylesheet_sources()
+                .iter()
+                .map(|css| split_css_imports(css).0.len())
+                .sum::<usize>();
+            if import_count != 0 {
+                reasons.insert(format!(
+                    "frame {} shadow-root inline stylesheets contain {import_count} unsupported @import rule(s)",
+                    frame.frame_id(),
+                ));
+            }
+            for href in frame.unresolved_shadow_stylesheet_hrefs() {
+                reasons.insert(format!(
+                    "frame {} shadow-root stylesheet has no materialized response owner: {href}",
+                    frame.frame_id(),
+                ));
+            }
+        }
+        for diagnostic in frame_diagnostics {
+            if diagnostic.unsupported_module_scripts != 0 {
+                reasons.insert(format!(
+                    "frame {} ({}) has {} unsupported module scripts",
+                    diagnostic.frame_id, diagnostic.url, diagnostic.unsupported_module_scripts,
+                ));
+            }
+            if diagnostic.unsupported_stylesheet_imports != 0 {
+                reasons.insert(format!(
+                    "frame {} ({}) has {} unsupported stylesheet imports",
+                    diagnostic.frame_id, diagnostic.url, diagnostic.unsupported_stylesheet_imports,
+                ));
+            }
+            if let Some(target) = diagnostic.pending_navigation_url {
+                reasons.insert(format!(
+                    "frame {} ({}) has a pending navigation to {}",
+                    diagnostic.frame_id, diagnostic.url, target,
+                ));
+            }
+            if diagnostic.pending_dynamic_scripts {
+                reasons.insert(format!(
+                    "frame {} ({}) has dynamic scripts still pending",
+                    diagnostic.frame_id, diagnostic.url,
+                ));
+            }
+        }
+        reasons.into_iter().collect()
+    }
+
+    /// Page-wide count of network operations still awaiting a response or
+    /// error. Child frames share the same counter, so zero is required before
+    /// a byte-exact resource archive can truthfully claim completeness.
+    pub fn pending_network_request_count(&self) -> u32 {
+        self.js
+            .as_ref()
+            .map(ObscuraJsRuntime::pending_network_request_count)
+            .unwrap_or(0)
+    }
+
+    /// Whether the top-level document still has dynamically inserted scripts
+    /// queued, fetching, or evaluating.
+    pub fn has_pending_top_level_dynamic_scripts(&mut self) -> bool {
+        self.js
+            .as_mut()
+            .is_some_and(ObscuraJsRuntime::has_pending_dynamic_scripts)
+    }
+
+    /// Resource work which can still add response bodies to the current
+    /// document generation. This deliberately includes every child realm's
+    /// private dynamic-script queue, cross-realm message deliveries, and the
+    /// shared network counter.
+    pub fn has_pending_resource_work(&mut self) -> bool {
+        if self.pending_network_request_count() != 0
+            || self.has_pending_top_level_dynamic_scripts()
+            || self
+                .js
+                .as_ref()
+                .is_some_and(|js| js.pending_frame_message_queue().0 != 0)
+            || self
+                .js
+                .as_ref()
+                .is_some_and(|js| js.pending_frame_document_queue().0 != 0)
+        {
+            return true;
+        }
+        let Some(js) = self.js.as_mut() else {
+            return false;
+        };
+        self.frames
+            .iter()
+            .any(|frame| frame.has_pending_dynamic_scripts(js))
     }
 
     /// Evaluates an expression inside one of the page's child frames.
@@ -1376,12 +3098,23 @@ impl Page {
     }
 
     async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
+        self.do_fetch_resource(url, ResourceRequest::navigation())
+            .await
+    }
+
+    async fn do_fetch_resource(
+        &self,
+        url: &Url,
+        request: ResourceRequest,
+    ) -> Result<Response, ObscuraNetError> {
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
-            return stealth.fetch(url).await;
+            return stealth
+                .fetch_resource_with_callbacks(url, request, Some(&self.callbacks))
+                .await;
         }
         self.http_client
-            .fetch_with_callbacks(url, Some(&self.callbacks))
+            .fetch_resource_with_callbacks(url, request, Some(&self.callbacks))
             .await
     }
     fn init_js(&mut self) {
@@ -1480,6 +3213,11 @@ impl Page {
         }
 
         rt.run_page_init();
+        for name in &self.preload_bindings {
+            if let Err(error) = rt.install_cdp_binding(name) {
+                tracing::debug!("binding {name} setup failed: {error}");
+            }
+        }
         let _ = rt.execute_script(
             "<device-metrics>",
             &format!("globalThis.devicePixelRatio={};", self.device_scale_factor),
@@ -1508,21 +3246,224 @@ impl Page {
         }
     }
 
-    async fn fetch_stylesheets(&mut self) -> Vec<(AuthorStylesheetTarget, String)> {
-        let (all_links, inline_imports) = match &self.js {
-            Some(js) => js
-                .with_dom(|dom| {
-                    (
-                        linked_stylesheet_requests(dom),
-                        inline_stylesheet_import_requests(dom),
-                    )
-                })
-                .unwrap_or_default(),
-            None => {
-                tracing::info!("fetch_stylesheets: no js runtime");
-                return Vec::new();
+    /// Freeze the parser-owned script list before any new-document preload can
+    /// see the fully parsed backing tree. Preloads may create their own scripts
+    /// or move nodes which already belong to the parser; neither operation may
+    /// enroll new parser work or execute an original parser script twice.
+    fn snapshot_parser_scripts(&self) -> Option<Vec<ScriptInfo>> {
+        let js = self.js.as_ref()?;
+        let document_url = self.url_string();
+        js.with_dom(|dom| {
+            let script_ids = dom.query_selector_all("script").unwrap_or_default();
+            let mut bases_at_script = std::collections::HashMap::new();
+            let mut parser_order_at_script = std::collections::HashMap::new();
+            let mut active_base = url::Url::parse(&document_url).ok();
+            let mut found_base = false;
+            for (parser_order, nid) in dom.descendants(dom.document()).into_iter().enumerate() {
+                let Some(node) = dom.get_node(nid) else {
+                    continue;
+                };
+                let Some(name) = node.as_element() else {
+                    continue;
+                };
+                if name.local.as_ref() == "base" && !found_base {
+                    if let Some(href) = node.get_attribute("href") {
+                        found_base = true;
+                        if let Some(resolved) =
+                            active_base.as_ref().and_then(|base| base.join(href).ok())
+                        {
+                            active_base = Some(resolved);
+                        }
+                    }
+                } else if name.local.as_ref() == "script" {
+                    parser_order_at_script.insert(nid.raw(), parser_order);
+                    bases_at_script.insert(
+                        nid.raw(),
+                        active_base
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| document_url.clone()),
+                    );
+                }
             }
+            let body_descendants = dom
+                .query_selector("body")
+                .ok()
+                .flatten()
+                .map(|body| {
+                    dom.descendants(body)
+                        .into_iter()
+                        .map(|nid| nid.raw())
+                        .collect::<std::collections::HashSet<_>>()
+                })
+                .unwrap_or_default();
+
+            script_ids
+                .into_iter()
+                .filter_map(|sid| {
+                    let node = dom.get_node(sid)?;
+                    let src = node.get_attribute("src").map(str::to_string);
+                    let script_type = node
+                        .get_attribute("type")
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_lowercase();
+                    let kind = match script_type.as_str() {
+                        "module" => ScriptKind::Module,
+                        "importmap" => ScriptKind::ImportMap,
+                        "" | "text/javascript" | "application/javascript" => ScriptKind::Classic,
+                        _ => return None,
+                    };
+                    let inline = if src.is_none() {
+                        dom.text_content(sid)
+                    } else {
+                        String::new()
+                    };
+                    if !matches!(kind, ScriptKind::ImportMap)
+                        && src.is_none()
+                        && inline.trim().is_empty()
+                    {
+                        return None;
+                    }
+                    Some(ScriptInfo {
+                        src,
+                        inline,
+                        is_defer: node.get_attribute("defer").is_some(),
+                        is_async: node.get_attribute("async").is_some(),
+                        kind,
+                        nid: sid.raw(),
+                        after_body_start: body_descendants.contains(&sid.raw()),
+                        base_url: bases_at_script
+                            .get(&sid.raw())
+                            .cloned()
+                            .unwrap_or_else(|| document_url.clone()),
+                        parser_order: parser_order_at_script
+                            .get(&sid.raw())
+                            .copied()
+                            .unwrap_or(usize::MAX),
+                    })
+                })
+                .collect()
+        })
+    }
+
+    #[cfg(test)]
+    fn snapshot_parser_body_order(&self) -> Option<usize> {
+        self.js
+            .as_ref()?
+            .with_dom(|dom| {
+                let body = dom.query_selector("body").ok().flatten()?;
+                dom.descendants(dom.document())
+                    .into_iter()
+                    .position(|nid| nid == body)
+            })
+            .flatten()
+    }
+
+    fn install_parsed_body_load_handler(&mut self) {
+        if let Some(js) = self.js.as_mut() {
+            let _ = js.execute_script(
+                "<body-load-handler>",
+                "globalThis.__obscura_installParsedBodyLoadHandler?.();",
+            );
+        }
+    }
+
+    fn mark_parser_scripts_started(&mut self, scripts: &[ScriptInfo]) {
+        let Some(js) = self.js.as_mut() else {
+            return;
         };
+        let ids = scripts
+            .iter()
+            .map(|script| script.nid.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let _ = js.execute_script(
+            "<parser-scripts>",
+            &format!("globalThis.__markParserScripts([{}]);", ids),
+        );
+    }
+
+    fn snapshot_parser_stylesheets(&self) -> Option<ParserStylesheetSnapshot> {
+        let document_url = self.url.clone()?;
+        let (links, inline_imports, body_parser_order) = self
+            .js
+            .as_ref()?
+            .with_dom(|dom| parser_stylesheet_requests(dom, &document_url))
+            .unwrap_or_default();
+        Some(ParserStylesheetSnapshot {
+            links,
+            inline_imports,
+            body_parser_order,
+        })
+    }
+
+    fn mark_parser_stylesheets_pending(&mut self, snapshot: &ParserStylesheetSnapshot) {
+        let Some(js) = self.js.as_mut() else {
+            return;
+        };
+        let tokens = snapshot
+            .links
+            .iter()
+            .map(|link| {
+                serde_json::json!({
+                    "nid": link.nid,
+                    "rawHref": link.raw_href,
+                    "requestHref": link
+                        .base_url
+                        .join(&link.raw_href)
+                        .ok()
+                        .map(|url| url.to_string()),
+                })
+            })
+            .collect::<Vec<_>>();
+        let tokens = serde_json::to_string(&tokens).unwrap_or_else(|_| "[]".to_string());
+        let _ = js.execute_script(
+            "<parser-stylesheets>",
+            &format!("globalThis.__markParserStylesheets({tokens});"),
+        );
+    }
+
+    fn execute_top_lifecycle_script(&mut self, name: &str, source: &str) -> Result<(), String> {
+        let Some(js) = self.js.as_mut() else {
+            return Err("JavaScript runtime disappeared".to_string());
+        };
+        let watchdog = js.arm_watchdog(std::time::Duration::from_millis(
+            LIFECYCLE_CALLBACK_WATCHDOG_MS,
+        ));
+        let result = js.execute_script(name, source);
+        let watchdog_fired = js.disarm_watchdog(watchdog);
+        if watchdog_fired || result.is_err() {
+            self.top_load_pending = false;
+            self.lifecycle = LifecycleState::Failed;
+            return Err(result
+                .err()
+                .unwrap_or_else(|| "lifecycle task budget exceeded".to_string()));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn fetch_stylesheets(&mut self) -> FetchedStylesheets {
+        let Some(snapshot) = self.snapshot_parser_stylesheets() else {
+            tracing::info!("fetch_stylesheets: no js runtime");
+            return FetchedStylesheets {
+                materialized: Vec::new(),
+                failed_links: Vec::new(),
+            };
+        };
+        self.fetch_stylesheets_from_snapshot(snapshot).await
+    }
+
+    async fn fetch_stylesheets_from_snapshot(
+        &mut self,
+        snapshot: ParserStylesheetSnapshot,
+    ) -> FetchedStylesheets {
+        let ParserStylesheetSnapshot {
+            links: all_links,
+            inline_imports,
+            body_parser_order: _,
+        } = snapshot;
 
         tracing::info!(
             "fetch_stylesheets: found {} stylesheet links and {} inline imports",
@@ -1531,18 +3472,21 @@ impl Page {
         );
 
         let Some(document_url) = self.url.clone() else {
-            return Vec::new();
+            return FetchedStylesheets {
+                materialized: Vec::new(),
+                failed_links: Vec::new(),
+            };
         };
-        let document_base = self
-            .resolve_base_url()
-            .unwrap_or_else(|| document_url.clone());
         let mut roots = Vec::new();
+        let mut failed_links = Vec::new();
         let mut scheduled = std::collections::HashSet::new();
         let mut pending = Vec::new();
-        for (link_index, href) in all_links {
-            let Ok(resolved) = document_base.join(&href) else {
+        for link in all_links {
+            let Ok(resolved) = link.base_url.join(&link.raw_href) else {
+                failed_links.push((link.nid, link.parser_order, link.raw_href, None));
                 continue;
             };
+            let request_href = resolved.to_string();
             let (key, resolved) = canonical_stylesheet_url(resolved);
             if !subresource_allowed(Some(&document_url), resolved.as_str()) {
                 tracing::warn!(
@@ -1550,21 +3494,46 @@ impl Page {
                     self.url_string(),
                     resolved,
                 );
+                failed_links.push((
+                    link.nid,
+                    link.parser_order,
+                    link.raw_href,
+                    Some(request_href),
+                ));
                 continue;
             }
             if self.should_block_url(resolved.as_str()) {
                 tracing::info!("Blocked stylesheet by interception: {}", resolved);
+                failed_links.push((
+                    link.nid,
+                    link.parser_order,
+                    link.raw_href,
+                    Some(request_href),
+                ));
                 continue;
             }
-            roots.push((AuthorStylesheetTarget::Linked(link_index), key.clone(), None));
+            roots.push((
+                AuthorStylesheetTarget::Linked {
+                    nid: link.nid,
+                    parser_order: link.parser_order,
+                    raw_href: link.raw_href,
+                    request_href,
+                },
+                key.clone(),
+                None,
+            ));
             if scheduled.insert(key.clone()) {
                 if scheduled.len() <= MAX_STYLESHEET_RESOURCES {
                     pending.push((key, resolved, 0u8));
+                } else {
+                    self.mark_resource_archive_incomplete(format!(
+                        "top-level stylesheet resource cap reached ({MAX_STYLESHEET_RESOURCES} resources)"
+                    ));
                 }
             }
         }
-        for (style_index, import) in inline_imports {
-            let Ok(resolved) = document_base.join(&import.url) else {
+        for inline_import in inline_imports {
+            let Ok(resolved) = inline_import.base_url.join(&inline_import.import.url) else {
                 continue;
             };
             let (key, resolved) = canonical_stylesheet_url(resolved);
@@ -1575,12 +3544,20 @@ impl Page {
                 continue;
             }
             roots.push((
-                AuthorStylesheetTarget::InlineImport(style_index),
+                AuthorStylesheetTarget::InlineImport {
+                    nid: inline_import.nid,
+                },
                 key.clone(),
-                import.media,
+                inline_import.import.media,
             ));
-            if scheduled.insert(key.clone()) && scheduled.len() <= MAX_STYLESHEET_RESOURCES {
-                pending.push((key, resolved, 1u8));
+            if scheduled.insert(key.clone()) {
+                if scheduled.len() <= MAX_STYLESHEET_RESOURCES {
+                    pending.push((key, resolved, 1u8));
+                } else {
+                    self.mark_resource_archive_incomplete(format!(
+                        "top-level stylesheet resource cap reached ({MAX_STYLESHEET_RESOURCES} resources)"
+                    ));
+                }
             }
         }
 
@@ -1642,6 +3619,9 @@ impl Page {
                     Ok(response) => response,
                     Err(error) => {
                         tracing::debug!("Failed to fetch stylesheet {}: {}", requested_url, error);
+                        self.mark_resource_archive_incomplete(format!(
+                            "top-level stylesheet fetch failed: {requested_url}"
+                        ));
                         continue;
                     }
                 };
@@ -1655,6 +3635,13 @@ impl Page {
                     &response.body,
                     false,
                 );
+                if !(200..300).contains(&response.status) {
+                    self.mark_resource_archive_incomplete(format!(
+                        "top-level stylesheet {requested_url} returned HTTP {}",
+                        response.status,
+                    ));
+                    continue;
+                }
 
                 let (response_key, response_url) = canonical_stylesheet_url(response_url);
                 if let Some(existing) = aliases.get(&response_key).cloned() {
@@ -1662,9 +3649,14 @@ impl Page {
                     continue;
                 }
                 let css = obscura_net::decode_non_html(&response.body, response.content_type());
-                let (imports, rules) = split_css_imports(&css);
+                let (discovered_imports, rules) = split_css_imports(&css);
+                if depth >= MAX_STYLESHEET_IMPORT_DEPTH && !discovered_imports.is_empty() {
+                    self.mark_resource_archive_incomplete(format!(
+                        "top-level stylesheet import depth cap reached ({MAX_STYLESHEET_IMPORT_DEPTH}): {response_url}"
+                    ));
+                }
                 let imports = if depth < MAX_STYLESHEET_IMPORT_DEPTH {
-                    imports
+                    discovered_imports
                 } else {
                     Vec::new()
                 };
@@ -1695,6 +3687,9 @@ impl Page {
                             "stylesheet resource cap reached at {} resources",
                             MAX_STYLESHEET_RESOURCES
                         );
+                        self.mark_resource_archive_incomplete(format!(
+                            "top-level stylesheet resource cap reached ({MAX_STYLESHEET_RESOURCES} resources)"
+                        ));
                         continue;
                     }
                     if !subresource_allowed(Some(&document_url), import_url.as_str())
@@ -1709,26 +3704,43 @@ impl Page {
             }
         }
 
-        roots
-            .into_iter()
-            .filter_map(|(target, key, media)| {
-                materialize_stylesheet_graph(
-                    &key,
-                    &sheets,
-                    &aliases,
-                    &mut std::collections::HashSet::new(),
-                )
-                .map(|css| {
+        let mut materialized = Vec::new();
+        for (target, key, media) in roots {
+            match materialize_stylesheet_graph(
+                &key,
+                &sheets,
+                &aliases,
+                &mut std::collections::HashSet::new(),
+            ) {
+                Some(css) => {
                     let css = match media {
                         Some(media) => format!("@media {media} {{\n{css}\n}}\n"),
                         None => css,
                     };
-                    (target, css)
-                })
-            })
-            .collect()
+                    materialized.push((target, css));
+                }
+                None => {
+                    if let AuthorStylesheetTarget::Linked {
+                        nid,
+                        parser_order,
+                        raw_href,
+                        request_href,
+                    } = target
+                    {
+                        failed_links.push((nid, parser_order, raw_href, Some(request_href)));
+                    }
+                }
+            }
+        }
+        failed_links.sort_unstable();
+        failed_links.dedup();
+        FetchedStylesheets {
+            materialized,
+            failed_links,
+        }
     }
 
+    #[cfg(test)]
     async fn execute_scripts(&mut self) {
         self.execute_scripts_with_module_budget(None).await;
     }
@@ -1738,11 +3750,12 @@ impl Page {
     /// separate from arbitrary post-load imports, timers, and enhancement
     /// scripts; navigation readiness must not turn those into an implicit
     /// multi-second settle.
+    #[cfg(test)]
     async fn drive_load_delaying_scripts(
         js: &mut ObscuraJsRuntime,
         deadline: tokio::time::Instant,
     ) -> bool {
-        while js.has_pending_load_delaying_scripts() {
+        while js.has_pending_load_delaying_resources() {
             let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
             else {
                 return false;
@@ -1751,14 +3764,9 @@ impl Page {
                 return false;
             }
             let poll_budget = remaining.min(tokio::time::Duration::from_millis(25));
-            match tokio::time::timeout(
-                poll_budget,
-                js.run_load_delaying_event_loop_tick(),
-            )
-            .await
-            {
+            match tokio::time::timeout(poll_budget, js.run_load_delaying_event_loop_tick()).await {
                 Ok(Ok(_idle)) => {
-                    if js.has_pending_load_delaying_scripts() {
+                    if js.has_pending_load_delaying_resources() {
                         tokio::task::yield_now().await;
                     }
                 }
@@ -1784,7 +3792,76 @@ impl Page {
         true
     }
 
+    /// Alternate JavaScript tasks with native frame attachment until the top
+    /// document's complete/readystatechange/load transition can run.
+    async fn drive_document_load(&mut self, deadline: tokio::time::Instant) -> bool {
+        loop {
+            self.advance_frames().await;
+            if self.lifecycle == LifecycleState::Failed {
+                return false;
+            }
+            if !self.top_load_pending {
+                return true;
+            }
+            let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
+            else {
+                return false;
+            };
+            if remaining.is_zero() {
+                return false;
+            }
+            let poll_budget = remaining.min(tokio::time::Duration::from_millis(25));
+            let Some(js) = self.js.as_mut() else {
+                return false;
+            };
+            match tokio::time::timeout(poll_budget, js.run_load_delaying_event_loop_tick()).await {
+                Ok(Ok(_)) => tokio::task::yield_now().await,
+                Ok(Err(error)) => {
+                    tracing::warn!("document load event loop failed: {error}");
+                    return false;
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    #[cfg(test)]
     async fn execute_scripts_with_module_budget(&mut self, module_budget_override: Option<u64>) {
+        // Unit fixtures construct a fully parsed document directly instead of
+        // entering through navigate_single(). Match the real navigation
+        // boundary so scripts inserted by parser code join the load-delay set
+        // and the lifecycle driver actually pumps their fetches.
+        if let Some(js) = self.js.as_mut() {
+            let _ = js.execute_script(
+                "<ready-state>",
+                "globalThis.__documentReadyState__ = 'loading';",
+            );
+        }
+        let parser_body_order = self.snapshot_parser_body_order();
+        let Some(phase) = self
+            .execute_scripts_to_dom_content_loaded(module_budget_override, None, parser_body_order)
+            .await
+        else {
+            return;
+        };
+        self.top_load_pending = true;
+        if !self.drive_document_load(phase.deadline).await {
+            tracing::warn!("document load deadline reached with blockers still pending");
+        }
+        if let (Some(js), Some(watchdog)) = (self.js.as_mut(), phase.watchdog) {
+            if js.disarm_watchdog(watchdog) {
+                self.top_load_pending = false;
+                self.lifecycle = LifecycleState::Failed;
+            }
+        }
+    }
+
+    async fn execute_scripts_to_dom_content_loaded(
+        &mut self,
+        module_budget_override: Option<u64>,
+        parser_scripts: Option<Vec<ScriptInfo>>,
+        parser_body_order: Option<usize>,
+    ) -> Option<ScriptLoadPhase> {
         let scripts_started = std::time::Instant::now();
         tracing::info!(
             "execute_scripts called, js runtime exists: {}",
@@ -1821,127 +3898,34 @@ impl Page {
             .as_mut()
             .map(|js| js.arm_watchdog(std::time::Duration::from_millis(script_deadline_ms + 1000)));
 
-        #[derive(Debug, Clone, Copy)]
-        enum ScriptKind {
-            Classic,
-            Module,
-            ImportMap,
-        }
+        let external_module_url = |script: &ScriptInfo| {
+            let src = script.src.as_ref()?;
+            Some(
+                if src.starts_with("http://")
+                    || src.starts_with("https://")
+                    || src.starts_with("data:")
+                {
+                    src.clone()
+                } else {
+                    url::Url::parse(&script.base_url)
+                        .ok()
+                        .and_then(|base| base.join(src).ok())
+                        .map(|url| url.to_string())
+                        .unwrap_or_else(|| src.clone())
+                },
+            )
+        };
 
-        #[derive(Debug)]
-        struct ScriptInfo {
-            src: Option<String>,
-            inline: String,
-            is_defer: bool,
-            is_async: bool,
-            kind: ScriptKind,
-            nid: u32,
-            /// Document base URL at this element's parser encounter point.
-            base_url: String,
-        }
-
-        let all_scripts = match &self.js {
-            Some(js) => {
-                let document_url = self.url_string();
-                js.with_dom(|dom| {
-                    let script_ids = dom.query_selector_all("script").unwrap_or_default();
-                    let mut bases_at_script = std::collections::HashMap::new();
-                    let mut active_base = url::Url::parse(&document_url).ok();
-                    let mut found_base = false;
-                    for nid in dom.descendants(dom.document()) {
-                        let Some(node) = dom.get_node(nid) else {
-                            continue;
-                        };
-                        let Some(name) = node.as_element() else {
-                            continue;
-                        };
-                        if name.local.as_ref() == "base" && !found_base {
-                            if let Some(href) = node.get_attribute("href") {
-                                found_base = true;
-                                if let Some(resolved) =
-                                    active_base.as_ref().and_then(|base| base.join(href).ok())
-                                {
-                                    active_base = Some(resolved);
-                                }
-                            }
-                        } else if name.local.as_ref() == "script" {
-                            bases_at_script.insert(
-                                nid.raw(),
-                                active_base
-                                    .as_ref()
-                                    .map(ToString::to_string)
-                                    .unwrap_or_else(|| document_url.clone()),
-                            );
-                        }
-                    }
-                    let mut scripts = Vec::new();
-
-                    for sid in script_ids {
-                        if let Some(node) = dom.get_node(sid) {
-                            let src = node.get_attribute("src").map(|s| s.to_string());
-                            let script_type = node
-                                .get_attribute("type")
-                                .unwrap_or("")
-                                .trim()
-                                .to_ascii_lowercase();
-                            let is_defer = node.get_attribute("defer").is_some();
-                            let is_async = node.get_attribute("async").is_some();
-                            let kind = match script_type.as_str() {
-                                "module" => ScriptKind::Module,
-                                "importmap" => ScriptKind::ImportMap,
-                                "" | "text/javascript" | "application/javascript" => {
-                                    ScriptKind::Classic
-                                }
-                                _ => continue,
-                            };
-
-                            let inline_code = if src.is_none() {
-                                dom.text_content(sid)
-                            } else {
-                                String::new()
-                            };
-
-                            if matches!(kind, ScriptKind::ImportMap)
-                                || src.is_some()
-                                || !inline_code.trim().is_empty()
-                            {
-                                scripts.push(ScriptInfo {
-                                    src,
-                                    inline: inline_code,
-                                    is_defer,
-                                    is_async,
-                                    kind,
-                                    nid: sid.raw(),
-                                    base_url: bases_at_script
-                                        .get(&sid.raw())
-                                        .cloned()
-                                        .unwrap_or_else(|| document_url.clone()),
-                                });
-                            }
-                        }
-                    }
-                    scripts
-                })
-                .unwrap_or_default()
-            }
-            None => return,
+        let all_scripts = match parser_scripts {
+            Some(scripts) => scripts,
+            None => self.snapshot_parser_scripts()?,
         };
 
         // HTML scripts have an "already started" flag. Mark every
         // parser-discovered script before running page code so React/Next
         // hydration can move or hoist those nodes without appendChild
         // executing them a second time.
-        if let Some(js) = &mut self.js {
-            let ids = all_scripts
-                .iter()
-                .map(|script| script.nid.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            let _ = js.execute_script(
-                "<parser-scripts>",
-                &format!("globalThis.__markParserScripts([{}]);", ids),
-            );
-        }
+        self.mark_parser_scripts_started(&all_scripts);
 
         tracing::info!("Found {} parser-discovered scripts", all_scripts.len());
         let mut fetch_tasks: Vec<(usize, String)> = Vec::new();
@@ -2089,30 +4073,6 @@ impl Page {
             }
         }
 
-        // Spec: readyState is "loading" while parser-discovered scripts execute.
-        // Scripts that check readyState === 'loading' will register DOMContentLoaded
-        // listeners instead of calling their callback immediately.
-        if let Some(js) = &mut self.js {
-            let _ = js.execute_script(
-                "<ready-state>",
-                "globalThis.__documentReadyState__ = 'loading';",
-            );
-        }
-
-        // CDP `Page.addScriptToEvaluateOnNewDocument` contract: preload
-        // sources must run BEFORE any of the page's own scripts. This is
-        // also where puppeteer's `exposeFunction` wrapper installs itself —
-        // if preload runs after page scripts, every early binding call
-        // hits an undefined function and silently no-ops.
-        let preload_sources = self.preload_scripts.clone();
-        if let Some(js) = &mut self.js {
-            for source in &preload_sources {
-                if let Err(e) = js.execute_script_guarded("<preload>", source.as_str()) {
-                    tracing::debug!("Preload script error: {}", e);
-                }
-            }
-        }
-
         // Per-module budget. Modules on an already-rendered page are
         // enhancement, not the app: give them a short budget so one slow
         // non-essential module (e.g. YC's bookface, whose top-level eval
@@ -2165,6 +4125,7 @@ impl Page {
             Module {
                 prepared: obscura_js::runtime::PreparedModule,
                 url: Option<String>,
+                nid: u32,
                 remaining_active_ms: u64,
                 graph_elapsed_ms: u64,
                 queued_at: std::time::Instant,
@@ -2194,6 +4155,24 @@ impl Page {
                 .saturating_add(module_hostcall_grace_ms)
                 .min(remaining_page_ms);
             (budget != 0).then_some(budget)
+        };
+
+        // Parser-discovered scripts are prepared by the Rust-side HTML script
+        // runner rather than bootstrap's dynamic-script queue, so completion
+        // must be reflected back through the element's EventTarget explicitly.
+        // Dispatching (instead of calling `onload` / `onerror` directly) keeps
+        // IDL/content-attribute handlers and addEventListener listeners on the
+        // same single event path.
+        let dispatch_script_event = |page: &mut Self, nid: u32, event_type: &'static str| {
+            debug_assert!(matches!(event_type, "load" | "error"));
+            if let Some(js) = &mut page.js {
+                let _ = js.execute_script(
+                    "<parser-script-event>",
+                    &format!(
+                        "globalThis.__obscura_dispatchParserScriptEvent({nid}, '{event_type}')"
+                    ),
+                );
+            }
         };
 
         let execute_classic =
@@ -2226,6 +4205,12 @@ impl Page {
                                 "globalThis.__currentScriptNid=0;",
                             );
                         }
+                        // A successfully fetched classic script fires load even
+                        // when evaluating its source reports a JS exception.
+                        // Fetch/HTTP failures take the error path below.
+                        dispatch_script_event(page, script.nid, "load");
+                    } else {
+                        dispatch_script_event(page, script.nid, "error");
                     }
                 } else if !script.inline.is_empty() {
                     if let Some(js) = &mut page.js {
@@ -2245,16 +4230,67 @@ impl Page {
             };
 
         let mut post_parse = Vec::new();
+        let mut body_load_handler_installed = false;
+        let mut parser_stylesheet_events =
+            std::mem::take(&mut self.pending_parser_stylesheet_events)
+                .into_values()
+                .collect::<Vec<_>>();
+        parser_stylesheet_events.sort_by_key(|(order, _)| *order);
+        let mut parser_stylesheet_events =
+            std::collections::VecDeque::from(parser_stylesheet_events);
+        let mut parser_stylesheet_failed = false;
 
         // Process parser-discovered scripts in encounter order. Import maps
         // register at their exact position; module graphs start there too, but
         // evaluation of non-async modules remains post-parse.
         for (index, script) in all_scripts.iter().enumerate() {
+            while parser_stylesheet_events
+                .front()
+                .is_some_and(|(order, _)| *order < script.parser_order)
+            {
+                let (order, source) = parser_stylesheet_events.pop_front().unwrap();
+                if !body_load_handler_installed
+                    && parser_body_order.is_some_and(|body_order| body_order < order)
+                {
+                    self.install_parsed_body_load_handler();
+                    body_load_handler_installed = true;
+                }
+                if let Err(error) =
+                    self.execute_top_lifecycle_script("<parser-stylesheet-event>", &source)
+                {
+                    tracing::warn!("parser stylesheet owner event failed: {error}");
+                    parser_stylesheet_failed = true;
+                    break;
+                }
+            }
+            if parser_stylesheet_failed {
+                break;
+            }
+            if !body_load_handler_installed
+                && parser_body_order
+                    .map(|body_order| body_order < script.parser_order)
+                    .unwrap_or(script.after_body_start)
+            {
+                self.install_parsed_body_load_handler();
+                body_load_handler_installed = true;
+            }
             if tokio::time::Instant::now() >= script_deadline {
                 tracing::warn!(
                     "execute_scripts: deadline reached, skipping {} remaining scripts",
                     all_scripts.len() - index,
                 );
+                for skipped in &all_scripts[index..] {
+                    if matches!(skipped.kind, ScriptKind::Module) {
+                        if let Some(url) = external_module_url(skipped) {
+                            self.mark_resource_archive_incomplete(format!(
+                                "top-level module was not processed before the script deadline: {url}"
+                            ));
+                        }
+                    }
+                    if skipped.src.is_some() || matches!(skipped.kind, ScriptKind::Module) {
+                        dispatch_script_event(self, skipped.nid, "error");
+                    }
+                }
                 break;
             }
 
@@ -2279,32 +4315,33 @@ impl Page {
                     }
                 }
                 ScriptKind::Module => {
+                    let external_url = external_module_url(script);
                     // Graph loading and evaluation share one active-work
                     // allowance. Queue time behind other post-parse scripts is
                     // not work performed by this module.
                     let Some(remaining_page_ms) = remaining_budget_ms(script_deadline) else {
                         tracing::warn!("ES module budget exhausted before graph preparation");
+                        if let Some(url) = external_url.as_deref() {
+                            self.mark_resource_archive_incomplete(format!(
+                                "top-level module page budget exhausted before graph preparation: {url}"
+                            ));
+                        }
+                        dispatch_script_event(self, script.nid, "error");
                         continue;
                     };
                     let prepare_budget_ms = module_budget_ms.min(remaining_page_ms);
                     let prepare_started = std::time::Instant::now();
-                    let (prepared, module_url) = if let Some(src) = &script.src {
-                        let full_url = if src.starts_with("http://")
-                            || src.starts_with("https://")
-                            || src.starts_with("data:")
-                        {
-                            src.clone()
-                        } else {
-                            url::Url::parse(&script.base_url)
-                                .ok()
-                                .and_then(|base| base.join(src).ok())
-                                .map(|url| url.to_string())
-                                .unwrap_or_else(|| src.clone())
-                        };
+                    let (prepared, module_url) = if let Some(full_url) = external_url {
                         tracing::info!("Preparing ES module graph: {}", full_url);
                         let result = match &mut self.js {
                             Some(js) => js.prepare_module(&full_url, prepare_budget_ms).await,
-                            None => continue,
+                            None => {
+                                self.mark_resource_archive_incomplete(format!(
+                                    "top-level module graph preparation could not start: {full_url}"
+                                ));
+                                dispatch_script_event(self, script.nid, "error");
+                                continue;
+                            }
                         };
                         tracing::debug!(
                             phase = "module-graph",
@@ -2318,6 +4355,10 @@ impl Page {
                             Ok(prepared) => (prepared, Some(full_url)),
                             Err(error) => {
                                 tracing::warn!("ES module error ({}): {}", full_url, error);
+                                self.mark_resource_archive_incomplete(format!(
+                                    "top-level module graph preparation failed: {full_url}"
+                                ));
+                                dispatch_script_event(self, script.nid, "error");
                                 continue;
                             }
                         }
@@ -2331,7 +4372,10 @@ impl Page {
                                 )
                                 .await
                             }
-                            None => continue,
+                            None => {
+                                dispatch_script_event(self, script.nid, "error");
+                                continue;
+                            }
                         };
                         tracing::debug!(
                             phase = "module-graph",
@@ -2345,6 +4389,7 @@ impl Page {
                             Ok(prepared) => (prepared, None),
                             Err(error) => {
                                 tracing::warn!("Inline ES module error: {}", error);
+                                dispatch_script_event(self, script.nid, "error");
                                 continue;
                             }
                         }
@@ -2358,11 +4403,18 @@ impl Page {
                             active_budget_ms = module_budget_ms,
                             "ES module exhausted its active budget during graph preparation",
                         );
+                        if let Some(url) = module_url.as_deref() {
+                            self.mark_resource_archive_incomplete(format!(
+                                "top-level module active budget exhausted during graph preparation: {url}"
+                            ));
+                        }
+                        dispatch_script_event(self, script.nid, "error");
                         continue;
                     }
                     let scheduled = ScheduledScript::Module {
                         prepared,
                         url: module_url,
+                        nid: script.nid,
                         remaining_active_ms,
                         graph_elapsed_ms,
                         queued_at: std::time::Instant::now(),
@@ -2371,6 +4423,7 @@ impl Page {
                         let ScheduledScript::Module {
                             prepared,
                             url,
+                            nid,
                             remaining_active_ms,
                             graph_elapsed_ms,
                             queued_at,
@@ -2386,6 +4439,12 @@ impl Page {
                                 queue_wait_ms = queued_at.elapsed().as_millis(),
                                 "ES module exhausted the page budget before evaluation",
                             );
+                            if let Some(url) = url.as_deref() {
+                                self.mark_resource_archive_incomplete(format!(
+                                    "top-level module page budget exhausted before evaluation: {url}"
+                                ));
+                            }
+                            dispatch_script_event(self, nid, "error");
                             continue;
                         };
                         let queue_wait_ms = queued_at.elapsed().as_millis();
@@ -2395,7 +4454,15 @@ impl Page {
                                 js.evaluate_prepared_module(prepared, evaluation_budget_ms)
                                     .await
                             }
-                            None => continue,
+                            None => {
+                                if let Some(url) = url.as_deref() {
+                                    self.mark_resource_archive_incomplete(format!(
+                                        "top-level module evaluation could not start: {url}"
+                                    ));
+                                }
+                                dispatch_script_event(self, nid, "error");
+                                continue;
+                            }
                         };
                         tracing::debug!(
                             phase = "module-evaluation",
@@ -2410,6 +4477,12 @@ impl Page {
                         );
                         if let Err(error) = result {
                             tracing::warn!("ES module evaluation error: {}", error);
+                            if let Some(url) = url.as_deref() {
+                                self.mark_resource_archive_incomplete(format!(
+                                    "top-level module evaluation failed: {url}"
+                                ));
+                            }
+                            dispatch_script_event(self, nid, "error");
                         } else if let Some(url) = url {
                             tracing::info!("ES module loaded: {}", url);
                             self.record_network_event(
@@ -2420,6 +4493,9 @@ impl Page {
                                 &std::collections::HashMap::new(),
                                 0,
                             );
+                            dispatch_script_event(self, nid, "load");
+                        } else {
+                            dispatch_script_event(self, nid, "load");
                         }
                     } else {
                         post_parse.push(scheduled);
@@ -2428,20 +4504,54 @@ impl Page {
             }
         }
 
+        while let Some((order, source)) = parser_stylesheet_events.pop_front() {
+            if !body_load_handler_installed
+                && parser_body_order.is_some_and(|body_order| body_order < order)
+            {
+                self.install_parsed_body_load_handler();
+                body_load_handler_installed = true;
+            }
+            if let Err(error) =
+                self.execute_top_lifecycle_script("<parser-stylesheet-event>", &source)
+            {
+                tracing::warn!("parser stylesheet owner event failed: {error}");
+                break;
+            }
+        }
+
+        if !body_load_handler_installed {
+            self.install_parsed_body_load_handler();
+        }
+
         // Parsing has finished before defer scripts and non-async modules run.
         // They still gate DOMContentLoaded, but observe the browser's
         // `interactive` readyState while they execute.
         if let Some(js) = &mut self.js {
             let _ = js.execute_script(
                 "<ready-state-interactive>",
-                "globalThis.__documentReadyState__ = 'interactive';",
+                "globalThis.__documentReadyState__ = 'interactive';\
+                 try { globalThis.__obscura_dispatchDocumentLifecycleEvent('readystatechange'); } catch (_) {}",
             );
         }
 
         for scheduled in post_parse {
             if tokio::time::Instant::now() >= script_deadline {
                 tracing::warn!("execute_scripts: deadline reached during post-parse scripts");
-                break;
+                match &scheduled {
+                    ScheduledScript::Classic(index) => {
+                        let script = &all_scripts[*index];
+                        dispatch_script_event(self, script.nid, "error");
+                    }
+                    ScheduledScript::Module { url, nid, .. } => {
+                        if let Some(url) = url {
+                            self.mark_resource_archive_incomplete(format!(
+                                "top-level module was not evaluated before the script deadline: {url}"
+                            ));
+                        }
+                        dispatch_script_event(self, *nid, "error");
+                    }
+                }
+                continue;
             }
             match scheduled {
                 ScheduledScript::Classic(index) => {
@@ -2452,6 +4562,7 @@ impl Page {
                 ScheduledScript::Module {
                     prepared,
                     url,
+                    nid,
                     remaining_active_ms,
                     graph_elapsed_ms,
                     queued_at,
@@ -2464,6 +4575,12 @@ impl Page {
                             queue_wait_ms = queued_at.elapsed().as_millis(),
                             "ES module exhausted the page budget before post-parse evaluation",
                         );
+                        if let Some(url) = url.as_deref() {
+                            self.mark_resource_archive_incomplete(format!(
+                                "top-level module page budget exhausted before post-parse evaluation: {url}"
+                            ));
+                        }
+                        dispatch_script_event(self, nid, "error");
                         continue;
                     };
                     let queue_wait_ms = queued_at.elapsed().as_millis();
@@ -2473,7 +4590,15 @@ impl Page {
                             js.evaluate_prepared_module(prepared, evaluation_budget_ms)
                                 .await
                         }
-                        None => continue,
+                        None => {
+                            if let Some(url) = url.as_deref() {
+                                self.mark_resource_archive_incomplete(format!(
+                                    "top-level module post-parse evaluation could not start: {url}"
+                                ));
+                            }
+                            dispatch_script_event(self, nid, "error");
+                            continue;
+                        }
                     };
                     tracing::debug!(
                         phase = "module-evaluation",
@@ -2488,6 +4613,12 @@ impl Page {
                     );
                     if let Err(error) = result {
                         tracing::warn!("ES module evaluation error: {}", error);
+                        if let Some(url) = url.as_deref() {
+                            self.mark_resource_archive_incomplete(format!(
+                                "top-level module evaluation failed: {url}"
+                            ));
+                        }
+                        dispatch_script_event(self, nid, "error");
                     } else if let Some(url) = url {
                         tracing::info!("ES module loaded: {}", url);
                         self.record_network_event(
@@ -2498,6 +4629,9 @@ impl Page {
                             &std::collections::HashMap::new(),
                             0,
                         );
+                        dispatch_script_event(self, nid, "load");
+                    } else {
+                        dispatch_script_event(self, nid, "load");
                     }
                 }
             }
@@ -2510,32 +4644,8 @@ impl Page {
             // a DOMContentLoaded listener.
             let _ = js.execute_script(
                 "<dom-content-loaded>",
-                "try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
-                 try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}",
+                "try { globalThis.__obscura_dispatchDocumentLifecycleEvent('DOMContentLoaded'); } catch(e) {}",
             );
-
-            let load_blockers_finished =
-                Self::drive_load_delaying_scripts(js, script_deadline).await;
-            if !load_blockers_finished {
-                tracing::warn!(
-                    "script deadline reached with load-delaying dynamic scripts still pending"
-                );
-            }
-
-            // readyState becomes complete before the load event. A script
-            // inserted by an onload handler is therefore post-load work and
-            // remains pending until an explicit caller settle/wait.
-            let _ = js.execute_script(
-                "<load-event>",
-                "globalThis.__documentReadyState__ = 'complete';\n\
-                 if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
-                 try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}",
-            );
-        }
-        if let Some(token) = exec_wd {
-            if let Some(js) = self.js.as_mut() {
-                js.disarm_watchdog(token);
-            }
         }
         tracing::debug!(
             phase = "script-execution-total",
@@ -2543,6 +4653,10 @@ impl Page {
             budget_ms = script_deadline_ms,
             "script execution phase complete",
         );
+        Some(ScriptLoadPhase {
+            deadline: script_deadline,
+            watchdog: exec_wd,
+        })
     }
 
     pub async fn navigate(&mut self, url_str: &str) -> Result<(), PageError> {
@@ -2610,6 +4724,8 @@ impl Page {
             return;
         }
         let settle_started = std::time::Instant::now();
+        let settle_deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_millis(max_ms);
         // Pump, then give any frame document that finished fetching a realm of
         // its own. Attaching one runs its scripts, which can start timers,
         // fetches and further frames, so keep alternating until no new frame
@@ -2621,7 +4737,12 @@ impl Page {
             }
             if let Some(js) = &mut self.js {
                 if std::env::var_os("OBSCURA_STRICT_SETTLE").is_some() {
-                    Self::settle_runtime_for_duration(js, remaining).await;
+                    if let Err(error) = Self::settle_runtime_for_duration(js, remaining).await {
+                        tracing::warn!("strict settle JavaScript task failed: {error}");
+                        self.top_load_pending = false;
+                        self.lifecycle = LifecycleState::Failed;
+                        break;
+                    }
                 } else {
                     // A deno_core event loop remains "busy" for any future timer,
                     // including analytics intervals and animation loops which do
@@ -2629,10 +4750,20 @@ impl Page {
                     // observable document/network/script activity instead. The
                     // absolute caller budget and V8 watchdog still bound both
                     // asynchronous work and synchronous microtask storms.
-                    let _ = js.run_event_loop_until_quiescent(remaining, 150).await;
+                    if let Err(error) = js.run_event_loop_until_quiescent(remaining, 150).await {
+                        tracing::warn!("adaptive settle JavaScript task failed: {error}");
+                        self.top_load_pending = false;
+                        self.lifecycle = LifecycleState::Failed;
+                        break;
+                    }
                 }
             }
-            if !self.advance_frames().await {
+            let advanced =
+                match tokio::time::timeout_at(settle_deadline, self.advance_frames()).await {
+                    Ok(advanced) => advanced,
+                    Err(_) => break,
+                };
+            if !advanced {
                 break;
             }
         }
@@ -2646,11 +4777,8 @@ impl Page {
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(1_000);
-            let remaining_ms = remaining_settle_resource_warmup_ms(
-                max_ms,
-                settle_started.elapsed(),
-                warmup_ms,
-            );
+            let remaining_ms =
+                remaining_settle_resource_warmup_ms(max_ms, settle_started.elapsed(), warmup_ms);
             if remaining_ms != 0 {
                 let _ = self.prepare_screenshot_resources(remaining_ms).await;
             }
@@ -2665,14 +4793,80 @@ impl Page {
         if duration_ms == 0 {
             return;
         }
-        if let Some(js) = &mut self.js {
-            Self::settle_runtime_for_duration(js, duration_ms).await;
+        // A fixed wait must retain its full wall clock, but it still has to
+        // alternate runtime work with frame attachment and message delivery.
+        // Attaching frames only after the entire delay strands their timers,
+        // fetches and multi-turn postMessage handshakes until a second settle.
+        // Challenge widgets are a common example: the child reports ready,
+        // the parent sends configuration, then the child starts image loads.
+        const FRAME_PUMP_SLICE_MS: u64 = 50;
+        let started = std::time::Instant::now();
+        let deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_millis(duration_ms);
+        loop {
+            let remaining = duration_ms.saturating_sub(started.elapsed().as_millis() as u64);
+            if remaining == 0 {
+                break;
+            }
+            let slice = remaining.min(FRAME_PUMP_SLICE_MS);
+            if let Some(js) = &mut self.js {
+                if let Err(error) = Self::settle_runtime_for_duration(js, slice).await {
+                    tracing::warn!("fixed settle JavaScript task failed: {error}");
+                    self.top_load_pending = false;
+                    self.lifecycle = LifecycleState::Failed;
+                    break;
+                }
+            } else {
+                tokio::time::sleep(tokio::time::Duration::from_millis(slice)).await;
+            }
+            if tokio::time::timeout_at(deadline, self.advance_frames())
+                .await
+                .is_err()
+            {
+                break;
+            }
         }
-        // A fixed wait must retain its full wall clock, so frames get their
-        // realms once at the end instead of being interleaved as in `settle`.
-        // Their document scripts still run; only their own deferred work is
-        // left for a later settle.
-        self.advance_frames().await;
+    }
+
+    /// Pump the page for a fixed wall-clock budget while committing any
+    /// top-level navigation requested by page script. Unlike a plain settle,
+    /// this follows post-load `location` changes, resets the old document, and
+    /// continues pumping the final page for the remaining budget.
+    pub async fn settle_for_duration_following_navigations(
+        &mut self,
+        duration_ms: u64,
+    ) -> Result<(), PageError> {
+        const BROWSER_PUMP_SLICE_MS: u64 = 50;
+        let started = std::time::Instant::now();
+        let deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_millis(duration_ms);
+        loop {
+            while self.process_pending_navigation().await? {}
+
+            let remaining = duration_ms.saturating_sub(started.elapsed().as_millis() as u64);
+            if remaining == 0 {
+                break;
+            }
+            let slice = remaining.min(BROWSER_PUMP_SLICE_MS);
+            if let Some(js) = &mut self.js {
+                if let Err(error) = Self::settle_runtime_for_duration(js, slice).await {
+                    self.top_load_pending = false;
+                    self.lifecycle = LifecycleState::Failed;
+                    return Err(PageError::NetworkError(format!(
+                        "fixed settle JavaScript task failed: {error}"
+                    )));
+                }
+            } else {
+                tokio::time::sleep(tokio::time::Duration::from_millis(slice)).await;
+            }
+            if tokio::time::timeout_at(deadline, self.advance_frames())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Advance one wake-driven browser task for a continuously owned page.
@@ -2681,10 +4875,23 @@ impl Page {
     /// higher-priority automation commands.
     #[doc(hidden)]
     pub async fn run_autonomous_event_loop_turn(&mut self) -> Result<bool, String> {
-        let reached_idle = match self.js.as_mut() {
+        let turn = match self.js.as_mut() {
             Some(js) => js.run_autonomous_event_loop_turn().await,
             None => Ok(true),
-        }?;
+        };
+        let reached_idle = match turn {
+            Ok(reached_idle) => reached_idle,
+            Err(error) => {
+                // A bounded JS task failure is terminal for this document's
+                // lifecycle. In particular, a non-returning dynamic resource
+                // load/error handler may leave its JS-side delay counter set;
+                // retaining DomContentLoaded+pending would make Window.load
+                // appear capable of completing even though the pump stopped.
+                self.top_load_pending = false;
+                self.lifecycle = LifecycleState::Failed;
+                return Err(error);
+            }
+        };
         // Dynamic iframe fetches finish on the page event loop, but their
         // realms must be built by Page between turns. Keep the autonomous CDP
         // pump on the same generic frame path as settle(), so a client that
@@ -2693,14 +4900,18 @@ impl Page {
         Ok(reached_idle && !frame_work)
     }
 
-    async fn settle_runtime_for_duration(js: &mut ObscuraJsRuntime, duration_ms: u64) {
+    async fn settle_runtime_for_duration(
+        js: &mut ObscuraJsRuntime,
+        duration_ms: u64,
+    ) -> Result<(), String> {
         let started = tokio::time::Instant::now();
-        let _ = js.run_event_loop_for_duration(duration_ms).await;
+        let result = js.run_event_loop_for_duration(duration_ms).await;
         let requested = tokio::time::Duration::from_millis(duration_ms);
         let elapsed = started.elapsed();
         if elapsed < requested {
             tokio::time::sleep(requested - elapsed).await;
         }
+        result
     }
 
     /// Append the current URL to the history stack, truncating any forward
@@ -2808,6 +5019,8 @@ impl Page {
     ) -> Result<(), PageError> {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
 
+        self.begin_top_document();
+
         self.lifecycle = LifecycleState::Loading;
         self.referrer = referrer.to_string();
         self.url = Some(url.clone());
@@ -2821,11 +5034,10 @@ impl Page {
                     robots_url.set_path("/robots.txt");
                     robots_url.set_query(None);
                     robots_url.set_fragment(None);
-                    let body = match self
-                        .http_client
-                        .fetch_with_callbacks(&robots_url, Some(&self.callbacks))
-                        .await
-                    {
+                    // robots.txt is a crawler policy probe, not a resource
+                    // requested or rendered by the document. Keep it outside
+                    // page callbacks and final-document resource archives.
+                    let body = match self.http_client.fetch(&robots_url).await {
                         Ok(resp) if resp.status == 200 => {
                             String::from_utf8_lossy(&resp.body).into_owned()
                         }
@@ -2849,7 +5061,7 @@ impl Page {
         }
 
         if url.scheme() == "about" {
-            self.navigate_blank();
+            self.commit_blank_document();
             self.init_js();
             // Preloads (Page.addScriptToEvaluateOnNewDocument, the
             // Runtime.addBinding shim) must run on about:blank too —
@@ -2933,39 +5145,138 @@ impl Page {
 
         self.dom = Some(dom);
         self.init_js();
-        let author_stylesheets = self.fetch_stylesheets().await;
+
+        // Freeze parser-owned resources, their encounter order, and their URL
+        // bases before CDP new-document code sees the fully parsed backing
+        // tree. Preloads may append, move, or rewrite nodes; that must neither
+        // enroll new parser work nor change the request base of existing work.
+        // Marking original scripts started here also prevents a preload which
+        // moves one from triggering it through the dynamic-script path.
+        let parser_scripts = self
+            .snapshot_parser_scripts()
+            .ok_or_else(|| PageError::ParseError("JavaScript runtime disappeared".to_string()))?;
+        self.mark_parser_scripts_started(&parser_scripts);
+        let parser_stylesheets = self
+            .snapshot_parser_stylesheets()
+            .ok_or_else(|| PageError::ParseError("JavaScript runtime disappeared".to_string()))?;
+        let parser_body_order = parser_stylesheets.body_parser_order;
+        self.mark_parser_stylesheets_pending(&parser_stylesheets);
+
+        // Static stylesheet owner events are the first page-authored
+        // callbacks this realm can dispatch. Establish parser readiness and
+        // install CDP new-document sources before starting their frozen
+        // network requests, so load/error handlers observe `loading` and the
+        // preload state.
+        if let Some(js) = &mut self.js {
+            let _ = js.execute_script(
+                "<ready-state>",
+                "globalThis.__documentReadyState__ = 'loading';",
+            );
+        }
+        let preload_sources = self.preload_scripts.clone();
+        let preload_watchdog = self.js.as_mut().map(|js| {
+            js.arm_watchdog(std::time::Duration::from_millis(
+                LIFECYCLE_CALLBACK_WATCHDOG_MS,
+            ))
+        });
+        if let Some(js) = &mut self.js {
+            for source in &preload_sources {
+                if let Err(error) = js.execute_script_guarded("<preload>", source) {
+                    tracing::debug!("Preload script error: {error}");
+                }
+            }
+        }
+        let preload_watchdog_fired = match (self.js.as_mut(), preload_watchdog) {
+            (Some(js), Some(watchdog)) => js.disarm_watchdog(watchdog),
+            _ => false,
+        };
+        if preload_watchdog_fired {
+            self.top_load_pending = false;
+            self.lifecycle = LifecycleState::Failed;
+            return Err(PageError::NetworkError(
+                "new-document preload exceeded its execution budget".to_string(),
+            ));
+        }
+        let fetched_stylesheets = self
+            .fetch_stylesheets_from_snapshot(parser_stylesheets)
+            .await;
+        let author_stylesheets = fetched_stylesheets.materialized;
+        if self.lifecycle == LifecycleState::Failed {
+            return Err(PageError::NetworkError(
+                "parser stylesheet lifecycle callback failed".to_string(),
+            ));
+        }
 
         // Inject CSS as a global so getComputedStyle and any CSS-aware shim
         // can read it. Has to happen before scripts run, regardless of
         // waitUntil, so handlers that read window.__obscura_css see it.
         if !author_stylesheets.is_empty() {
+            let combined_css = author_stylesheets
+                .iter()
+                .map(|(_, css)| css.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            // Use the thorough template-literal escape that covers U+2028 /
+            // U+2029 and other controls, so CSS cannot escape this assignment.
+            let escaped = escape_for_js_template_literal(&combined_css);
+            let code = format!("globalThis.__obscura_css = `{}`;", escaped);
             if let Some(js) = &mut self.js {
-                let combined_css = author_stylesheets
-                    .iter()
-                    .map(|(_, css)| css.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                // Use the thorough template-literal escape that
-                // covers U+2028 / U+2029 and other control chars.
-                // The previous escaper only handled `, \, and ${,
-                // letting attacker-controlled CSS containing a raw
-                // U+2028 break out of the template literal and run
-                // arbitrary JS in the page's V8 realm.
-                let escaped = escape_for_js_template_literal(&combined_css);
-                let code = format!("globalThis.__obscura_css = `{}`;", escaped);
                 let _ = js.execute_script("<css>", &code);
-                for (target, css) in &author_stylesheets {
-                    let code = match target {
-                        AuthorStylesheetTarget::Linked(link_index) => {
-                            materialize_linked_stylesheet_script(*link_index, css)
-                        }
-                        AuthorStylesheetTarget::InlineImport(style_index) => {
-                            materialize_inline_import_script(*style_index, css)
-                        }
-                    };
-                    let _ = js.execute_script("<fetch_stylesheets>", &code);
+            }
+            for (target, css) in &author_stylesheets {
+                let result = match target {
+                    AuthorStylesheetTarget::Linked {
+                        nid,
+                        parser_order,
+                        raw_href,
+                        request_href,
+                    } => {
+                        self.pending_parser_stylesheet_events.insert(
+                            *nid,
+                            (
+                                *parser_order,
+                                materialize_parser_stylesheet_script_with_token(
+                                    *nid,
+                                    css,
+                                    request_href,
+                                    raw_href,
+                                ),
+                            ),
+                        );
+                        Ok(())
+                    }
+                    AuthorStylesheetTarget::InlineImport { nid } => self.js.as_mut().map_or_else(
+                        || Err("JavaScript runtime disappeared".to_string()),
+                        |js| {
+                            js.execute_script(
+                                "<fetch_stylesheets>",
+                                &materialize_inline_import_script(*nid, css),
+                            )
+                        },
+                    ),
+                };
+                if let Err(error) = result {
+                    self.top_load_pending = false;
+                    self.lifecycle = LifecycleState::Failed;
+                    return Err(PageError::NetworkError(format!(
+                        "parser stylesheet lifecycle callback failed: {error}"
+                    )));
                 }
             }
+        }
+        for (nid, parser_order, raw_href, request_href) in fetched_stylesheets.failed_links {
+            self.pending_parser_stylesheet_events.insert(
+                nid,
+                (
+                    parser_order,
+                    complete_parser_stylesheet_script_with_token(
+                        nid,
+                        "error",
+                        request_href.as_deref(),
+                        &raw_href,
+                    ),
+                ),
+            );
         }
         self.document_timeline_origin = std::time::Instant::now();
         #[cfg(feature = "render")]
@@ -2974,7 +5285,7 @@ impl Page {
         }
         if let Some(js) = &mut self.js {
             let _ = js.execute_script("<iframe-load>",
-                "(function() { var iframes = document.querySelectorAll('iframe[src]'); for (var i = 0; i < iframes.length; i++) { var src = iframes[i].getAttribute('src'); if (src && src !== 'about:blank') iframes[i]._loadIframeSrc(src); } })()");
+                "(function() { var iframes = document.querySelectorAll('iframe[src]'); for (var i = 0; i < iframes.length; i++) { if (iframes[i].hasAttribute('srcdoc')) continue; var src = iframes[i].getAttribute('src'); if (src && src !== 'about:blank') iframes[i]._loadIframeSrc(src); } })()");
         }
 
         // Scripts can synchronously flush style/layout through
@@ -2998,9 +5309,22 @@ impl Page {
         // not before. Skipping execute_scripts() on the DCL path meant
         // every inline <script> in the page was silently dropped: form
         // listeners never registered, frameworks never bootstrapped,
-        // page.click() handlers were no-ops. Now scripts run regardless
-        // of waitUntil and DCL means "DOM parsed AND scripts executed".
-        self.execute_scripts().await;
+        // page.click() handlers were no-ops. Run through DOMContentLoaded here;
+        // the separate load gate below waits for frames and resources.
+        let script_phase = self
+            .execute_scripts_to_dom_content_loaded(None, Some(parser_scripts), parser_body_order)
+            .await
+            .ok_or_else(|| PageError::ParseError("JavaScript runtime disappeared".to_string()))?;
+        if self.lifecycle == LifecycleState::Failed {
+            if let (Some(js), Some(watchdog)) = (self.js.as_mut(), script_phase.watchdog) {
+                let _ = js.disarm_watchdog(watchdog);
+            }
+            self.top_load_pending = false;
+            return Err(PageError::NetworkError(
+                "parser stylesheet lifecycle callback failed".to_string(),
+            ));
+        }
+        let script_deadline = script_phase.deadline;
 
         #[cfg(feature = "render")]
         {
@@ -3018,6 +5342,11 @@ impl Page {
         }
 
         self.lifecycle = LifecycleState::DomContentLoaded;
+        // Establish the browser-side load gate before frame attachment or any
+        // other cancellable await. A caller timing out does not cancel the
+        // underlying document load in browsers; autonomous turns may still
+        // complete it and dispatch the pending lifecycle events.
+        self.top_load_pending = true;
 
         // Before any `wait_until` can return, because the frames belong to the
         // document rather than to one readiness level. Puppeteer and Playwright
@@ -3027,7 +5356,34 @@ impl Page {
         self.build_document_frames().await;
 
         if wait_until == crate::lifecycle::WaitUntil::DomContentLoaded {
+            let watchdog_fired = match (self.js.as_mut(), script_phase.watchdog) {
+                (Some(js), Some(watchdog)) => js.disarm_watchdog(watchdog),
+                _ => false,
+            };
+            if watchdog_fired || self.lifecycle == LifecycleState::Failed {
+                self.top_load_pending = false;
+                self.lifecycle = LifecycleState::Failed;
+                return Err(PageError::NetworkError(
+                    "document lifecycle callback exceeded its execution budget".to_string(),
+                ));
+            }
             return Ok(());
+        }
+
+        let document_loaded = self.drive_document_load(script_deadline).await;
+        let watchdog_fired = match (self.js.as_mut(), script_phase.watchdog) {
+            (Some(js), Some(watchdog)) => js.disarm_watchdog(watchdog),
+            _ => false,
+        };
+        if watchdog_fired {
+            self.top_load_pending = false;
+            self.lifecycle = LifecycleState::Failed;
+        }
+        if !document_loaded || self.lifecycle == LifecycleState::Failed {
+            self.lifecycle = LifecycleState::Failed;
+            return Err(PageError::NetworkError(
+                "document load event remained blocked at the script deadline".to_string(),
+            ));
         }
 
         if let Some(js) = &mut self.js {
@@ -3037,8 +5393,6 @@ impl Page {
                 }
             }
         }
-
-        self.lifecycle = LifecycleState::Loaded;
 
         if matches!(
             wait_until,
@@ -3059,6 +5413,7 @@ impl Page {
                 .map(|js| js.arm_watchdog(std::time::Duration::from_millis(5500)));
             let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
             let mut idle_since: Option<tokio::time::Instant> = None;
+            let mut event_loop_failed = false;
 
             loop {
                 let active = self.http_client.active_requests();
@@ -3086,20 +5441,37 @@ impl Page {
                 }
 
                 if let Some(js) = &mut self.js {
-                    let _ = tokio::time::timeout(
-                        tokio::time::Duration::from_millis(50),
-                        js.run_event_loop(),
-                    )
-                    .await;
+                    if matches!(
+                        tokio::time::timeout(
+                            tokio::time::Duration::from_millis(50),
+                            js.run_event_loop(),
+                        )
+                        .await,
+                        Ok(Err(_))
+                    ) {
+                        event_loop_failed = true;
+                        break;
+                    }
                 } else {
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
             }
 
-            if let Some(token) = netidle_wd {
+            let watchdog_fired = if let Some(token) = netidle_wd {
                 if let Some(js) = self.js.as_mut() {
-                    js.disarm_watchdog(token);
+                    js.disarm_watchdog(token)
+                } else {
+                    false
                 }
+            } else {
+                false
+            };
+            if event_loop_failed || watchdog_fired {
+                self.top_load_pending = false;
+                self.lifecycle = LifecycleState::Failed;
+                return Err(PageError::NetworkError(
+                    "JavaScript execution failed while waiting for network idle".to_string(),
+                ));
             }
             self.lifecycle = LifecycleState::NetworkIdle;
         }
@@ -3128,7 +5500,11 @@ impl Page {
         let has_iframe = self
             .with_dom(|dom| dom.query_selector("iframe").ok().flatten().is_some())
             .unwrap_or(false);
-        if !has_iframe {
+        let has_pending_frame = self
+            .js
+            .as_ref()
+            .is_some_and(|js| js.pending_frame_document_queue().0 != 0);
+        if !has_iframe && !has_pending_frame {
             return;
         }
 
@@ -3140,13 +5516,18 @@ impl Page {
                 )
                 .await;
             }
-            if !self.advance_frames().await {
+            let advanced = self.advance_frames().await;
+            let pending = self
+                .js
+                .as_ref()
+                .is_some_and(|js| js.pending_frame_document_queue().0 != 0);
+            if !advanced && !pending {
                 break;
             }
         }
     }
 
-    pub fn navigate_blank(&mut self) {
+    fn commit_blank_document(&mut self) {
         self.frames.clear();
         self.js = None;
         self.url = Some(Url::parse("about:blank").unwrap());
@@ -3155,7 +5536,13 @@ impl Page {
         ));
         self.title = String::new();
         self.lifecycle = LifecycleState::Loaded;
+        self.top_load_pending = false;
         self.document_timeline_origin = std::time::Instant::now();
+    }
+
+    pub fn navigate_blank(&mut self) {
+        self.begin_top_document();
+        self.commit_blank_document();
     }
 
     pub fn url_string(&self) -> String {
@@ -3178,102 +5565,320 @@ impl Page {
     /// response limits, and connection pooling.
     #[cfg(feature = "render")]
     pub async fn prepare_screenshot_resources(&mut self, max_ms: u64) -> usize {
+        self.prepare_screenshot_resources_with_report(max_ms)
+            .await
+            .loaded
+    }
+
+    /// Concurrently seed the synchronous renderer cache and report all work
+    /// which did not complete in this bounded pass.
+    ///
+    /// This is the diagnostic form of [`Page::prepare_screenshot_resources`].
+    /// It prevents archive callers from mistaking `loaded == 0` for completion
+    /// when the pass timed out or when more than 128 candidates were present.
+    #[cfg(feature = "render")]
+    pub async fn prepare_screenshot_resources_with_report(
+        &mut self,
+        max_ms: u64,
+    ) -> ScreenshotResourceWarmupReport {
+        #[derive(Clone)]
+        struct WarmupCandidate {
+            raw: String,
+            initiator: Url,
+            frame_id: u32,
+            profile: Option<obscura_js::ImageRequestProfile>,
+            kind: ResourceType,
+            /// Non-empty only for a not-yet-loaded frame stylesheet. Multiple
+            /// links to the same URL share one response but each gets its own
+            /// CSSOM/materialized owner.
+            stylesheet_links: Vec<(usize, u8)>,
+        }
+
         let started = std::time::Instant::now();
-        if max_ms == 0 || self.js.is_none() {
-            return 0;
+        if self.js.is_none() {
+            return ScreenshotResourceWarmupReport::default();
         }
         let Some(document_url) = self.url.clone() else {
-            return 0;
+            return ScreenshotResourceWarmupReport::default();
         };
         let base_url = self
             .resolve_base_url()
             .unwrap_or_else(|| document_url.clone());
-        let mut candidates = std::collections::BTreeMap::new();
+        let mut candidates: std::collections::BTreeMap<
+            (u32, u8, String, Option<obscura_js::ImageRequestProfile>),
+            WarmupCandidate,
+        > = std::collections::BTreeMap::new();
 
-        if let Some(js) = &self.js {
+        let mut top_inline_import_problems = Vec::new();
+        if let Some(js) = self.js.as_mut() {
+            match js.inline_stylesheet_sources() {
+                Ok(inline_stylesheets) => {
+                    for (style_index, css, _) in inline_stylesheets {
+                        let (imports, rules) = split_css_imports(&css);
+                        if imports.is_empty() {
+                            continue;
+                        }
+                        for import in &imports {
+                            if base_url.join(&import.url).is_err() {
+                                top_inline_import_problems.push(format!(
+                                    "top-level inline stylesheet import URL could not be resolved: {}",
+                                    import.url,
+                                ));
+                            }
+                        }
+                        if let Err(error) = js.execute_script(
+                            "<archive:inline-import>",
+                            &queue_inline_stylesheet_imports_script(
+                                style_index,
+                                &rules,
+                                &imports,
+                                &base_url,
+                                1,
+                            ),
+                        ) {
+                            top_inline_import_problems.push(format!(
+                                "top-level inline stylesheet import setup failed: {error}",
+                            ));
+                        }
+                    }
+                }
+                Err(error) => top_inline_import_problems
+                    .push(format!("top-level inline stylesheet scan failed: {error}",)),
+            }
             for (raw, profile) in js.pending_render_image_urls() {
                 if let Ok(mut url) = url::Url::parse(&raw) {
                     url.set_fragment(None);
-                    candidates.insert((url.to_string(), Some(profile)), ResourceType::Image);
+                    let raw = url.to_string();
+                    if !js.render_image_resource_is_known(&raw, profile) {
+                        candidates.insert(
+                            (0, 0, raw.clone(), Some(profile)),
+                            WarmupCandidate {
+                                raw,
+                                initiator: document_url.clone(),
+                                frame_id: 0,
+                                profile: Some(profile),
+                                kind: ResourceType::Image,
+                                stylesheet_links: Vec::new(),
+                            },
+                        );
+                    }
                 }
             }
-            let css_sources = js
-                .with_dom(|dom| {
-                    let mut sources = Vec::new();
-                    for id in dom.descendants(dom.document()) {
-                        let Some(node) = dom.get_node(id) else {
-                            continue;
-                        };
-                        if node
-                            .as_element()
-                            .is_some_and(|element| element.local.as_ref() == "style")
-                        {
-                            sources.push(dom.text_content(id));
-                        }
-                        if let Some(style) = node.get_attribute("style") {
-                            sources.push(style.to_string());
-                        }
-                        if node
-                            .as_element()
-                            .is_some_and(|element| element.local.as_ref() == "use")
-                        {
-                            if let Some(href) = node
-                                .get_attribute("href")
-                                .or_else(|| node.get_attribute("xlink:href"))
-                            {
-                                sources.push(format!("url({href})"));
-                            }
-                        }
-                    }
-                    sources
-                })
-                .unwrap_or_default();
+            let css_sources = js.render_resource_style_sources();
             for css in css_sources {
                 for raw in css_resource_urls(&css, &base_url) {
                     if let Ok(mut url) = url::Url::parse(&raw) {
                         let kind = render_resource_type(&url);
                         url.set_fragment(None);
-                        candidates.insert((url.to_string(), None), kind);
+                        let raw = url.to_string();
+                        if !js.render_resource_is_known(&raw) {
+                            candidates.insert(
+                                (0, 0, raw.clone(), None),
+                                WarmupCandidate {
+                                    raw,
+                                    initiator: document_url.clone(),
+                                    frame_id: 0,
+                                    profile: None,
+                                    kind,
+                                    stylesheet_links: Vec::new(),
+                                },
+                            );
+                        }
                     }
                 }
             }
-            candidates.retain(|(url, profile), _| match profile {
-                Some(profile) => !js.render_image_resource_is_known(url, *profile),
-                None => !js.render_resource_is_known(url),
-            });
+            match js.external_stylesheet_urls() {
+                Ok(stylesheets) => {
+                    for (link_index, href, import_depth) in stylesheets {
+                        let Ok(mut url) = base_url.join(&href) else {
+                            top_inline_import_problems.push(format!(
+                                "top-level stylesheet URL could not be resolved: {href}",
+                            ));
+                            continue;
+                        };
+                        url.set_fragment(None);
+                        let raw = url.to_string();
+                        let key = (0, 1, raw.clone(), None);
+                        candidates
+                            .entry(key)
+                            .and_modify(|candidate| {
+                                candidate.stylesheet_links.push((link_index, import_depth));
+                            })
+                            .or_insert_with(|| WarmupCandidate {
+                                raw,
+                                initiator: document_url.clone(),
+                                frame_id: 0,
+                                profile: None,
+                                kind: ResourceType::Stylesheet,
+                                stylesheet_links: vec![(link_index, import_depth)],
+                            });
+                    }
+                }
+                Err(error) => top_inline_import_problems
+                    .push(format!("top-level linked stylesheet scan failed: {error}",)),
+            }
+        }
+        for problem in top_inline_import_problems {
+            self.mark_resource_archive_incomplete(problem);
         }
 
-        candidates.retain(|(url, _), _| {
-            subresource_allowed(Some(&document_url), url) && !self.should_block_url(url)
+        // A frame has its own DOM and render cache. Re-scan every live realm on
+        // every pass: frame scripts commonly install a responsive image,
+        // inline background, or stylesheet only after a timer/postMessage.
+        // The final archive warmup calls this method repeatedly, so a newly
+        // materialized stylesheet's url()/font dependencies are discovered on
+        // the next pass without teaching the renderer a second CSS parser.
+        let mut frame_inline_import_problems = Vec::new();
+        if let Some(js) = self.js.as_mut() {
+            for frame in &self.frames {
+                let frame_id = frame.frame_id();
+                let Ok(initiator) = Url::parse(frame.url()) else {
+                    continue;
+                };
+                for (raw, profile) in frame.pending_render_image_urls() {
+                    if let Ok(mut url) = Url::parse(&raw) {
+                        url.set_fragment(None);
+                        let raw = url.to_string();
+                        candidates.insert(
+                            (frame_id, 0, raw.clone(), Some(profile)),
+                            WarmupCandidate {
+                                raw,
+                                initiator: initiator.clone(),
+                                frame_id,
+                                profile: Some(profile),
+                                kind: ResourceType::Image,
+                                stylesheet_links: Vec::new(),
+                            },
+                        );
+                    }
+                }
+
+                let style_base = frame
+                    .document_base_url(js)
+                    .unwrap_or_else(|| initiator.clone());
+                match frame.inline_stylesheet_sources(js) {
+                    Ok(inline_stylesheets) => {
+                        for (style_index, css, _) in inline_stylesheets {
+                            let (imports, rules) = split_css_imports(&css);
+                            if imports.is_empty() {
+                                continue;
+                            }
+                            for import in &imports {
+                                if style_base.join(&import.url).is_err() {
+                                    frame_inline_import_problems.push(format!(
+                                        "frame {frame_id} inline stylesheet import URL could not be resolved: {}",
+                                        import.url,
+                                    ));
+                                }
+                            }
+                            if let Err(error) = frame.execute_script(
+                                js,
+                                &queue_inline_stylesheet_imports_script(
+                                    style_index,
+                                    &rules,
+                                    &imports,
+                                    &style_base,
+                                    1,
+                                ),
+                            ) {
+                                frame_inline_import_problems.push(format!(
+                                    "frame {frame_id} inline stylesheet import setup failed: {error}",
+                                ));
+                            }
+                        }
+                    }
+                    Err(error) => frame_inline_import_problems.push(format!(
+                        "frame {frame_id} inline stylesheet scan failed: {error}",
+                    )),
+                }
+                for css in frame.render_resource_style_sources() {
+                    for raw in css_resource_urls(&css, &style_base) {
+                        if let Ok(mut url) = Url::parse(&raw) {
+                            let kind = render_resource_type(&url);
+                            url.set_fragment(None);
+                            let raw = url.to_string();
+                            if !frame.render_resource_is_known(&raw) {
+                                candidates.insert(
+                                    (frame_id, 0, raw.clone(), None),
+                                    WarmupCandidate {
+                                        raw,
+                                        initiator: initiator.clone(),
+                                        frame_id,
+                                        profile: None,
+                                        kind,
+                                        stylesheet_links: Vec::new(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+
+                for (link_index, _, raw, import_depth) in frame.external_stylesheet_urls(js) {
+                    let Ok(mut url) = Url::parse(&raw) else {
+                        continue;
+                    };
+                    url.set_fragment(None);
+                    let raw = url.to_string();
+                    let key = (frame_id, 1, raw.clone(), None);
+                    candidates
+                        .entry(key)
+                        .and_modify(|candidate| {
+                            candidate.stylesheet_links.push((link_index, import_depth));
+                        })
+                        .or_insert_with(|| WarmupCandidate {
+                            raw,
+                            initiator: initiator.clone(),
+                            frame_id,
+                            profile: None,
+                            kind: ResourceType::Stylesheet,
+                            stylesheet_links: vec![(link_index, import_depth)],
+                        });
+                }
+            }
+        }
+        for problem in frame_inline_import_problems {
+            self.mark_resource_archive_incomplete(problem);
+        }
+
+        candidates.retain(|_, candidate| {
+            subresource_allowed(Some(&candidate.initiator), &candidate.raw)
+                && !self.should_block_url(&candidate.raw)
         });
+        let discovered = candidates.len();
+        if max_ms == 0 {
+            return ScreenshotResourceWarmupReport {
+                discovered,
+                remaining: discovered,
+                ..ScreenshotResourceWarmupReport::default()
+            };
+        }
         if candidates.len() > 128 {
             candidates = candidates.into_iter().take(128).collect();
         }
         if candidates.is_empty() {
-            return 0;
+            return ScreenshotResourceWarmupReport::default();
         }
 
-        let requested: Vec<(String, Option<obscura_js::ImageRequestProfile>, ResourceType)> =
-            candidates
-                .into_iter()
-                .map(|((url, profile), kind)| (url, profile, kind))
-                .collect();
+        let requested: Vec<WarmupCandidate> = candidates.into_values().collect();
+        let attempted = requested.len();
         let client = self.http_client.clone();
         #[cfg(feature = "stealth")]
         let stealth_client = self.stealth_client.clone();
         let callbacks = self.callbacks.clone();
-        let initiator = document_url.clone();
         use futures::StreamExt as _;
-        let requests = futures::stream::iter(requested.into_iter().map(|(raw, profile, kind)| {
+        let requests = futures::stream::iter(requested.into_iter().map(|candidate| {
             let client = client.clone();
             #[cfg(feature = "stealth")]
             let stealth_client = stealth_client.clone();
             let callbacks = callbacks.clone();
-            let initiator = initiator.clone();
             async move {
-                let parsed = url::Url::parse(&raw).expect("validated render resource URL");
-                let mut request = ResourceRequest::subresource(kind, &initiator);
-                match profile {
+                let parsed =
+                    url::Url::parse(&candidate.raw).expect("validated render resource URL");
+                let mut request =
+                    ResourceRequest::subresource(candidate.kind, &candidate.initiator)
+                        .in_frame(candidate.frame_id);
+                match candidate.profile {
                     Some(obscura_js::ImageRequestProfile::CorsSameOrigin) => {
                         request.mode = obscura_net::RequestMode::Cors;
                         request.credentials = obscura_net::RequestCredentials::SameOrigin;
@@ -3298,60 +5903,278 @@ impl Page {
                 let result = client
                     .fetch_resource_with_callbacks(&parsed, request, Some(&callbacks))
                     .await;
-                (raw, profile, kind, result)
+                (candidate, result)
             }
         }))
         .buffer_unordered(16);
         futures::pin_mut!(requests);
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(max_ms);
         let mut loaded = 0usize;
+        let mut failed = 0usize;
+        let mut timed_out = 0usize;
+        let mut fetched_stylesheets = Vec::new();
         loop {
             match tokio::time::timeout_at(deadline, requests.next()).await {
-                Ok(Some((raw, profile, kind, result))) => {
-                    let outcome = match result {
+                Ok(Some((candidate, result))) => {
+                    let mut outcome = None;
+                    let mut successful = false;
+                    match result {
                         Ok(response) => {
                             self.record_network_event_with_body(
                                 response.url.as_str(),
                                 "GET",
-                                match kind {
+                                match candidate.kind {
+                                    ResourceType::Stylesheet => "Stylesheet",
                                     ResourceType::Font => "Font",
                                     _ => "Image",
                                 },
                                 response.status,
                                 &response.headers,
                                 &response.body,
-                                true,
+                                candidate.kind != ResourceType::Stylesheet,
                             );
+                            if candidate.kind == ResourceType::Stylesheet
+                                && (200..300).contains(&response.status)
+                            {
+                                fetched_stylesheets.push((candidate, response));
+                                continue;
+                            }
                             if (200..300).contains(&response.status) {
-                                loaded += 1;
-                                Some(response.body)
-                            } else {
-                                None
+                                successful = true;
+                                outcome = Some(response.body);
+                            } else if candidate.kind == ResourceType::Stylesheet {
+                                let owner = if candidate.frame_id == 0 {
+                                    "top-level".to_string()
+                                } else {
+                                    format!("frame {}", candidate.frame_id)
+                                };
+                                self.mark_resource_archive_incomplete(format!(
+                                    "{owner} stylesheet {} returned HTTP {}",
+                                    candidate.raw, response.status,
+                                ));
+                            } else if candidate.frame_id != 0 {
+                                self.mark_resource_archive_incomplete(format!(
+                                    "frame {} resource {} returned HTTP {}",
+                                    candidate.frame_id, candidate.raw, response.status,
+                                ));
                             }
                         }
-                        Err(_) => None,
-                    };
-                    if let Some(js) = &mut self.js {
-                        match profile {
-                            Some(profile) => {
-                                js.seed_render_image_resource(raw, profile, outcome)
+                        Err(error) => {
+                            if candidate.kind == ResourceType::Stylesheet {
+                                let owner = if candidate.frame_id == 0 {
+                                    "top-level".to_string()
+                                } else {
+                                    format!("frame {}", candidate.frame_id)
+                                };
+                                self.mark_resource_archive_incomplete(format!(
+                                    "{owner} stylesheet fetch failed: {}: {}",
+                                    candidate.raw, error,
+                                ));
+                            } else if candidate.frame_id != 0 {
+                                self.mark_resource_archive_incomplete(format!(
+                                    "frame {} resource fetch failed: {}: {}",
+                                    candidate.frame_id, candidate.raw, error,
+                                ));
                             }
-                            None => js.seed_render_resource(raw, outcome),
+                        }
+                    }
+                    if successful {
+                        loaded += 1;
+                    } else {
+                        failed += 1;
+                    }
+                    if candidate.kind != ResourceType::Stylesheet {
+                        if candidate.frame_id == 0 {
+                            if let Some(js) = &mut self.js {
+                                match candidate.profile {
+                                    Some(profile) => js.seed_render_image_resource(
+                                        candidate.raw,
+                                        profile,
+                                        outcome,
+                                    ),
+                                    None => js.seed_render_resource(candidate.raw, outcome),
+                                }
+                            }
+                        } else if let Some(frame) = self
+                            .frames
+                            .iter()
+                            .find(|frame| frame.frame_id() == candidate.frame_id)
+                        {
+                            match candidate.profile {
+                                Some(profile) => frame.seed_render_image_resource(
+                                    candidate.raw,
+                                    profile,
+                                    outcome,
+                                ),
+                                None => frame.seed_render_resource(candidate.raw, outcome),
+                            }
                         }
                     }
                 }
-                Ok(None) | Err(_) => break,
+                Ok(None) => break,
+                Err(_) => {
+                    timed_out =
+                        attempted.saturating_sub(loaded + failed + fetched_stylesheets.len());
+                    break;
+                }
             }
         }
         // A deadline drops unfinished futures without negative-caching them,
         // so a later warmup can retry slow resources.
         drop(requests);
-        tracing::debug!(
+
+        // Materialize every fetched sheet before inserting any synthetic
+        // import links. Link indices are stable during this phase; inserting
+        // imports only afterwards (in descending owner order) prevents one
+        // stylesheet from shifting another response's owner.
+        struct ImportedStylesheet {
+            frame_id: u32,
+            link_index: usize,
+            import_depth: u8,
+            imports: Vec<StylesheetImport>,
+            response_url: Url,
+            requested_url: String,
+        }
+        let mut imported_stylesheets = Vec::new();
+        for (candidate, response) in fetched_stylesheets {
+            let css = obscura_net::decode_non_html(&response.body, response.content_type());
+            let (imports, rules) = split_css_imports(&css);
+            let rules = rebase_css_urls(&rules, &response.url);
+            let materialized = if candidate.frame_id == 0 {
+                match self.js.as_mut() {
+                    Some(js) => {
+                        candidate
+                            .stylesheet_links
+                            .iter()
+                            .try_for_each(|(link_index, _)| {
+                                js.execute_script(
+                                    "<archive:stylesheet>",
+                                    &materialize_linked_stylesheet_script(*link_index, &rules),
+                                )
+                            })
+                    }
+                    None => Err("top-level JavaScript runtime disappeared".to_string()),
+                }
+            } else {
+                let frame_index = self
+                    .frames
+                    .iter()
+                    .position(|frame| frame.frame_id() == candidate.frame_id);
+                match (frame_index, self.js.as_mut()) {
+                    (Some(frame_index), Some(js)) => candidate
+                        .stylesheet_links
+                        .iter()
+                        .try_for_each(|(link_index, _)| {
+                            self.frames[frame_index].execute_script(
+                                js,
+                                &materialize_linked_stylesheet_script(*link_index, &rules),
+                            )
+                        }),
+                    _ => Err("owning frame disappeared".to_string()),
+                }
+            };
+            match materialized {
+                Ok(()) => {
+                    loaded += 1;
+                    for (link_index, import_depth) in candidate.stylesheet_links {
+                        if import_depth >= MAX_STYLESHEET_IMPORT_DEPTH && !imports.is_empty() {
+                            let owner = if candidate.frame_id == 0 {
+                                "top-level".to_string()
+                            } else {
+                                format!("frame {}", candidate.frame_id)
+                            };
+                            self.mark_resource_archive_incomplete(format!(
+                                "{owner} stylesheet import depth cap reached ({MAX_STYLESHEET_IMPORT_DEPTH}): {}",
+                                response.url,
+                            ));
+                            continue;
+                        }
+                        if !imports.is_empty() {
+                            imported_stylesheets.push(ImportedStylesheet {
+                                frame_id: candidate.frame_id,
+                                link_index,
+                                import_depth,
+                                imports: imports.clone(),
+                                response_url: response.url.clone(),
+                                requested_url: candidate.raw.clone(),
+                            });
+                        }
+                    }
+                }
+                Err(error) => {
+                    failed += 1;
+                    let owner = if candidate.frame_id == 0 {
+                        "top-level".to_string()
+                    } else {
+                        format!("frame {}", candidate.frame_id)
+                    };
+                    self.mark_resource_archive_incomplete(format!(
+                        "{owner} stylesheet materialization failed for {}: {}",
+                        candidate.raw, error,
+                    ));
+                }
+            }
+        }
+        imported_stylesheets.sort_by(|left, right| {
+            left.frame_id
+                .cmp(&right.frame_id)
+                .then_with(|| right.link_index.cmp(&left.link_index))
+        });
+        for imported in imported_stylesheets {
+            let code = queue_stylesheet_imports_script(
+                imported.link_index,
+                &imported.imports,
+                &imported.response_url,
+                imported.import_depth.saturating_add(1),
+            );
+            let queued = if imported.frame_id == 0 {
+                match self.js.as_mut() {
+                    Some(js) => js.execute_script("<archive:stylesheet-import>", &code),
+                    None => Err("top-level JavaScript runtime disappeared".to_string()),
+                }
+            } else {
+                let frame_index = self
+                    .frames
+                    .iter()
+                    .position(|frame| frame.frame_id() == imported.frame_id);
+                match (frame_index, self.js.as_mut()) {
+                    (Some(frame_index), Some(js)) => {
+                        self.frames[frame_index].execute_script(js, &code)
+                    }
+                    _ => Err("owning frame disappeared".to_string()),
+                }
+            };
+            if let Err(error) = queued {
+                let owner = if imported.frame_id == 0 {
+                    "top-level".to_string()
+                } else {
+                    format!("frame {}", imported.frame_id)
+                };
+                self.mark_resource_archive_incomplete(format!(
+                    "{owner} stylesheet import setup failed for {}: {}",
+                    imported.requested_url, error,
+                ));
+            }
+        }
+        let report = ScreenshotResourceWarmupReport {
+            discovered,
+            attempted,
             loaded,
+            failed,
+            timed_out,
+            remaining: discovered.saturating_sub(loaded + failed),
+        };
+        tracing::debug!(
+            discovered = report.discovered,
+            attempted = report.attempted,
+            loaded = report.loaded,
+            failed = report.failed,
+            timed_out = report.timed_out,
+            remaining = report.remaining,
             elapsed_ms = started.elapsed().as_millis(),
             "prepared screenshot resources through page transport"
         );
-        loaded
+        report
     }
 
     /// Rasterize the current DOM to PNG bytes at `viewport` (CSS pixels), when
@@ -3435,7 +6258,7 @@ impl Page {
                 self.capture_surface_color(),
             )
         })
-            .flatten()
+        .flatten()
     }
 
     /// Rasterize an immutable document-space rectangle from the page's retained
@@ -3540,13 +6363,18 @@ impl Page {
             .unwrap_or((0.0, 0.0))
     }
 
-    /// Absolute URLs the page pulled in via fetch()/XHR (issue #301). Empty
-    /// when the page has no live JS runtime.
+    /// Absolute URLs pulled in through fetch/XHR or Image by the page and its
+    /// child frames (issue #301). Empty when no live realm fetched a resource.
     pub fn fetched_urls(&self) -> Vec<String> {
-        self.js
+        let mut urls = self
+            .js
             .as_ref()
             .map(|js| js.fetched_urls())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        for frame in &self.frames {
+            urls.extend(frame.fetched_urls());
+        }
+        urls
     }
 
     /// Move network events recorded for script-initiated requests
@@ -3650,9 +6478,9 @@ impl Page {
         return_by_value: bool,
         await_promise: bool,
     ) -> obscura_js::runtime::RemoteObjectInfo {
-        if let Some(js) = &mut self.js {
-            match js
-                .evaluate_for_cdp(expression, return_by_value, await_promise)
+        if self.js.is_some() {
+            match self
+                .evaluate_for_cdp_with_timeout(expression, return_by_value, await_promise, 30_000)
                 .await
             {
                 Ok(info) => info,
@@ -3693,17 +6521,70 @@ impl Page {
         await_promise: bool,
         await_timeout_ms: u64,
     ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
-        if let Some(js) = &mut self.js {
-            js.evaluate_for_cdp_with_timeout(
-                expression,
-                return_by_value,
-                await_promise,
-                await_timeout_ms,
-            )
-            .await
-        } else {
+        let deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_millis(await_timeout_ms);
+        self.evaluate_for_cdp_until(
+            expression,
+            return_by_value,
+            await_promise,
+            deadline,
+            await_timeout_ms,
+        )
+        .await
+    }
+
+    fn remaining_cdp_budget(
+        deadline: tokio::time::Instant,
+        operation: &str,
+        timeout_ms: u64,
+    ) -> Result<std::time::Duration, String> {
+        deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| format!("{operation} exceeded its {timeout_ms}ms command budget"))
+    }
+
+    fn cdp_budget_millis(remaining: std::time::Duration) -> u64 {
+        u64::try_from(remaining.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1)
+    }
+
+    fn cleanup_cdp_await_sentinel(&mut self, await_key_json: &str) {
+        if let Some(js) = self.js.as_mut() {
+            // Cleanup is deliberately bounded on its own. It must run even when
+            // the caller's deadline has just expired, otherwise every ordinary
+            // CDP timeout leaks a page-global result cell and its continuation.
+            let _ = js.evaluate_with_timeout(
+                &format!("delete globalThis[{await_key_json}]"),
+                std::time::Duration::from_millis(100),
+            );
+        }
+    }
+
+    fn remaining_cdp_await_budget(
+        &mut self,
+        deadline: tokio::time::Instant,
+        timeout_ms: u64,
+        await_key_json: &str,
+    ) -> Result<std::time::Duration, String> {
+        Self::remaining_cdp_budget(deadline, "Runtime.evaluate", timeout_ms).map_err(|error| {
+            self.cleanup_cdp_await_sentinel(await_key_json);
+            error
+        })
+    }
+
+    async fn evaluate_for_cdp_until(
+        &mut self,
+        expression: &str,
+        return_by_value: bool,
+        await_promise: bool,
+        deadline: tokio::time::Instant,
+        await_timeout_ms: u64,
+    ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
+        if self.js.is_none() {
             let value = self.evaluate(expression);
-            Ok(obscura_js::runtime::RemoteObjectInfo {
+            return Ok(obscura_js::runtime::RemoteObjectInfo {
                 js_type: match &value {
                     serde_json::Value::String(_) => "string".into(),
                     serde_json::Value::Number(_) => "number".into(),
@@ -3715,8 +6596,203 @@ impl Page {
                 description: String::new(),
                 object_id: None,
                 value: Some(value),
-            })
+            });
         }
+        if !await_promise {
+            let remaining =
+                Self::remaining_cdp_budget(deadline, "Runtime.evaluate", await_timeout_ms)?;
+            let js = self.js.as_mut().expect("runtime checked above");
+            let watchdog = js.arm_watchdog(remaining);
+            let result = js
+                .evaluate_for_cdp_with_timeout(
+                    expression,
+                    return_by_value,
+                    false,
+                    Self::cdp_budget_millis(remaining),
+                )
+                .await;
+            let watchdog_fired = js.disarm_watchdog(watchdog);
+            if watchdog_fired {
+                return Err(format!(
+                    "Runtime.evaluate exceeded its {await_timeout_ms}ms command budget"
+                ));
+            }
+            return result;
+        }
+
+        // An awaited expression may depend on iframe.onload. Child realms are
+        // attached by Page, between runtime turns, rather than from a JS op.
+        // Letting ObscuraJsRuntime own the complete await would therefore
+        // deadlock: the promise waits for the owner event while Page cannot
+        // attach and complete the child until the await returns. Store the
+        // result behind a unique page-global sentinel, then alternate one
+        // runtime task with the ordinary frame lifecycle driver.
+        let await_id = NEXT_CDP_PAGE_AWAIT_ID.fetch_add(1, Ordering::Relaxed);
+        let await_key = format!("__obscura_page_await_{await_id}");
+        let await_key_json = serde_json::to_string(&await_key)
+            .map_err(|error| format!("could not encode CDP await key: {error}"))?;
+        let cleaned_expression = expression
+            .trim()
+            .trim_end_matches(|character: char| character == ';' || character.is_whitespace());
+        let start_script = format!(
+            "(function() {{\n\
+                const key = {await_key_json};\n\
+                globalThis[key] = {{ done: false, rejected: false, value: undefined }};\n\
+                (async function() {{\n\
+                    try {{\n\
+                        globalThis[key].value = await (\n{cleaned_expression}\n);\n\
+                    }} catch (error) {{\n\
+                        globalThis[key].rejected = true;\n\
+                        globalThis[key].value = error;\n\
+                    }} finally {{\n\
+                        globalThis[key].done = true;\n\
+                    }}\n\
+                }})();\n\
+                return key;\n\
+            }})()"
+        );
+        let start_result =
+            match self.remaining_cdp_await_budget(deadline, await_timeout_ms, &await_key_json) {
+                Ok(remaining) => self
+                    .js
+                    .as_mut()
+                    .expect("runtime checked above")
+                    .evaluate_with_timeout(&start_script, remaining),
+                Err(error) => Err(error),
+            };
+        if let Err(error) = start_result {
+            self.cleanup_cdp_await_sentinel(&await_key_json);
+            return Err(format!("Runtime.evaluate could not start: {error}"));
+        }
+
+        let done_script = format!("globalThis[{await_key_json}]?.done === true");
+        loop {
+            let remaining =
+                match Self::remaining_cdp_budget(deadline, "Runtime.evaluate", await_timeout_ms) {
+                    Ok(remaining) => remaining,
+                    Err(_) => {
+                        self.cleanup_cdp_await_sentinel(&await_key_json);
+                        return Err(format!(
+                            "Runtime.evaluate promise did not settle within {await_timeout_ms}ms"
+                        ));
+                    }
+                };
+            let done = match self
+                .js
+                .as_mut()
+                .ok_or_else(|| "JavaScript runtime disappeared".to_string())?
+                .evaluate_with_timeout(&done_script, remaining)
+            {
+                Ok(value) => value.as_bool().unwrap_or(false),
+                Err(error) => {
+                    self.cleanup_cdp_await_sentinel(&await_key_json);
+                    return Err(format!("Runtime.evaluate completion probe failed: {error}"));
+                }
+            };
+            if done {
+                break;
+            }
+
+            let remaining =
+                self.remaining_cdp_await_budget(deadline, await_timeout_ms, &await_key_json)?;
+            // Tokio can cancel a parked network/timer/frame future at the
+            // absolute command deadline. The V8 watchdog covers the part where
+            // one callback or microtask keeps this thread inside V8 and Tokio
+            // cannot observe that deadline.
+            let turn_watchdog = self
+                .js
+                .as_mut()
+                .ok_or_else(|| "JavaScript runtime disappeared".to_string())?
+                .arm_watchdog(remaining);
+            let turn =
+                tokio::time::timeout_at(deadline, self.run_autonomous_event_loop_turn()).await;
+            let turn_watchdog_fired = self
+                .js
+                .as_mut()
+                .is_some_and(|js| js.disarm_watchdog(turn_watchdog));
+            let reached_idle = match turn {
+                Ok(Ok(reached_idle)) if !turn_watchdog_fired => reached_idle,
+                Ok(Err(error)) if !turn_watchdog_fired => {
+                    self.cleanup_cdp_await_sentinel(&await_key_json);
+                    return Err(error);
+                }
+                Ok(_) | Err(_) => {
+                    self.cleanup_cdp_await_sentinel(&await_key_json);
+                    return Err(format!(
+                        "Runtime.evaluate promise did not settle within {await_timeout_ms}ms"
+                    ));
+                }
+            };
+            if self.lifecycle == LifecycleState::Failed {
+                self.cleanup_cdp_await_sentinel(&await_key_json);
+                return Err("page lifecycle failed while awaiting Runtime.evaluate".to_string());
+            }
+            if reached_idle {
+                let remaining =
+                    self.remaining_cdp_await_budget(deadline, await_timeout_ms, &await_key_json)?;
+                tokio::time::sleep(remaining.min(tokio::time::Duration::from_millis(1))).await;
+            }
+        }
+
+        let rejected_script = format!("globalThis[{await_key_json}].rejected === true");
+        let remaining =
+            self.remaining_cdp_await_budget(deadline, await_timeout_ms, &await_key_json)?;
+        let rejected = match self
+            .js
+            .as_mut()
+            .ok_or_else(|| "JavaScript runtime disappeared".to_string())?
+            .evaluate_with_timeout(&rejected_script, remaining)
+        {
+            Ok(value) => value.as_bool().unwrap_or(false),
+            Err(error) => {
+                self.cleanup_cdp_await_sentinel(&await_key_json);
+                return Err(format!("Runtime.evaluate rejection probe failed: {error}"));
+            }
+        };
+        if rejected {
+            let error_script = format!(
+                "String(globalThis[{await_key_json}].value && \
+                 (globalThis[{await_key_json}].value.message || \
+                  globalThis[{await_key_json}].value))"
+            );
+            let remaining =
+                self.remaining_cdp_await_budget(deadline, await_timeout_ms, &await_key_json)?;
+            let message = self
+                .js
+                .as_mut()
+                .ok_or_else(|| "JavaScript runtime disappeared".to_string())?
+                .evaluate_with_timeout(&error_script, remaining)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_default();
+            self.cleanup_cdp_await_sentinel(&await_key_json);
+            return Err(format!("Promise rejected: {message}"));
+        }
+
+        let result_expression = format!("globalThis[{await_key_json}].value");
+        let remaining =
+            self.remaining_cdp_await_budget(deadline, await_timeout_ms, &await_key_json)?;
+        let js = self
+            .js
+            .as_mut()
+            .ok_or_else(|| "JavaScript runtime disappeared".to_string())?;
+        let result_watchdog = js.arm_watchdog(remaining);
+        let info = js
+            .evaluate_for_cdp_with_timeout(
+                &result_expression,
+                return_by_value,
+                false,
+                Self::cdp_budget_millis(remaining),
+            )
+            .await;
+        let result_watchdog_fired = js.disarm_watchdog(result_watchdog);
+        self.cleanup_cdp_await_sentinel(&await_key_json);
+        if result_watchdog_fired {
+            return Err(format!(
+                "Runtime.evaluate exceeded its {await_timeout_ms}ms command budget"
+            ));
+        }
+        info
     }
 
     pub async fn call_function_on_for_cdp(
@@ -3727,14 +6803,15 @@ impl Page {
         return_by_value: bool,
         await_promise: bool,
     ) -> obscura_js::runtime::RemoteObjectInfo {
-        if let Some(js) = &mut self.js {
-            match js
-                .call_function_on_for_cdp(
+        if self.js.is_some() {
+            match self
+                .call_function_on_for_cdp_with_timeout(
                     function_declaration,
                     object_id,
                     args,
                     return_by_value,
                     await_promise,
+                    30_000,
                 )
                 .await
             {
@@ -3772,16 +6849,89 @@ impl Page {
         await_promise: bool,
         await_timeout_ms: u64,
     ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
+        let deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_millis(await_timeout_ms);
+        if !await_promise {
+            let remaining =
+                Self::remaining_cdp_budget(deadline, "Runtime.callFunctionOn", await_timeout_ms)?;
+            let js = self.js.as_mut().ok_or("JavaScript runtime unavailable")?;
+            let watchdog = js.arm_watchdog(remaining);
+            let result = js
+                .call_function_on_for_cdp_with_timeout(
+                    function_declaration,
+                    object_id,
+                    args,
+                    return_by_value,
+                    false,
+                    Self::cdp_budget_millis(remaining),
+                )
+                .await;
+            let watchdog_fired = js.disarm_watchdog(watchdog);
+            if watchdog_fired {
+                return Err(format!(
+                    "Runtime.callFunctionOn exceeded its {await_timeout_ms}ms command budget"
+                ));
+            }
+            return result;
+        }
+
+        // Start the function synchronously and retain its raw return value as
+        // an ordinary remote object. Await that value through Page's generic
+        // promise driver, which alternates runtime turns with `advance_frames`.
+        // This is the callFunctionOn counterpart of Runtime.evaluate's iframe
+        // interleave and prevents a Promise waiting on iframe.onload from
+        // deadlocking the native frame queue.
+        let remaining =
+            Self::remaining_cdp_budget(deadline, "Runtime.callFunctionOn", await_timeout_ms)?;
         let js = self.js.as_mut().ok_or("JavaScript runtime unavailable")?;
-        js.call_function_on_for_cdp_with_timeout(
-            function_declaration,
-            object_id,
-            args,
-            return_by_value,
-            await_promise,
-            await_timeout_ms,
-        )
-        .await
+        let watchdog = js.arm_watchdog(remaining);
+        let pending = js
+            .call_function_on_for_cdp_with_timeout(
+                function_declaration,
+                object_id,
+                args,
+                false,
+                false,
+                Self::cdp_budget_millis(remaining),
+            )
+            .await;
+        let watchdog_fired = js.disarm_watchdog(watchdog);
+        if watchdog_fired {
+            return Err(format!(
+                "Runtime.callFunctionOn exceeded its {await_timeout_ms}ms command budget"
+            ));
+        }
+        let pending = pending?;
+        let pending_object_id = pending
+            .object_id
+            .ok_or_else(|| "Runtime.callFunctionOn did not retain its return value".to_string())?;
+        let pending_expression = match self
+            .js
+            .as_ref()
+            .and_then(|js| js.object_expression_for_cdp(&pending_object_id))
+        {
+            Some(expression) => expression,
+            None => {
+                if let Some(js) = self.js.as_mut() {
+                    js.release_object(&pending_object_id);
+                }
+                return Err("Runtime.callFunctionOn return object disappeared".to_string());
+            }
+        };
+
+        let result = self
+            .evaluate_for_cdp_until(
+                &pending_expression,
+                return_by_value,
+                true,
+                deadline,
+                await_timeout_ms,
+            )
+            .await;
+        if let Some(js) = self.js.as_mut() {
+            js.release_object(&pending_object_id);
+        }
+        result
     }
 
     pub fn set_blocked_urls(&mut self, patterns: Vec<String>) {
@@ -4027,6 +7177,35 @@ impl Page {
         self.preload_scripts = scripts;
     }
 
+    /// Replace the CDP Runtime bindings that must exist in every new page and
+    /// child-frame realm before author scripts execute.
+    pub fn set_preload_bindings(&mut self, bindings: Vec<String>) {
+        self.preload_bindings = bindings;
+    }
+
+    /// Install one CDP Runtime binding now and retain it for future documents.
+    pub fn add_preload_binding(&mut self, name: &str) -> Result<(), String> {
+        if !self.preload_bindings.iter().any(|item| item == name) {
+            self.preload_bindings.push(name.to_string());
+        }
+        if let Some(js) = &mut self.js {
+            js.install_cdp_binding(name)?;
+        }
+        Ok(())
+    }
+
+    /// Remove a CDP Runtime binding from this document and future documents.
+    pub fn remove_preload_binding(&mut self, name: &str) {
+        self.preload_bindings.retain(|item| item != name);
+        if let Some(js) = &mut self.js {
+            let encoded = serde_json::to_string(name).unwrap_or_else(|_| "\"\"".to_string());
+            let _ = js.execute_script(
+                "<remove-binding>",
+                &format!("delete globalThis[{encoded}];"),
+            );
+        }
+    }
+
     /// Append a script that runs in the page before any of the page's own
     /// `<script>` tags, matching CDP `Page.addScriptToEvaluateOnNewDocument`.
     /// Takes effect on the next navigation (`goto` / `navigate*`).
@@ -4078,6 +7257,87 @@ impl Page {
     /// one was removed.
     pub fn off_response(&mut self, id: u64) -> bool {
         self.callbacks.remove_response(id)
+    }
+
+    /// Retain byte-exact responses for the current and subsequent top-level
+    /// documents. Each committed top-level navigation resets the archive, so
+    /// after HTTP or JavaScript redirects it contains only the final page and
+    /// resources initiated by that page and its child frames.
+    pub fn enable_resource_capture(&mut self, limits: ResourceCaptureLimits) {
+        if let Some(state) = &self.resource_capture {
+            let generation = self.callbacks.document_generation();
+            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+            state.limits = limits;
+            state.begin_document(generation);
+            return;
+        }
+
+        let generation = self.callbacks.document_generation();
+        let state = Arc::new(std::sync::Mutex::new(ResourceCaptureState::new(
+            limits, generation,
+        )));
+        let observed = Arc::clone(&state);
+        let callback_id = self
+            .callbacks
+            .add_response(Arc::new(move |request, response| {
+                observed
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .record(request, response);
+            }));
+        self.resource_capture = Some(state);
+        self.resource_capture_callback_id = Some(callback_id);
+    }
+
+    fn retain_final_resource_scope(&mut self, mut capture: ResourceCapture) -> ResourceCapture {
+        // A frame can remove itself in its final script turn, after its
+        // responses have already been captured. Refresh realm liveness at the
+        // archive boundary so those superseded browsing contexts do not leak
+        // into a snapshot of the final page.
+        self.release_detached_frames();
+        let live_frame_ids: std::collections::HashSet<u32> =
+            self.frames.iter().map(|frame| frame.frame_id()).collect();
+        let document_generation = self.callbacks.document_generation();
+        capture.resources.retain(|resource| {
+            resource.document_generation == document_generation
+                && (resource.frame_id == 0 || live_frame_ids.contains(&resource.frame_id))
+        });
+        capture.document_generation = document_generation;
+        capture.total_bytes = capture.resources.iter().fold(0usize, |total, resource| {
+            total.saturating_add(resource.body.len())
+        });
+        capture
+    }
+
+    /// Drain the final document's captured responses while keeping capture
+    /// enabled for later requests or navigations.
+    pub fn take_resource_capture(&mut self) -> Option<ResourceCapture> {
+        let capture = {
+            let state = self.resource_capture.as_ref()?;
+            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+            let generation = self.callbacks.document_generation();
+            std::mem::replace(
+                &mut state.capture,
+                ResourceCapture {
+                    document_generation: generation,
+                    ..ResourceCapture::default()
+                },
+            )
+        };
+        Some(self.retain_final_resource_scope(capture))
+    }
+
+    /// Stop lossless response retention and return everything captured so far.
+    pub fn disable_resource_capture(&mut self) -> Option<ResourceCapture> {
+        if let Some(callback_id) = self.resource_capture_callback_id.take() {
+            self.callbacks.remove_response(callback_id);
+        }
+        let state = self.resource_capture.take()?;
+        let capture = {
+            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+            std::mem::take(&mut state.capture)
+        };
+        Some(self.retain_final_resource_scope(capture))
     }
 
     pub async fn process_pending_navigation(&mut self) -> Result<bool, PageError> {
@@ -4169,14 +7429,16 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        css_resource_urls, linked_stylesheet_requests, materialize_linked_stylesheet_script,
-        materialize_stylesheet_graph, navigation_referrer, navigation_timeout_from_env_value,
-        parse_import_url, rebase_css_urls, script_response_is_executable, split_css_imports,
-        truncate_on_char_boundary, url_matches_cdp_pattern, LoadedStylesheet, StylesheetImport,
-    };
     #[cfg(feature = "render")]
     use super::remaining_settle_resource_warmup_ms;
+    use super::{
+        css_resource_urls, linked_stylesheet_requests, materialize_linked_stylesheet_script,
+        materialize_parser_stylesheet_script_with_token, materialize_stylesheet_graph,
+        navigation_referrer, navigation_timeout_from_env_value, parse_import_url,
+        parser_stylesheet_requests, rebase_css_urls, script_response_is_executable,
+        split_css_imports, truncate_on_char_boundary, url_matches_cdp_pattern, LoadedStylesheet,
+        StylesheetImport, MAX_STYLESHEET_RESOURCES,
+    };
     use base64::Engine as _;
     use obscura_dom::parse_html;
 
@@ -4201,6 +7463,44 @@ mod tests {
     }
 
     #[test]
+    fn parser_stylesheets_keep_the_base_at_each_encounter_point() {
+        let dom = parse_html(
+            r#"<!doctype html><html><head>
+               <link rel="stylesheet" href="before.css">
+               <style>@import "before-import.css";</style>
+               <base href="/shifted/">
+               <link rel="stylesheet" href="after.css">
+               <style>@import "after-import.css";</style>
+               <base href="/ignored/">
+               </head><body></body></html>"#,
+        );
+        let document_url = url::Url::parse("https://example.test/original/page.html").unwrap();
+        let (links, inline_imports, body_order) = parser_stylesheet_requests(&dom, &document_url);
+
+        assert_eq!(
+            links
+                .iter()
+                .map(|link| link.base_url.join(&link.raw_href).unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "https://example.test/original/before.css".to_string(),
+                "https://example.test/shifted/after.css".to_string(),
+            ]
+        );
+        assert_eq!(
+            inline_imports
+                .iter()
+                .map(|item| item.base_url.join(&item.import.url).unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "https://example.test/original/before-import.css".to_string(),
+                "https://example.test/shifted/after-import.css".to_string(),
+            ]
+        );
+        assert!(body_order.is_some());
+    }
+
+    #[test]
     fn css_resource_discovery_ignores_strings_comments_data_and_fragments() {
         let base = url::Url::parse("https://example.test/css/app/main.css").unwrap();
         let css = r#"
@@ -4220,6 +7520,67 @@ mod tests {
                 "https://cdn.test/icon.svg".to_string(),
             ]
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stylesheet_caps_depth_and_fetch_failures_are_archive_diagnostics() {
+        let directory = std::env::temp_dir().join(format!(
+            "obscura-stylesheet-archive-diagnostics-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        for depth in 0..=5 {
+            let css = if depth == 5 {
+                ".leaf { color: green }".to_string()
+            } else {
+                format!(
+                    "@import '{}.css'; .depth-{depth} {{ color: green }}",
+                    depth + 1
+                )
+            };
+            std::fs::write(directory.join(format!("{depth}.css")), css).unwrap();
+        }
+
+        let mut page = frame_page("stylesheet-archive-diagnostics");
+        let document_url = url::Url::from_file_path(directory.join("index.html")).unwrap();
+        page.url = Some(document_url);
+        page.dom = Some(parse_html(
+            "<html><head><link rel=stylesheet href='0.css'></head></html>",
+        ));
+        page.init_js();
+        page.fetch_stylesheets().await;
+        assert!(page
+            .resource_archive_incomplete_reasons()
+            .iter()
+            .any(|reason| reason.contains("stylesheet import depth cap reached (4)")));
+
+        let links = (0..=MAX_STYLESHEET_RESOURCES)
+            .map(|index| {
+                format!(
+                    "<link rel=stylesheet href='file:///obscura-missing-archive-diagnostic-{index}.css'>"
+                )
+            })
+            .collect::<String>();
+        page.dom = Some(parse_html(&format!("<html><head>{links}</head></html>")));
+        page.init_js();
+        page.fetch_stylesheets().await;
+        let reasons = page.resource_archive_incomplete_reasons();
+        assert_eq!(
+            reasons
+                .iter()
+                .filter(|reason| reason.contains("stylesheet resource cap reached"))
+                .count(),
+            1,
+            "the same cap must remain de-duplicated across every refused root",
+        );
+        assert!(reasons
+            .iter()
+            .any(|reason| reason.contains("top-level stylesheet fetch failed:")));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     fn spawn_stylesheet_graph_server(
@@ -4913,20 +8274,71 @@ mod tests {
                     let mut buf = [0u8; 2048];
                     let read = socket.read(&mut buf).await.unwrap_or(0);
                     let request = String::from_utf8_lossy(&buf[..read]).to_string();
-                    let body = if request.starts_with("GET /child.html ") {
-                        "<html><body><script>window.__ran = 'YES';</script></body></html>"
+                    let (content_type, body) = if request.starts_with("GET /child.html ") {
+                        (
+                            "text/html",
+                            "<html><body><script>window.__ran = 'YES';</script></body></html>",
+                        )
                     } else if request.starts_with("GET /plain.html ") {
-                        "<html><body><iframe src=\"/child.html\"></iframe></body></html>"
+                        (
+                            "text/html",
+                            "<html><body><iframe src=\"/child.html\"></iframe></body></html>",
+                        )
+                    } else if request.starts_with("GET /fixed-wait.html ") {
+                        (
+                            "text/html",
+                            "<html><body><script>\
+                             setTimeout(function () {\
+                               var f = document.createElement('iframe');\
+                               f.src = '/async-child.html';\
+                               document.body.appendChild(f);\
+                             }, 100);\
+                             </script></body></html>",
+                        )
+                    } else if request.starts_with("GET /async-child.html ") {
+                        (
+                            "text/html",
+                            "<html><body><script>\
+                             setTimeout(function () {\
+                               fetch('/frame-resource.txt')\
+                                 .then(function (response) { return response.text(); })\
+                                 .then(function (text) { window.__deferredFrameWork = text; });\
+                             }, 100);\
+                             </script></body></html>",
+                        )
+                    } else if request.starts_with("GET /frame-resource.txt ") {
+                        ("text/plain", "FRAME-READY")
+                    } else if request.starts_with("GET /dynamic-frame-parent.html ") {
+                        (
+                            "text/html",
+                            "<html><body><iframe src=\"/dynamic-frame.html\"></iframe></body></html>",
+                        )
+                    } else if request.starts_with("GET /dynamic-frame.html ") {
+                        (
+                            "text/html",
+                            "<html><body><script>\
+                             window.__dynamicFrameLoads = 0;\
+                             var script = document.createElement('script');\
+                             script.src = '/frame-dynamic.js';\
+                             script.onload = function () { window.__dynamicFrameOnload = true; };\
+                             document.body.appendChild(script);\
+                             </script></body></html>",
+                        )
+                    } else if request.starts_with("GET /frame-dynamic.js ") {
+                        ("application/javascript", "window.__dynamicFrameLoads += 1;")
                     } else {
-                        "<html><body><div id=\"host\"></div><script>\
+                        (
+                            "text/html",
+                            "<html><body><div id=\"host\"></div><script>\
                          var r = document.getElementById('host').attachShadow({mode:'closed'});\
                          var f = document.createElement('iframe');\
                          f.src = '/child.html';\
                          r.appendChild(f);\
-                         </script></body></html>"
+                         </script></body></html>",
+                        )
                     };
                     let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
                     let _ = socket.write_all(resp.as_bytes()).await;
@@ -4934,6 +8346,921 @@ mod tests {
             }
         });
         format!("http://{addr}/")
+    }
+
+    fn spawn_redirected_frame_stylesheet_server() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0u8; 4096];
+                let length = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..length]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/");
+                let response = match path {
+                    "/parent.html" => {
+                        let body = "<!doctype html><iframe src=\"/frame/start\"></iframe>";
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len(),
+                        )
+                    }
+                    "/frame/start" => "HTTP/1.1 302 Found\r\nLocation: /frame/final.html\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                    "/frame/final.html" => {
+                        let body = concat!(
+                            "<!doctype html><html><head>",
+                            "<link rel=\"stylesheet\" href=\"frame.css\">",
+                            "<style>@import url('unsupported.css'); .inline-style { mask-image: url(inline.svg); }</style>",
+                            "</head><body>",
+                            "<div class=\"inline-style\" style=\"background-image: url(attribute.svg)\"></div>",
+                            "<script src=\"child.js\"></script>",
+                            "<script>window.__frameCssReady = globalThis.__obscura_css.includes('redirected-frame-sheet');</script>",
+                            "<script type=\"module\" src=\"module.js\"></script>",
+                            "<script>location.href='/later-frame.html';</script>",
+                            "</body></html>",
+                        );
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len(),
+                        )
+                    }
+                    "/frame/frame.css" => {
+                        let body = "body { --redirected-frame-sheet: yes; background-image: url(icon.svg); }";
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/css\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len(),
+                        )
+                    }
+                    "/frame/child.js" => {
+                        let body = "window.__redirectedChildScript = 'loaded';";
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len(),
+                        )
+                    }
+                    "/frame/icon.svg" | "/frame/inline.svg" | "/frame/attribute.svg" => {
+                        let body = format!(
+                            "<svg xmlns=\"http://www.w3.org/2000/svg\"><title>{path}</title></svg>"
+                        );
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len(),
+                        )
+                    }
+                    _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{address}")
+    }
+
+    const FRAME_RENDER_CHILD_HTML: &str = concat!(
+        "<!doctype html><html><head>",
+        "<style>@import '/inline-root.css'; .inline { background-image:url('/inline.svg') }</style>",
+        "</head><body>",
+        "<img src=\"/static.svg\">",
+        "<picture><source media=\"(min-width:1px)\" srcset=\"/picture.svg\">",
+        "<img src=\"/fallback.svg\"></picture>",
+        "<video poster=\"/poster.svg\"></video>",
+        "<script>setTimeout(function(){",
+        "var image=document.createElement('img');image.src='/dynamic.svg';document.body.appendChild(image);",
+        "var style=document.createElement('style');style.textContent=\"@import '/dynamic-inline.css'; .dynamic{background-image:url('/dynamic-style.svg')}\";document.head.appendChild(style);",
+        "var link=document.createElement('link');link.rel='stylesheet';link.href='/late.css';document.head.appendChild(link);",
+        "},25)</script>",
+        "</body></html>",
+    );
+    const FRAME_RENDER_LATE_CSS: &str =
+        "@import '/nested.css'; .linked { background-image:url('/linked.svg') }";
+    const FRAME_RENDER_INLINE_ROOT_CSS: &str =
+        "@import '/inline-nested.css'; .inline-root { background-image:url('/inline-root.svg') }";
+    const FRAME_RENDER_INLINE_NESTED_CSS: &str =
+        ".inline-nested { background-image:url('/inline-nested.svg') }";
+    const FRAME_RENDER_DYNAMIC_INLINE_CSS: &str =
+        ".dynamic-inline { background-image:url('/dynamic-inline.svg') }";
+    const FRAME_RENDER_NESTED_CSS: &str = "@font-face { font-family:nested; src:url('/nested.woff2') } .nested { background-image:url('/nested.svg') }";
+    const FRAME_RENDER_FONT_BYTES: &str = "frame-font-response-bytes";
+
+    fn frame_render_svg_body(path: &str) -> String {
+        format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"2\" height=\"3\"><title>{path}</title></svg>"
+        )
+    }
+
+    fn spawn_frame_render_resource_server() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0u8; 4096];
+                let length = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..length]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/");
+                let (content_type, body) = match path {
+                    "/parent.html" => (
+                        "text/html",
+                        "<!doctype html><iframe src=\"/child.html\"></iframe>".to_string(),
+                    ),
+                    "/top-dynamic.html" => (
+                        "text/html",
+                        concat!(
+                            "<!doctype html><html><head></head><body>",
+                            "<script>setTimeout(function(){",
+                            "var style=document.createElement('style');",
+                            "style.textContent=\"@import '/top-inline-root.css'; .top{background:url('/top-inline.svg')}\";",
+                            "document.head.appendChild(style);",
+                            "},25)</script></body></html>",
+                        )
+                        .to_string(),
+                    ),
+                    "/top-missing.html" => (
+                        "text/html",
+                        concat!(
+                            "<!doctype html><script>setTimeout(function(){",
+                            "var style=document.createElement('style');",
+                            "style.textContent=\"@import '/top-missing.css';\";",
+                            "document.head.appendChild(style);",
+                            "},25)</script>",
+                        )
+                        .to_string(),
+                    ),
+                    "/shadow-parent.html" => (
+                        "text/html",
+                        concat!(
+                            "<!doctype html><div id='host'></div><iframe src='/shadow-frame.html'></iframe>",
+                            "<script>setTimeout(function(){",
+                            "var outer=document.getElementById('host').attachShadow({mode:'closed'});",
+                            "var innerHost=document.createElement('div');outer.appendChild(innerHost);",
+                            "var inner=innerHost.attachShadow({mode:'closed'});",
+                            "var style=document.createElement('style');",
+                            "style.textContent=\".paint{background-image:url('/shadow-top-byte.svg')}\";",
+                            "inner.appendChild(style);",
+                            "},25)</script>",
+                        )
+                        .to_string(),
+                    ),
+                    "/shadow-frame.html" => (
+                        "text/html",
+                        concat!(
+                            "<!doctype html><div><template shadowrootmode='closed'>",
+                            "<div><template shadowrootmode='closed'>",
+                            "<style>.paint{background-image:url('/shadow-frame-byte.svg')}</style>",
+                            "</template></div></template></div>",
+                        )
+                        .to_string(),
+                    ),
+                    "/shadow-unsupported.html" => (
+                        "text/html",
+                        concat!(
+                            "<!doctype html>",
+                            "<div><template shadowrootmode='closed'>",
+                            "<link rel='stylesheet' href='/shadow-link.css'>",
+                            "</template></div><div id='import-host'></div>",
+                            "<script>",
+                            "var root=document.getElementById('import-host').attachShadow({mode:'closed'});",
+                            "var style=document.createElement('style');",
+                            "style.textContent=\"@import '/shadow-import.css'; .paint{color:green}\";",
+                            "root.appendChild(style);",
+                            "</script>",
+                        )
+                        .to_string(),
+                    ),
+                    "/shadow-link.css" | "/shadow-import.css" => (
+                        "text/css",
+                        ".shadow-sheet { color: green }".to_string(),
+                    ),
+                    "/child.html" => (
+                        "text/html",
+                        FRAME_RENDER_CHILD_HTML.to_string(),
+                    ),
+                    "/missing-parent.html" => (
+                        "text/html",
+                        "<!doctype html><iframe src=\"/missing-child.html\"></iframe>"
+                            .to_string(),
+                    ),
+                    "/missing-child.html" => (
+                        "text/html",
+                        "<!doctype html><script>var link=document.createElement('link');link.rel='stylesheet';link.href='/missing.css';document.head.appendChild(link)</script>"
+                            .to_string(),
+                    ),
+                    "/late.css" => (
+                        "text/css",
+                        FRAME_RENDER_LATE_CSS.to_string(),
+                    ),
+                    "/inline-root.css" => (
+                        "text/css",
+                        FRAME_RENDER_INLINE_ROOT_CSS.to_string(),
+                    ),
+                    "/inline-nested.css" => (
+                        "text/css",
+                        FRAME_RENDER_INLINE_NESTED_CSS.to_string(),
+                    ),
+                    "/dynamic-inline.css" => (
+                        "text/css",
+                        FRAME_RENDER_DYNAMIC_INLINE_CSS.to_string(),
+                    ),
+                    "/top-inline-root.css" => (
+                        "text/css",
+                        "@import '/top-inline-nested.css'; .top-root { background-image:url('/top-root.svg') }"
+                            .to_string(),
+                    ),
+                    "/top-inline-nested.css" => (
+                        "text/css",
+                        ".top-nested { background-image:url('/top-nested.svg') }"
+                            .to_string(),
+                    ),
+                    "/nested.css" => (
+                        "text/css",
+                        FRAME_RENDER_NESTED_CSS.to_string(),
+                    ),
+                    "/nested.woff2" => ("font/woff2", FRAME_RENDER_FONT_BYTES.to_string()),
+                    path if path.ends_with(".svg") =>
+                        ("image/svg+xml", frame_render_svg_body(path)),
+                    _ => ("text/plain", "not found".to_string()),
+                };
+                let status = if body == "not found" {
+                    "404 Not Found"
+                } else {
+                    "200 OK"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn spawn_srcdoc_frame_server() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0u8; 4096];
+                let length = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..length]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/");
+                let (status, content_type, body) = match path {
+                    "/parser.html" => (
+                        "200 OK",
+                        "text/html",
+                        concat!(
+                            "<!doctype html><base href='/assets/'>",
+                            "<iframe src='/ignored.html' srcdoc=\"<!doctype html><html><head>",
+                            "<link rel=&quot;stylesheet&quot; href=&quot;parser.css&quot;>",
+                            "<script src=&quot;parser.js&quot;></script></head>",
+                            "<body data-srcdoc=&quot;parser&quot;><img src=&quot;parser.svg&quot;>",
+                            "</body></html>\"></iframe>",
+                        ),
+                    ),
+                    "/dynamic.html" => (
+                        "200 OK",
+                        "text/html",
+                        concat!(
+                            "<!doctype html><base href='/assets/'><iframe id='frame' src='/fallback.html'></iframe>",
+                            "<script>var f=document.getElementById('frame');",
+                            "f.srcdoc='<img src=\"stale.svg\">';",
+                            "f.srcdoc='<body data-srcdoc=\"dynamic\"><img src=\"dynamic.svg\"></body>';",
+                            "</script>",
+                        ),
+                    ),
+                    "/fallback.html" => (
+                        "200 OK",
+                        "text/html",
+                        "<!doctype html><body data-srcdoc='fallback'><img src='/assets/fallback.svg'>",
+                    ),
+                    "/assets/parser.js" => (
+                        "200 OK",
+                        "application/javascript",
+                        "globalThis.__srcdocParserScript = 'ran';",
+                    ),
+                    "/assets/parser.css" => (
+                        "200 OK",
+                        "text/css",
+                        "body { background-image:url('css.svg') }",
+                    ),
+                    path if path.ends_with(".svg") => (
+                        "200 OK",
+                        "image/svg+xml",
+                        "<svg xmlns='http://www.w3.org/2000/svg' width='2' height='3'></svg>",
+                    ),
+                    _ => ("404 Not Found", "text/plain", "not found"),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn srcdoc_frames_inherit_base_capture_resources_and_replace_their_realm() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let origin = spawn_srcdoc_frame_server();
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "srcdoc-frame-lifecycle".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("srcdoc-frame-lifecycle".to_string(), context);
+        page.enable_resource_capture(super::ResourceCaptureLimits::default());
+        page.navigate(&format!("{origin}/parser.html"))
+            .await
+            .unwrap();
+        page.settle_for_duration(50).await;
+        for _ in 0..3 {
+            let report = page.prepare_screenshot_resources_with_report(1_000).await;
+            assert_eq!(report.failed, 0, "srcdoc warmup failed: {report:?}");
+            assert_eq!(report.timed_out, 0, "srcdoc warmup timed out: {report:?}");
+        }
+
+        let parser_frame = page.frame_snapshots().into_iter().next().unwrap();
+        assert_ne!(parser_frame.frame_id, 0);
+        assert_eq!(parser_frame.url, "about:srcdoc");
+        assert_eq!(
+            page.evaluate_in_frame(
+                0,
+                "({url:document.URL,base:document.baseURI,ran:globalThis.__srcdocParserScript})",
+            )
+            .unwrap(),
+            serde_json::json!({
+                "url": "about:srcdoc",
+                "base": format!("{origin}/assets/"),
+                "ran": "ran",
+            }),
+        );
+        let capture = page.take_resource_capture().unwrap();
+        let parser_urls = capture
+            .resources
+            .iter()
+            .filter(|resource| resource.frame_id == parser_frame.frame_id)
+            .map(|resource| resource.final_url.to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        for path in ["parser.js", "parser.css", "parser.svg", "css.svg"] {
+            assert!(
+                parser_urls.contains(&format!("{origin}/assets/{path}")),
+                "missing srcdoc resource {path}: {parser_urls:#?}",
+            );
+        }
+
+        page.navigate(&format!("{origin}/dynamic.html"))
+            .await
+            .unwrap();
+        page.settle_for_duration(50).await;
+        let first = page.frame_snapshots();
+        assert_eq!(
+            first.len(),
+            1,
+            "stale queued srcdoc realm survived: {first:?}"
+        );
+        assert_eq!(first[0].url, "about:srcdoc");
+        let first_id = first[0].frame_id;
+        page.evaluate(
+            "document.getElementById('frame').srcdoc='<body data-srcdoc=\"replacement\"><img src=\"replacement.svg\"></body>'",
+        );
+        page.settle_for_duration(50).await;
+        let replacement = page.frame_snapshots();
+        assert_eq!(replacement.len(), 1);
+        assert_ne!(replacement[0].frame_id, first_id);
+        assert_eq!(replacement[0].url, "about:srcdoc");
+        assert_eq!(
+            page.evaluate_in_frame(0, "document.body.getAttribute('data-srcdoc')")
+                .unwrap(),
+            serde_json::json!("replacement"),
+        );
+
+        let replacement_id = replacement[0].frame_id;
+        page.evaluate("document.getElementById('frame').removeAttribute('srcdoc')");
+        page.settle_for_duration(50).await;
+        let fallback = page.frame_snapshots();
+        assert_eq!(fallback.len(), 1);
+        assert_ne!(fallback[0].frame_id, replacement_id);
+        assert_eq!(fallback[0].url, format!("{origin}/fallback.html"));
+
+        page.set_blocked_urls(vec!["*parser.js".to_string()]);
+        page.navigate(&format!("{origin}/parser.html"))
+            .await
+            .unwrap();
+        page.settle_for_duration(50).await;
+        assert!(page
+            .resource_archive_incomplete_reasons()
+            .iter()
+            .any(|reason| {
+                reason.contains("classic script was blocked")
+                    && reason.contains("/assets/parser.js")
+            }));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_render_warmup_captures_static_and_dynamic_final_dom_resources() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let origin = spawn_frame_render_resource_server();
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "frame-render-resource-warmup".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("frame-render-resource-warmup".to_string(), context);
+        page.enable_resource_capture(super::ResourceCaptureLimits::default());
+        page.navigate(&format!("{origin}/parent.html"))
+            .await
+            .unwrap();
+        page.settle_for_duration(100).await;
+
+        for _ in 0..5 {
+            let report = page.prepare_screenshot_resources_with_report(1_000).await;
+            assert_eq!(report.failed, 0, "frame warmup failed: {report:?}");
+            assert_eq!(report.timed_out, 0, "frame warmup timed out: {report:?}");
+        }
+
+        let frame = page.frame_snapshots().into_iter().next().unwrap();
+        let capture = page.take_resource_capture().unwrap();
+        let frame_resources = capture
+            .resources
+            .iter()
+            .filter(|resource| resource.frame_id == frame.frame_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            frame_resources.len(),
+            18,
+            "unexpected frame capture: {frame_resources:#?}"
+        );
+
+        let document_resources = frame_resources
+            .iter()
+            .copied()
+            .filter(|resource| resource.resource_type == obscura_net::ResourceType::Document)
+            .collect::<Vec<_>>();
+        assert_eq!(document_resources.len(), 1);
+        let document = document_resources[0];
+        assert_eq!(document.requested_url.as_str(), frame.url);
+        assert_eq!(document.final_url.as_str(), frame.url);
+        assert_eq!(document.method, "GET");
+        assert_eq!(document.status, 200);
+        assert!(document.redirected_from.is_empty());
+        assert_eq!(document.body, FRAME_RENDER_CHILD_HTML.as_bytes());
+        assert_eq!(
+            document.initiator.as_ref().map(url::Url::as_str),
+            Some(format!("{origin}/parent.html").as_str()),
+        );
+
+        let mut expected = vec![
+            (
+                "/dynamic-inline.css",
+                obscura_net::ResourceType::Stylesheet,
+                FRAME_RENDER_DYNAMIC_INLINE_CSS.as_bytes().to_vec(),
+            ),
+            (
+                "/inline-nested.css",
+                obscura_net::ResourceType::Stylesheet,
+                FRAME_RENDER_INLINE_NESTED_CSS.as_bytes().to_vec(),
+            ),
+            (
+                "/inline-root.css",
+                obscura_net::ResourceType::Stylesheet,
+                FRAME_RENDER_INLINE_ROOT_CSS.as_bytes().to_vec(),
+            ),
+            (
+                "/late.css",
+                obscura_net::ResourceType::Fetch,
+                FRAME_RENDER_LATE_CSS.as_bytes().to_vec(),
+            ),
+            (
+                "/nested.css",
+                obscura_net::ResourceType::Fetch,
+                FRAME_RENDER_NESTED_CSS.as_bytes().to_vec(),
+            ),
+            (
+                "/nested.woff2",
+                obscura_net::ResourceType::Font,
+                FRAME_RENDER_FONT_BYTES.as_bytes().to_vec(),
+            ),
+        ];
+        for path in [
+            "/dynamic-inline.svg",
+            "/dynamic-style.svg",
+            "/dynamic.svg",
+            "/inline-nested.svg",
+            "/inline-root.svg",
+            "/inline.svg",
+            "/linked.svg",
+            "/nested.svg",
+            "/picture.svg",
+            "/poster.svg",
+            "/static.svg",
+        ] {
+            expected.push((
+                path,
+                obscura_net::ResourceType::Image,
+                frame_render_svg_body(path).into_bytes(),
+            ));
+        }
+        expected.sort_by(|left, right| left.0.cmp(right.0));
+
+        let mut subresources = frame_resources
+            .into_iter()
+            .filter(|resource| resource.resource_type != obscura_net::ResourceType::Document)
+            .collect::<Vec<_>>();
+        subresources.sort_by(|left, right| left.final_url.path().cmp(right.final_url.path()));
+        assert_eq!(subresources.len(), expected.len());
+        for (resource, (path, resource_type, body)) in subresources.into_iter().zip(expected) {
+            assert_eq!(resource.requested_url.as_str(), format!("{origin}{path}"));
+            assert_eq!(resource.final_url.as_str(), format!("{origin}{path}"));
+            assert_eq!(
+                resource.resource_type, resource_type,
+                "wrong type for {path}"
+            );
+            assert_eq!(resource.body, body, "wrong response bytes for {path}");
+            assert_eq!(resource.method, "GET");
+            assert_eq!(resource.status, 200);
+            assert!(resource.redirected_from.is_empty());
+            assert_eq!(
+                resource.initiator.as_ref().map(url::Url::as_str),
+                Some(frame.url.as_str()),
+                "wrong initiator for {path}",
+            );
+        }
+        assert!(page.resource_archive_incomplete_reasons().is_empty());
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn top_render_warmup_captures_dynamic_inline_stylesheet_import_graph() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let origin = spawn_frame_render_resource_server();
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "top-inline-import-warmup".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("top-inline-import-warmup".to_string(), context);
+        page.enable_resource_capture(super::ResourceCaptureLimits::default());
+        page.navigate(&format!("{origin}/top-dynamic.html"))
+            .await
+            .unwrap();
+        page.settle_for_duration(100).await;
+
+        for _ in 0..4 {
+            let report = page.prepare_screenshot_resources_with_report(1_000).await;
+            assert_eq!(report.failed, 0, "top warmup failed: {report:?}");
+            assert_eq!(report.timed_out, 0, "top warmup timed out: {report:?}");
+        }
+
+        let capture = page.take_resource_capture().unwrap();
+        let resources = capture
+            .resources
+            .iter()
+            .filter(|resource| resource.frame_id == 0)
+            .collect::<Vec<_>>();
+        let urls = resources
+            .iter()
+            .map(|resource| resource.final_url.to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        for path in [
+            "/top-inline-root.css",
+            "/top-inline-nested.css",
+            "/top-inline.svg",
+            "/top-root.svg",
+            "/top-nested.svg",
+        ] {
+            assert!(
+                urls.contains(&format!("{origin}{path}")),
+                "missing top-level dynamic inline import resource {path}: {urls:#?}",
+            );
+        }
+        let document_url = format!("{origin}/top-dynamic.html");
+        assert!(resources
+            .iter()
+            .filter(|resource| resource.final_url.as_str() != document_url)
+            .all(|resource| {
+                resource.initiator.as_ref().map(url::Url::as_str) == Some(document_url.as_str())
+            }));
+        assert!(page.resource_archive_incomplete_reasons().is_empty());
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn top_dynamic_inline_stylesheet_http_failure_is_archive_incomplete() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let origin = spawn_frame_render_resource_server();
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "top-inline-import-failure".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("top-inline-import-failure".to_string(), context);
+        page.navigate(&format!("{origin}/top-missing.html"))
+            .await
+            .unwrap();
+        page.settle_for_duration(100).await;
+
+        let report = page.prepare_screenshot_resources_with_report(1_000).await;
+        assert_eq!(report.failed, 1, "unexpected top warmup: {report:?}");
+        assert!(page
+            .resource_archive_incomplete_reasons()
+            .iter()
+            .any(|reason| {
+                reason.contains("top-level stylesheet")
+                    && reason.contains("top-missing.css")
+                    && reason.contains("HTTP 404")
+            }));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn shadow_render_warmup_archives_closed_nested_resources_with_ownership() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let origin = spawn_frame_render_resource_server();
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "closed-shadow-render-resource-warmup".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page =
+            super::Page::new("closed-shadow-render-resource-warmup".to_string(), context);
+        page.enable_resource_capture(super::ResourceCaptureLimits::default());
+        page.navigate(&format!("{origin}/shadow-parent.html"))
+            .await
+            .unwrap();
+        page.settle_for_duration(500).await;
+
+        for _ in 0..3 {
+            let report = page.prepare_screenshot_resources_with_report(1_000).await;
+            assert_eq!(report.failed, 0, "shadow warmup failed: {report:?}");
+            assert_eq!(report.timed_out, 0, "shadow warmup timed out: {report:?}");
+        }
+        assert!(page.resource_archive_incomplete_reasons().is_empty());
+
+        let frame = page
+            .frame_snapshots()
+            .into_iter()
+            .find(|frame| frame.url.ends_with("/shadow-frame.html"))
+            .expect("live shadow fixture frame");
+        let capture = page.take_resource_capture().unwrap();
+        for (path, frame_id, initiator) in [
+            (
+                "/shadow-top-byte.svg",
+                0,
+                format!("{origin}/shadow-parent.html"),
+            ),
+            (
+                "/shadow-frame-byte.svg",
+                frame.frame_id,
+                format!("{origin}/shadow-frame.html"),
+            ),
+        ] {
+            let url = format!("{origin}{path}");
+            let resource = capture
+                .resources
+                .iter()
+                .find(|resource| resource.final_url.as_str() == url)
+                .unwrap_or_else(|| panic!("missing closed-shadow resource {url}"));
+            assert_eq!(resource.frame_id, frame_id);
+            assert_eq!(
+                resource.initiator.as_ref().map(url::Url::as_str),
+                Some(initiator.as_str()),
+            );
+            assert_eq!(resource.resource_type, obscura_net::ResourceType::Image);
+            assert_eq!(resource.status, 200);
+            assert_eq!(
+                resource.body,
+                format!(
+                    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"2\" height=\"3\"><title>{path}</title></svg>"
+                )
+                .into_bytes(),
+                "resource capture changed closed-shadow response bytes",
+            );
+        }
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsupported_shadow_stylesheet_owners_are_archive_incomplete() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let origin = spawn_frame_render_resource_server();
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "unsupported-shadow-stylesheets".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("unsupported-shadow-stylesheets".to_string(), context);
+        page.navigate(&format!("{origin}/shadow-unsupported.html"))
+            .await
+            .unwrap();
+
+        let reasons = page.resource_archive_incomplete_reasons();
+        assert!(reasons.iter().any(|reason| {
+            reason
+                == "top-level shadow-root inline stylesheets contain 1 unsupported @import rule(s)"
+        }));
+        assert!(reasons.iter().any(|reason| {
+            reason.contains("shadow-root stylesheet has no materialized response owner")
+                && reason.contains("/shadow-link.css")
+        }));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_frame_stylesheet_http_failure_is_archive_incomplete() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let origin = spawn_frame_render_resource_server();
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "frame-stylesheet-http-failure".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("frame-stylesheet-http-failure".to_string(), context);
+        page.navigate(&format!("{origin}/missing-parent.html"))
+            .await
+            .unwrap();
+        page.settle_for_duration(50).await;
+
+        let report = page.prepare_screenshot_resources_with_report(1_000).await;
+        assert_eq!(report.failed, 1, "unexpected frame warmup: {report:?}");
+        assert!(page
+            .resource_archive_incomplete_reasons()
+            .iter()
+            .any(|reason| {
+                reason.contains("stylesheet")
+                    && reason.contains("missing.css")
+                    && reason.contains("HTTP 404")
+            }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn redirected_frame_uses_final_url_and_loads_stylesheet_in_its_frame() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let origin = spawn_redirected_frame_stylesheet_server();
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "redirected-frame-stylesheet".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("redirected-frame-stylesheet".to_string(), context);
+        let observed_stylesheets = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_images = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = observed_stylesheets.clone();
+        let observed_image_responses = observed_images.clone();
+        page.on_response(std::sync::Arc::new(move |request, response| {
+            if request.resource_type == obscura_net::ResourceType::Stylesheet {
+                observed.lock().unwrap().push((
+                    request.frame_id,
+                    request.initiator.as_ref().map(url::Url::to_string),
+                    response.url.to_string(),
+                    response.body.clone(),
+                ));
+            } else if request.resource_type == obscura_net::ResourceType::Image {
+                observed_image_responses.lock().unwrap().push((
+                    request.frame_id,
+                    request.initiator.as_ref().map(url::Url::to_string),
+                    response.url.to_string(),
+                    response.body.clone(),
+                ));
+            }
+        }));
+
+        page.navigate(&format!("{origin}/parent.html"))
+            .await
+            .unwrap();
+        page.settle_for_duration(500).await;
+
+        let snapshots = page.frame_snapshots();
+        assert_eq!(snapshots.len(), 1);
+        assert_ne!(snapshots[0].frame_id, 0);
+        assert_eq!(
+            snapshots[0].url,
+            format!("{origin}/frame/final.html"),
+            "the frame realm kept the pre-redirect iframe src as its document URL",
+        );
+
+        let mut stylesheets = observed_stylesheets.lock().unwrap().clone();
+        stylesheets.sort_by(|left, right| left.2.cmp(&right.2));
+        assert_eq!(
+            stylesheets
+                .iter()
+                .map(|stylesheet| stylesheet.2.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                format!("{origin}/frame/frame.css"),
+                format!("{origin}/frame/unsupported.css"),
+            ],
+            "each linked or imported stylesheet must be fetched exactly once",
+        );
+        assert!(stylesheets.iter().all(|stylesheet| {
+            stylesheet.0 == snapshots[0].frame_id
+                && stylesheet.1.as_deref() == Some(snapshots[0].url.as_str())
+        }));
+        assert_eq!(
+            stylesheets[0].3,
+            b"body { --redirected-frame-sheet: yes; background-image: url(icon.svg); }",
+        );
+        assert!(
+            stylesheets[1].3.is_empty(),
+            "the fixture's 404 import response body changed",
+        );
+        let mut images = observed_images.lock().unwrap().clone();
+        images.sort_by(|left, right| left.2.cmp(&right.2));
+        assert_eq!(images.len(), 3);
+        assert_eq!(
+            images
+                .iter()
+                .map(|image| image.2.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                format!("{origin}/frame/attribute.svg"),
+                format!("{origin}/frame/icon.svg"),
+                format!("{origin}/frame/inline.svg"),
+            ],
+        );
+        assert!(images.iter().all(|image| {
+            image.0 == snapshots[0].frame_id
+                && image.1.as_deref() == Some(snapshots[0].url.as_str())
+                && !image.3.is_empty()
+        }));
+        assert_eq!(
+            page.evaluate_in_frame(0, "window.__frameCssReady").unwrap(),
+            serde_json::json!(true),
+            "frame scripts ran before the linked stylesheet was installed",
+        );
+        assert_eq!(
+            page.evaluate_in_frame(0, "window.__redirectedChildScript")
+                .unwrap(),
+            serde_json::json!("loaded"),
+            "the relative frame script did not resolve against the final redirected URL",
+        );
+        assert_eq!(
+            page.evaluate_in_frame(
+                0,
+                "document.querySelector('style[data-obscura-external-stylesheets]').textContent",
+            )
+            .unwrap(),
+            serde_json::json!(format!(
+                "body {{ --redirected-frame-sheet: yes; background-image: url(\"{origin}/frame/icon.svg\"); }}"
+            )),
+        );
+
+        let diagnostics = page.frame_resource_diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].frame_id, snapshots[0].frame_id);
+        assert_eq!(diagnostics[0].unsupported_module_scripts, 1);
+        assert_eq!(diagnostics[0].unsupported_stylesheet_imports, 0);
+        assert_eq!(
+            diagnostics[0].pending_navigation_url.as_deref(),
+            Some(format!("{origin}/later-frame.html").as_str()),
+        );
+        assert!(page
+            .resource_archive_incomplete_reasons()
+            .iter()
+            .any(|reason| { reason.contains("unsupported.css") && reason.contains("HTTP 404") }));
     }
 
     /// A `FrameRealm` owns a `v8::Global` into the runtime's isolate, which is
@@ -4987,6 +9314,302 @@ mod tests {
         super::Page::new(name.to_string(), context)
     }
 
+    #[test]
+    fn rewritten_parser_stylesheet_rejects_the_stale_frozen_response() {
+        let mut page = frame_page("parser-stylesheet-frozen-href-token");
+        page.url = Some(url::Url::parse("https://example.test/original/page.html").unwrap());
+        page.dom = Some(parse_html(
+            r#"<!doctype html><html><head>
+               <link id="sheet" rel="stylesheet" href="old.css">
+               </head><body></body></html>"#,
+        ));
+        page.init_js();
+
+        let snapshot = page.snapshot_parser_stylesheets().unwrap();
+        let link = snapshot.links[0].clone();
+        let request_href = link.base_url.join(&link.raw_href).unwrap().to_string();
+        page.mark_parser_stylesheets_pending(&snapshot);
+        page.js
+            .as_mut()
+            .unwrap()
+            .execute_script(
+                "<preload-rewrite>",
+                "document.getElementById('sheet').setAttribute('href', 'data:text/css,html%7B--new-sheet:1%7D');",
+            )
+            .unwrap();
+
+        let materialize = materialize_parser_stylesheet_script_with_token(
+            link.nid,
+            "html { --stale-parser-sheet: 1; }",
+            &request_href,
+            &link.raw_href,
+        );
+        page.js
+            .as_mut()
+            .unwrap()
+            .execute_script("<stale-parser-sheet>", &materialize)
+            .unwrap();
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    "[...document.querySelectorAll('style')].some(style => style.textContent.includes('--stale-parser-sheet'))",
+                )
+                .unwrap(),
+            serde_json::json!(false),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn removed_and_restored_parser_stylesheet_rejects_the_old_response() {
+        let mut page = frame_page("parser-stylesheet-invalidated-epoch");
+        page.url = Some(url::Url::parse("https://example.test/original/page.html").unwrap());
+        page.dom = Some(parse_html(
+            r#"<!doctype html><html><head>
+               <link id="sheet" rel="stylesheet" href="old.css">
+               </head><body></body></html>"#,
+        ));
+        page.init_js();
+
+        let snapshot = page.snapshot_parser_stylesheets().unwrap();
+        let link = snapshot.links[0].clone();
+        let request_href = link.base_url.join(&link.raw_href).unwrap().to_string();
+        page.mark_parser_stylesheets_pending(&snapshot);
+        page.js
+            .as_mut()
+            .unwrap()
+            .execute_script(
+                "<preload-remove-reset>",
+                "var link = document.getElementById('sheet');\
+                 link.removeAttribute('href');\
+                 link.setAttribute('href', 'old.css');",
+            )
+            .unwrap();
+
+        let materialize = materialize_parser_stylesheet_script_with_token(
+            link.nid,
+            "html { --stale-parser-sheet: 1; }",
+            &request_href,
+            &link.raw_href,
+        );
+        page.js
+            .as_mut()
+            .unwrap()
+            .execute_script("<stale-parser-sheet>", &materialize)
+            .unwrap();
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    "[globalThis.__obscura_isParserStylesheetPending(document.getElementById('sheet')),\
+                     [...document.querySelectorAll('style')].some(style => style.textContent.includes('--stale-parser-sheet'))]",
+                )
+                .unwrap(),
+            serde_json::json!([false, false]),
+        );
+    }
+
+    #[test]
+    fn frame_diagnostic_evaluation_failure_is_incomplete_and_navigation_resets_it() {
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html("<html><body>parent</body></html>"));
+        runtime.set_url("https://parent.example/");
+        runtime.run_page_init();
+        let frame = obscura_js::frame::FrameRealm::new(
+            &mut runtime,
+            7,
+            0,
+            "https://frame.example/",
+            "<html><body><script type=module></script></body></html>",
+        )
+        .unwrap();
+        frame
+            .execute_script(&mut runtime, "document.querySelectorAll = undefined;")
+            .unwrap();
+
+        let mut page = frame_page("frame-diagnostic-failure");
+        page.frames.push(frame);
+        page.js = Some(runtime);
+        let diagnostics = page.frame_resource_diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].diagnostic_error.is_some());
+        assert_eq!(diagnostics[0].unsupported_module_scripts, 0);
+        assert_eq!(
+            page.resource_archive_incomplete_reasons(),
+            vec![
+                "frame resource diagnostic failed for frame 7 (https://frame.example/)".to_string()
+            ],
+        );
+        assert_eq!(
+            page.resource_archive_incomplete_reasons().len(),
+            1,
+            "repeated diagnostic passes must be de-duplicated",
+        );
+
+        page.navigate_blank();
+        assert!(page.resource_archive_incomplete_reasons().is_empty());
+    }
+
+    #[test]
+    fn invalid_live_frame_probe_fails_lifecycle_without_discarding_frames() {
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html("<html><body>parent</body></html>"));
+        runtime.set_url("https://parent.example/");
+        runtime.run_page_init();
+        let frame = obscura_js::frame::FrameRealm::new(
+            &mut runtime,
+            7,
+            0,
+            "https://parent.example/frame",
+            "<html><body></body></html>",
+        )
+        .unwrap();
+
+        let mut page = frame_page("invalid-live-frame-probe");
+        page.frames.push(frame);
+        page.js = Some(runtime);
+        page.top_load_pending = true;
+        page.lifecycle = crate::LifecycleState::DomContentLoaded;
+
+        assert!(!page.release_detached_frames_with_probe(
+            "(JSON.stringify = () => '[]', globalThis.__obscura_frameId === 0 ? [7] : [])"
+        ));
+        assert_eq!(page.lifecycle, crate::LifecycleState::DomContentLoaded);
+        assert!(page.top_load_pending);
+        assert_eq!(
+            page.frames.len(),
+            1,
+            "author JSON.stringify must not forge the top-realm live-id list"
+        );
+
+        assert!(!page.release_detached_frames_with_probe("({ forged: true })"));
+        assert_eq!(page.lifecycle, crate::LifecycleState::Failed);
+        assert!(!page.top_load_pending);
+        assert_eq!(
+            page.frames.len(),
+            1,
+            "a malformed liveness probe must not irreversibly discard a frame"
+        );
+    }
+
+    #[test]
+    fn pending_frame_messages_block_archive_readiness_and_queue_loss_resets_on_navigation() {
+        std::env::set_var("OBSCURA_FRAME_MESSAGE_QUEUE_ENTRIES", "1");
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html("<html><body>parent</body></html>"));
+        runtime.set_url("https://parent.example/");
+        runtime.run_page_init();
+        let frame = obscura_js::frame::FrameRealm::new(
+            &mut runtime,
+            7,
+            0,
+            "https://frame.example/",
+            "<html><body></body></html>",
+        )
+        .unwrap();
+        frame
+            .execute_script(
+                &mut runtime,
+                "parent.postMessage('first', '*'); parent.postMessage('dropped', '*');",
+            )
+            .unwrap();
+
+        let mut page = frame_page("frame-message-archive-readiness");
+        page.frames.push(frame);
+        page.js = Some(runtime);
+        assert!(
+            page.has_pending_resource_work(),
+            "a queued receiver can still start resource requests",
+        );
+        let reasons = page.resource_archive_incomplete_reasons();
+        assert!(reasons
+            .iter()
+            .any(|reason| reason == "frame postMessage queue entry cap reached (1 message(s))"));
+        assert!(reasons.iter().any(|reason| {
+            reason.starts_with("pending frame postMessage deliveries: 1 message(s), ")
+        }));
+
+        assert!(page.deliver_frame_messages());
+        assert!(!page.has_pending_resource_work());
+        assert!(page
+            .resource_archive_incomplete_reasons()
+            .iter()
+            .any(|reason| reason == "frame postMessage queue entry cap reached (1 message(s))"));
+
+        page.navigate_blank();
+        assert!(page.resource_archive_incomplete_reasons().is_empty());
+        std::env::remove_var("OBSCURA_FRAME_MESSAGE_QUEUE_ENTRIES");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_srcdoc_frame_is_pending_resource_work_until_attachment_completes() {
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html("<html><body></body></html>"));
+        runtime.set_url("https://parent.example/");
+        runtime.run_page_init();
+        runtime
+            .evaluate(
+                r#"(() => {
+                  const frame = document.createElement('iframe');
+                  frame.srcdoc = '<!doctype html><script>globalThis.__childRan = true;<\/script>';
+                  document.body.appendChild(frame);
+                  return frame._frameId;
+                })()"#,
+            )
+            .unwrap();
+
+        let mut page = frame_page("pending-srcdoc-resource-work");
+        page.js = Some(runtime);
+        assert!(
+            page.has_pending_resource_work(),
+            "a queued frame can still execute scripts and request resources",
+        );
+        for _ in 0..4 {
+            if !page.advance_frames().await {
+                break;
+            }
+        }
+        assert_eq!(page.frame_urls(), vec!["about:srcdoc"]);
+        assert!(!page.has_pending_resource_work());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blank_navigation_advances_generation_once_and_resets_capture_state() {
+        let mut page = frame_page("blank-navigation-generation");
+        page.enable_resource_capture(super::ResourceCaptureLimits::default());
+        page.mark_resource_archive_incomplete("old document diagnostic");
+        {
+            let mut state = page.resource_capture.as_ref().unwrap().lock().unwrap();
+            state.capture.omitted_resources = 1;
+            state.capture.omitted_bytes = 42;
+        }
+
+        let initial_generation = page.callbacks.document_generation();
+        page.navigate_blank();
+        let direct_generation = page.callbacks.document_generation();
+        assert_eq!(direct_generation, initial_generation + 1);
+        assert!(page.resource_archive_incomplete_reasons().is_empty());
+        {
+            let state = page.resource_capture.as_ref().unwrap().lock().unwrap();
+            assert_eq!(state.capture.document_generation, direct_generation);
+            assert_eq!(state.capture.omitted_resources, 0);
+            assert_eq!(state.capture.omitted_bytes, 0);
+        }
+
+        page.navigate("about:blank").await.unwrap();
+        let routed_generation = page.callbacks.document_generation();
+        assert_eq!(
+            routed_generation,
+            direct_generation + 1,
+            "navigate(about:blank) must not advance once in navigate_single and again in navigate_blank",
+        );
+        let capture = page.take_resource_capture().unwrap();
+        assert_eq!(capture.document_generation, routed_generation);
+        assert!(capture.resources.is_empty());
+    }
+
     /// An iframe inside a shadow root is absent from
     /// `document.querySelectorAll('iframe')` — real Chrome reports 0 for it too
     /// — so a liveness check built on that query reads a live frame as detached
@@ -5013,7 +9636,593 @@ mod tests {
             .unwrap()
             .evaluate("Object.keys(globalThis.__obscura_frameObjects).length")
             .unwrap();
-        assert_eq!(published.as_f64(), Some(1.0), "the page cannot reach the frame");
+        assert_eq!(
+            published.as_f64(),
+            Some(1.0),
+            "the page cannot reach the frame"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_preload_runs_before_parser_stylesheet_owner_error() {
+        const TOP_HTML: &str = r#"<!doctype html><html><body><script>
+            const frame = document.createElement('iframe');
+            frame.srcdoc = '<!doctype html><link rel="stylesheet" href="file:///obscura-frame-blocked.css" onerror="globalThis.__preloadAtStyleError = globalThis.__preloaded === true; globalThis.__styleErrorReadyState = document.readyState">';
+            document.body.appendChild(frame);
+        </script></body></html>"#;
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(TOP_HTML);
+        let url = format!("data:text/html;base64,{encoded}");
+        let mut page = frame_page("frame-preload-before-style-error");
+        page.set_preload_scripts(vec!["globalThis.__preloaded = true;".to_string()]);
+        page.navigate_with_wait(&url, crate::WaitUntil::Load)
+            .await
+            .expect("frame navigation");
+
+        assert_eq!(page.frame_urls(), vec!["about:srcdoc".to_string()]);
+        assert_eq!(
+            page.evaluate_in_frame(0, "globalThis.__preloadAtStyleError")
+                .unwrap(),
+            serde_json::json!(true),
+        );
+        assert_eq!(
+            page.evaluate_in_frame(0, "globalThis.__styleErrorReadyState")
+                .unwrap(),
+            serde_json::json!("loading"),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn new_document_preload_dynamic_inline_script_executes_exactly_once() {
+        const HTML: &str = "<!doctype html><html><head></head><body></body></html>";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(HTML);
+        let mut page = frame_page("preload-dynamic-inline-exactly-once");
+        page.set_preload_scripts(vec![r#"
+            globalThis.__preloadDynamicInlineRuns = 0;
+            const script = document.createElement('script');
+            script.textContent = 'globalThis.__preloadDynamicInlineRuns += 1;';
+            document.head.appendChild(script);
+        "#
+        .to_string()]);
+
+        page.navigate_with_wait(
+            &format!("data:text/html;base64,{encoded}"),
+            crate::WaitUntil::Load,
+        )
+        .await
+        .expect("preload dynamic script navigation");
+
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__preloadDynamicInlineRuns")
+                .unwrap(),
+            serde_json::json!(1.0),
+            "a preload-created script is dynamic work, not a parser script to run again",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn new_document_preload_dynamic_stylesheet_fetches_and_loads_exactly_once() {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let stylesheet_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed_requests = stylesheet_requests.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let observed_requests = observed_requests.clone();
+                std::thread::spawn(move || {
+                    let mut request = [0u8; 2048];
+                    let length = stream.read(&mut request).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&request[..length]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_ascii_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let (content_type, body) = if path == "/preload.css" {
+                        observed_requests.fetch_add(1, Ordering::SeqCst);
+                        ("text/css", "html { --preload-style: loaded; }")
+                    } else {
+                        (
+                            "text/html",
+                            "<!doctype html><html><head></head><body></body></html>",
+                        )
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                });
+            }
+        });
+
+        let mut page = frame_page("preload-dynamic-stylesheet-exactly-once");
+        page.set_preload_scripts(vec![r#"
+            globalThis.__preloadStyleLoads = 0;
+            const link = document.createElement('link');
+            link.setAttribute('rel', 'stylesheet');
+            link.setAttribute('href', '/preload.css');
+            link.addEventListener('load', () => globalThis.__preloadStyleLoads += 1);
+            document.head.appendChild(link);
+        "#
+        .to_string()]);
+
+        // This regression isolates parser-resource enrollment. Render builds
+        // also run a separate pre-script archive warmup which intentionally
+        // scans the live DOM; that transport/JS-loader race is independent of
+        // whether preload-created links leak into the frozen parser snapshot.
+        #[cfg(feature = "render")]
+        let previous_warmup = [
+            (
+                "OBSCURA_RENDER_RESOURCE_WARMUP_MS",
+                std::env::var_os("OBSCURA_RENDER_RESOURCE_WARMUP_MS"),
+            ),
+            (
+                "OBSCURA_RENDER_RESOURCE_POST_SCRIPT_WARMUP_MS",
+                std::env::var_os("OBSCURA_RENDER_RESOURCE_POST_SCRIPT_WARMUP_MS"),
+            ),
+        ];
+        #[cfg(feature = "render")]
+        for (name, _) in &previous_warmup {
+            std::env::set_var(name, "0");
+        }
+        let page_url = format!("http://{address}/index.html");
+        let navigation = page.navigate_with_wait(&page_url, crate::WaitUntil::Load);
+        let navigation = navigation.await;
+        #[cfg(feature = "render")]
+        for (name, value) in previous_warmup {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        navigation.expect("preload dynamic stylesheet navigation");
+
+        assert_eq!(
+            stylesheet_requests.load(Ordering::SeqCst),
+            1,
+            "a preload-created link is dynamic work, not a parser stylesheet to fetch again",
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__preloadStyleLoads")
+                .unwrap(),
+            serde_json::json!(1.0),
+            "the dynamic stylesheet owner must receive one completion",
+        );
+    }
+
+    /// An explicit CLI `--wait` uses `settle_for_duration`. The fixed wait
+    /// previously attached a dynamically loaded frame only after the entire
+    /// delay, which left the child timer, fetch and every postMessage reply for
+    /// a later settle that the caller never requested.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fixed_settle_interleaves_deferred_child_frame_work() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let base = spawn_shadow_frame_server().await;
+        let mut page = frame_page("fixed-settle-frame-work");
+        page.navigate(&format!("{base}fixed-wait.html"))
+            .await
+            .unwrap();
+
+        page.settle_for_duration(1_000).await;
+
+        assert_eq!(
+            page.frame_urls(),
+            vec![format!("{base}async-child.html")],
+            "the delayed iframe was not attached during the fixed wait",
+        );
+        assert_eq!(
+            page.evaluate_in_frame(0, "window.__deferredFrameWork")
+                .unwrap(),
+            serde_json::json!("FRAME-READY"),
+            "the child realm's deferred work was stranded after attachment",
+        );
+        assert!(
+            page.fetched_urls()
+                .contains(&format!("{base}frame-resource.txt")),
+            "a fetch made by the child realm was absent from page assets",
+        );
+    }
+
+    #[test]
+    fn autonomous_pump_bounds_a_timer_created_frame_dcl_handler() {
+        const TOP_HTML: &str = r#"<!doctype html><html><body><script>
+            setTimeout(function () {
+                const frame = document.createElement('iframe');
+                frame.srcdoc = "<script>document.addEventListener('DOMContentLoaded', function () { while (true) {} });<\/script>";
+                document.body.appendChild(frame);
+            }, 0);
+        </script></body></html>"#;
+
+        #[derive(Debug)]
+        struct Outcome {
+            before_page: crate::LifecycleState,
+            before_top_load_pending: bool,
+            before_frames: usize,
+            turn: Result<bool, String>,
+            after_page: crate::LifecycleState,
+            after_top_load_pending: bool,
+            after_frames: Vec<obscura_js::frame::FrameLifecycleState>,
+            elapsed: std::time::Duration,
+        }
+
+        // A missing V8 watchdog pins the executor inside the frame callback,
+        // so keep that work on a disposable OS thread. The receiving test still
+        // fails in bounded time instead of hanging the test runner forever.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("autonomous-frame-watchdog".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime");
+                let outcome = runtime.block_on(async {
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(TOP_HTML);
+                    let url = format!("data:text/html;base64,{encoded}");
+                    let mut page = frame_page("autonomous-frame-watchdog");
+                    page.navigate_with_wait(&url, crate::WaitUntil::DomContentLoaded)
+                        .await
+                        .expect("DOMContentLoaded navigation");
+
+                    let before_page = page.lifecycle;
+                    let before_top_load_pending = page.top_load_pending;
+                    let before_frames = page.frames.len();
+                    let started = std::time::Instant::now();
+                    let turn = page.run_autonomous_event_loop_turn().await;
+                    Outcome {
+                        before_page,
+                        before_top_load_pending,
+                        before_frames,
+                        turn,
+                        after_page: page.lifecycle,
+                        after_top_load_pending: page.top_load_pending,
+                        after_frames: page
+                            .frames
+                            .iter()
+                            .map(|frame| frame.lifecycle_state())
+                            .collect(),
+                        elapsed: started.elapsed(),
+                    }
+                });
+                let _ = tx.send(outcome);
+            })
+            .expect("spawn watchdog test worker");
+
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("autonomous pump did not return within the watchdog ceiling");
+        worker.join().expect("watchdog test worker panicked");
+
+        assert_eq!(outcome.before_page, crate::LifecycleState::DomContentLoaded);
+        assert!(outcome.before_top_load_pending);
+        assert_eq!(
+            outcome.before_frames, 0,
+            "the timer ran before DCL returned"
+        );
+        assert_eq!(
+            outcome.turn,
+            Ok(false),
+            "attaching the frame is browser work"
+        );
+        assert_eq!(outcome.after_page, crate::LifecycleState::Failed);
+        assert!(!outcome.after_top_load_pending);
+        assert_eq!(
+            outcome.after_frames,
+            vec![obscura_js::frame::FrameLifecycleState::Failed],
+        );
+        assert!(
+            outcome.elapsed < std::time::Duration::from_secs(10),
+            "scoped lifecycle watchdog returned too late: {:?}",
+            outcome.elapsed,
+        );
+    }
+
+    #[test]
+    fn autonomous_pump_marks_a_nonreturning_dynamic_script_load_handler_failed() {
+        const TOP_HTML: &str = r#"<!doctype html><html><head><script>
+            document.addEventListener('DOMContentLoaded', function () {
+                const script = document.createElement('script');
+                script.src = 'data:text/javascript,globalThis.__dynamicRan%3Dtrue';
+                script.onload = function () { while (true) {} };
+                document.head.appendChild(script);
+            });
+        </script></head><body></body></html>"#;
+
+        #[derive(Debug)]
+        struct Outcome {
+            before_page: crate::LifecycleState,
+            before_top_load_pending: bool,
+            turn: Result<bool, String>,
+            after_page: crate::LifecycleState,
+            after_top_load_pending: bool,
+            elapsed: std::time::Duration,
+        }
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("autonomous-resource-watchdog".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime");
+                let outcome = runtime.block_on(async {
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(TOP_HTML);
+                    let url = format!("data:text/html;base64,{encoded}");
+                    let mut page = frame_page("autonomous-resource-watchdog");
+                    page.navigate_with_wait(&url, crate::WaitUntil::DomContentLoaded)
+                        .await
+                        .expect("DOMContentLoaded navigation");
+
+                    let before_page = page.lifecycle;
+                    let before_top_load_pending = page.top_load_pending;
+                    let started = std::time::Instant::now();
+                    let turn = page.run_autonomous_event_loop_turn().await;
+                    Outcome {
+                        before_page,
+                        before_top_load_pending,
+                        turn,
+                        after_page: page.lifecycle,
+                        after_top_load_pending: page.top_load_pending,
+                        elapsed: started.elapsed(),
+                    }
+                });
+                let _ = tx.send(outcome);
+            })
+            .expect("spawn dynamic resource watchdog test worker");
+
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("autonomous resource callback did not respect the watchdog ceiling");
+        worker.join().expect("watchdog test worker panicked");
+
+        assert_eq!(outcome.before_page, crate::LifecycleState::DomContentLoaded);
+        assert!(outcome.before_top_load_pending);
+        assert!(
+            outcome.turn.is_err(),
+            "watchdog failure was hidden: {outcome:?}"
+        );
+        assert_eq!(outcome.after_page, crate::LifecycleState::Failed);
+        assert!(!outcome.after_top_load_pending);
+        assert!(
+            outcome.elapsed < std::time::Duration::from_secs(10),
+            "resource callback watchdog returned too late: {:?}",
+            outcome.elapsed,
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parsed_body_onload_precedes_listeners_registered_by_body_resource_callbacks() {
+        const HTML: &str = r#"<!doctype html><html><head>
+            <script>globalThis.__bodyResourceLoadOrder = [];</script>
+        </head><body onload="globalThis.__bodyResourceLoadOrder.push('body-handler')">
+            <link rel="stylesheet" href="file:///blocked-body-sheet.css"
+                  onerror="window.addEventListener('load', () => globalThis.__bodyResourceLoadOrder.push('resource-listener'))">
+        </body></html>"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(HTML);
+        let mut page = frame_page("body-handler-parser-encounter-order");
+        page.navigate_with_wait(
+            &format!("data:text/html;base64,{encoded}"),
+            crate::WaitUntil::Load,
+        )
+        .await
+        .expect("body/resource lifecycle navigation");
+
+        assert_eq!(
+            page.evaluate("globalThis.__bodyResourceLoadOrder"),
+            serde_json::json!(["body-handler", "resource-listener"]),
+        );
+    }
+
+    #[test]
+    fn parser_stylesheet_owner_handler_is_bounded_before_the_script_phase() {
+        const TOP_HTML: &str = r#"<!doctype html><html><head>
+            <link rel="stylesheet" href="file:///obscura-blocked.css"
+                  onerror="while (true) {}">
+        </head><body></body></html>"#;
+
+        #[derive(Debug)]
+        struct Outcome {
+            navigation: Result<(), String>,
+            lifecycle: crate::LifecycleState,
+            top_load_pending: bool,
+            elapsed: std::time::Duration,
+        }
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("parser-stylesheet-watchdog".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime");
+                let outcome = runtime.block_on(async {
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(TOP_HTML);
+                    let url = format!("data:text/html;base64,{encoded}");
+                    let mut page = frame_page("parser-stylesheet-watchdog");
+                    let started = std::time::Instant::now();
+                    let navigation = page
+                        .navigate_with_wait(&url, crate::WaitUntil::Load)
+                        .await
+                        .map_err(|error| error.to_string());
+                    Outcome {
+                        navigation,
+                        lifecycle: page.lifecycle,
+                        top_load_pending: page.top_load_pending,
+                        elapsed: started.elapsed(),
+                    }
+                });
+                let _ = tx.send(outcome);
+            })
+            .expect("spawn stylesheet watchdog test worker");
+
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("stylesheet owner callback did not respect the watchdog ceiling");
+        worker.join().expect("stylesheet watchdog worker panicked");
+
+        assert!(
+            outcome.navigation.is_err(),
+            "navigation unexpectedly succeeded: {outcome:?}"
+        );
+        assert_eq!(outcome.lifecycle, crate::LifecycleState::Failed);
+        assert!(!outcome.top_load_pending);
+        assert!(
+            outcome.elapsed < std::time::Duration::from_secs(10),
+            "stylesheet watchdog returned too late: {:?}",
+            outcome.elapsed,
+        );
+    }
+
+    #[test]
+    fn cdp_evaluate_and_call_function_share_one_absolute_watchdog_deadline() {
+        #[derive(Debug)]
+        struct Outcome {
+            sync_evaluate: Result<obscura_js::runtime::RemoteObjectInfo, String>,
+            sync_call: Result<obscura_js::runtime::RemoteObjectInfo, String>,
+            distant_timer: Result<obscura_js::runtime::RemoteObjectInfo, String>,
+            leaked_sentinels: serde_json::Value,
+            isolate_reusable: serde_json::Value,
+            elapsed: std::time::Duration,
+        }
+
+        // A regression in the initial synchronous entry would pin the current
+        // test thread inside V8 forever. Keep the isolate on a disposable worker
+        // so the receiver still reports the missing watchdog in bounded time.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("cdp-absolute-deadline-watchdog".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime");
+                let outcome = runtime.block_on(async {
+                    let mut page = frame_page("cdp-absolute-deadline-watchdog");
+                    page.url = Some(url::Url::parse("https://deadline.example/").unwrap());
+                    page.dom = Some(parse_html("<html><body></body></html>"));
+                    page.init_js();
+
+                    let started = std::time::Instant::now();
+                    let sync_evaluate = page
+                        .evaluate_for_cdp_with_timeout(
+                            "(() => { while (true) {} })()",
+                            true,
+                            true,
+                            40,
+                        )
+                        .await;
+                    let sync_call = page
+                        .call_function_on_for_cdp_with_timeout(
+                            "function () { while (true) {} }",
+                            None,
+                            &[],
+                            true,
+                            true,
+                            40,
+                        )
+                        .await;
+                    let distant_timer = page
+                        .evaluate_for_cdp_with_timeout(
+                            "new Promise(resolve => setTimeout(resolve, 60000))",
+                            true,
+                            true,
+                            40,
+                        )
+                        .await;
+                    let elapsed = started.elapsed();
+                    let leaked_sentinels = page.evaluate(
+                        "Object.getOwnPropertyNames(globalThis).filter(\
+                         name => name.startsWith('__obscura_page_await_')).length",
+                    );
+                    let isolate_reusable = page.evaluate(
+                        "(document.body.setAttribute('data-after-cdp-timeout', 'usable'), \
+                         document.body.getAttribute('data-after-cdp-timeout'))",
+                    );
+                    Outcome {
+                        sync_evaluate,
+                        sync_call,
+                        distant_timer,
+                        leaked_sentinels,
+                        isolate_reusable,
+                        elapsed,
+                    }
+                });
+                let _ = tx.send(outcome);
+            })
+            .expect("spawn CDP watchdog test worker");
+
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a CDP deadline failed to bound synchronous V8 or a distant timer");
+        worker.join().expect("CDP watchdog worker panicked");
+
+        assert!(outcome.sync_evaluate.is_err(), "{outcome:?}");
+        assert!(outcome.sync_call.is_err(), "{outcome:?}");
+        assert!(outcome.distant_timer.is_err(), "{outcome:?}");
+        assert_eq!(outcome.leaked_sentinels.as_f64(), Some(0.0), "{outcome:?}");
+        assert_eq!(
+            outcome.isolate_reusable,
+            serde_json::json!("usable"),
+            "{outcome:?}"
+        );
+        assert!(
+            outcome.elapsed < std::time::Duration::from_secs(2),
+            "the three 40ms commands escaped their shared deadlines: {outcome:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn child_frame_dynamic_script_executes_and_keeps_frame_request_context() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let base = spawn_shadow_frame_server().await;
+        let mut page = frame_page("child-frame-dynamic-script");
+        page.enable_resource_capture(super::ResourceCaptureLimits::default());
+
+        page.navigate(&format!("{base}dynamic-frame-parent.html"))
+            .await
+            .unwrap();
+        page.settle_for_duration(1_000).await;
+
+        assert_eq!(
+            page.evaluate_in_frame(
+                0,
+                "[window.__dynamicFrameLoads, window.__dynamicFrameOnload]",
+            )
+            .unwrap(),
+            serde_json::json!([1, true]),
+            "the dynamically inserted child-frame script did not fetch, execute, and fire load",
+        );
+        assert!(!page.has_pending_resource_work());
+
+        let snapshot = page.frame_snapshots().into_iter().next().unwrap();
+        let script_url = format!("{base}frame-dynamic.js");
+        let capture = page.take_resource_capture().unwrap();
+        let resource = capture
+            .resources
+            .iter()
+            .find(|resource| resource.final_url.as_str() == script_url)
+            .expect("dynamic child-frame script response was not captured");
+        assert_eq!(resource.frame_id, snapshot.frame_id);
+        assert_eq!(
+            resource.initiator.as_ref().map(url::Url::as_str),
+            Some(snapshot.url.as_str()),
+        );
+        assert_eq!(resource.body, b"window.__dynamicFrameLoads += 1;");
     }
 
     /// The sweep still does its job: an iframe removed from the document has
@@ -5050,6 +10259,69 @@ mod tests {
             Some(0.0),
             "a reference to the discarded frame survived, so its context cannot be collected"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn final_resource_capture_excludes_detached_frame_responses() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let base = spawn_shadow_frame_server().await;
+        let mut page = frame_page("detached-frame-capture-filter");
+        page.enable_resource_capture(super::ResourceCaptureLimits::default());
+        page.navigate(&format!("{base}dynamic-frame-parent.html"))
+            .await
+            .unwrap();
+        page.settle(1_000).await;
+
+        let frame_id = page.frame_snapshots()[0].frame_id;
+        let bytes_before_detach = {
+            let state = page.resource_capture.as_ref().unwrap().lock().unwrap();
+            assert!(
+                state
+                    .capture
+                    .resources
+                    .iter()
+                    .any(|resource| resource.frame_id == frame_id),
+                "the frame produced no captured response, so filtering it proves nothing",
+            );
+            state.capture.total_bytes
+        };
+
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate("(document.querySelector('iframe').remove(), 1)")
+            .unwrap();
+        let capture = page.take_resource_capture().unwrap();
+
+        assert!(
+            page.frames.is_empty(),
+            "the archive boundary kept a detached realm"
+        );
+        assert!(
+            capture
+                .resources
+                .iter()
+                .all(|resource| resource.frame_id == 0),
+            "a detached frame response leaked into the final archive: {:?}",
+            capture
+                .resources
+                .iter()
+                .map(|resource| (resource.frame_id, resource.final_url.as_str()))
+                .collect::<Vec<_>>(),
+        );
+        assert!(capture
+            .resources
+            .iter()
+            .all(|resource| resource.document_generation == capture.document_generation),);
+        assert_eq!(
+            capture.total_bytes,
+            capture
+                .resources
+                .iter()
+                .map(|resource| resource.body.len())
+                .sum::<usize>(),
+        );
+        assert!(capture.total_bytes < bytes_before_detach);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5183,6 +10455,100 @@ mod tests {
         page.dom = Some(parse_html(html));
         page.init_js();
         page
+    }
+
+    fn spawn_single_module_response(
+        status: &'static str,
+        body: &'static [u8],
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let length = stream.read(&mut request).unwrap();
+            let path = String::from_utf8_lossy(&request[..length])
+                .lines()
+                .next()
+                .and_then(|line| line.split_ascii_whitespace().nth(1))
+                .unwrap_or("/")
+                .to_string();
+            request_tx.send(path).unwrap();
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len(),
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+        });
+        (format!("http://{address}"), request_rx)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_external_module_response_is_captured_byte_exactly() {
+        const MODULE: &[u8] = b"globalThis.__externalModuleCaptured = true;\n";
+        let (base, requests) = spawn_single_module_response("200 OK", MODULE);
+        let mut page = import_map_test_page(
+            "external-module-capture",
+            &base,
+            r#"<html><head><script type="module" src="./entry.js"></script></head><body></body></html>"#,
+        );
+        page.enable_resource_capture(super::ResourceCaptureLimits::default());
+
+        page.execute_scripts_with_module_budget(Some(1_000)).await;
+
+        assert_eq!(
+            requests
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "/app/entry.js",
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__externalModuleCaptured === true")
+                .unwrap(),
+            serde_json::json!(true),
+        );
+        assert!(page.resource_archive_incomplete_reasons().is_empty());
+        let capture = page.take_resource_capture().unwrap();
+        let resource = capture
+            .resources
+            .iter()
+            .find(|resource| resource.final_url.as_str() == format!("{base}/app/entry.js"))
+            .expect("external module response was not captured");
+        assert_eq!(resource.resource_type, obscura_net::ResourceType::Script);
+        assert_eq!(resource.frame_id, 0);
+        assert_eq!(resource.body, MODULE);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_external_module_preparation_marks_the_archive_incomplete() {
+        let (base, requests) = spawn_single_module_response("404 Not Found", b"not found");
+        let mut page = import_map_test_page(
+            "failed-external-module",
+            &base,
+            r#"<html><head><script type="module" src="./missing.js"></script></head><body></body></html>"#,
+        );
+
+        page.execute_scripts_with_module_budget(Some(1_000)).await;
+
+        assert_eq!(
+            requests
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "/app/missing.js",
+        );
+        assert_eq!(
+            page.resource_archive_incomplete_reasons(),
+            vec![format!(
+                "top-level module graph preparation failed: {base}/app/missing.js"
+            )],
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5497,11 +10863,8 @@ mod tests {
                 document.head.appendChild(script);
             </script></body></html>"#,
         );
-        let mut page = import_map_test_page(
-            "preload-dynamic-lifecycle",
-            "http://127.0.0.1:9",
-            &html,
-        );
+        let mut page =
+            import_map_test_page("preload-dynamic-lifecycle", "http://127.0.0.1:9", &html);
 
         page.execute_scripts().await;
 
@@ -5621,11 +10984,8 @@ mod tests {
         let started = std::time::Instant::now();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(125);
 
-        let completed = super::Page::drive_load_delaying_scripts(
-            page.js.as_mut().unwrap(),
-            deadline,
-        )
-        .await;
+        let completed =
+            super::Page::drive_load_delaying_scripts(page.js.as_mut().unwrap(), deadline).await;
 
         let elapsed = started.elapsed();
         assert!(!completed, "the delayed resource must exceed the deadline");
@@ -5767,9 +11127,7 @@ mod tests {
                     .and_then(|line| line.split_ascii_whitespace().nth(1))
                     .unwrap_or("/");
                 let body = match path {
-                    "/app/lazy.js" => {
-                        "import { ready } from './lazy-child.js'; export { ready };"
-                    }
+                    "/app/lazy.js" => "import { ready } from './lazy-child.js'; export { ready };",
                     "/app/lazy-child.js" => {
                         // Cross the lifecycle's 500ms fast-settle floor on a
                         // descendant edge. deno_core must propagate the lazy
@@ -5838,8 +11196,7 @@ mod tests {
             let _ = accepted_tx.send(());
             let mut request = [0u8; 2048];
             let length = stream.read(&mut request).unwrap();
-            assert!(String::from_utf8_lossy(&request[..length])
-                .starts_with("GET /app/analytics "));
+            assert!(String::from_utf8_lossy(&request[..length]).starts_with("GET /app/analytics "));
             std::thread::sleep(std::time::Duration::from_secs(2));
             let body = "{}";
             let response = format!(
@@ -5858,11 +11215,7 @@ mod tests {
                 }});
             </script></body></html>"#,
         );
-        let mut page = import_map_test_page(
-            "ordinary-fetch-readiness",
-            &base,
-            &html,
-        );
+        let mut page = import_map_test_page("ordinary-fetch-readiness", &base, &html);
         let started = std::time::Instant::now();
         page.execute_scripts().await;
         let elapsed = started.elapsed();
@@ -6017,7 +11370,19 @@ mod tests {
         page.js = Some(runtime);
         page.url = Some(url::Url::parse(&page_url).unwrap());
 
-        assert_eq!(page.prepare_screenshot_resources(1_000).await, 1);
+        let report = page.prepare_screenshot_resources_with_report(1_000).await;
+        assert_eq!(
+            report,
+            super::ScreenshotResourceWarmupReport {
+                discovered: 1,
+                attempted: 1,
+                loaded: 1,
+                failed: 0,
+                timed_out: 0,
+                remaining: 0,
+            }
+        );
+        assert!(report.is_complete());
         assert_eq!(
             page.js
                 .as_mut()
@@ -6028,10 +11393,13 @@ mod tests {
             "cache/network fragment normalization must not alter currentSrc"
         );
         page.screenshot(page.viewport).expect("prefetched capture");
-        assert!(seen_rx
+        let first_request = seen_rx
             .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap()
-            .starts_with("GET /asset.svg "));
+            .unwrap();
+        assert!(
+            first_request.starts_with("GET /asset.svg "),
+            "unexpected warmup request line: {first_request:?}",
+        );
         assert!(
             seen_rx
                 .recv_timeout(std::time::Duration::from_millis(200))
@@ -6085,7 +11453,14 @@ mod tests {
         page.js = Some(runtime);
         page.url = Some(url::Url::parse(&page_url).unwrap());
 
-        assert_eq!(page.prepare_screenshot_resources(5).await, 0);
+        let report = page.prepare_screenshot_resources_with_report(5).await;
+        assert_eq!(report.discovered, 1);
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.loaded, 0);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.timed_out, 1);
+        assert_eq!(report.remaining, 1);
+        assert!(!report.is_complete());
         assert!(
             !page
                 .js
@@ -6094,6 +11469,109 @@ mod tests {
                 .render_resource_is_known(&asset_url),
             "a deadline-cancelled request must remain retryable"
         );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn render_resource_failures_are_reported_separately_from_remaining_work() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            let response =
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "render-failure-report".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("render-failure-report".to_string(), context);
+        let page_url = format!("http://{address}/page");
+        let asset_url = format!("http://{address}/missing.svg");
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html(&format!(
+            r#"<html><body><img src="{asset_url}"></body></html>"#
+        )));
+        runtime.set_url(&page_url);
+        runtime.run_page_init();
+        page.js = Some(runtime);
+        page.url = Some(url::Url::parse(&page_url).unwrap());
+
+        let report = page.prepare_screenshot_resources_with_report(1_000).await;
+        assert_eq!(report.discovered, 1);
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.loaded, 0);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.timed_out, 0);
+        assert_eq!(report.remaining, 0);
+        assert!(!report.is_complete());
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn render_resource_cap_is_visible_as_remaining_work() {
+        use std::io::{Read, Write};
+        const RESOURCE_COUNT: usize = 129;
+        const ATTEMPT_CAP: usize = 128;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..ATTEMPT_CAP {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request);
+                let body = br##"<svg xmlns="http://www.w3.org/2000/svg"/>"##;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "render-cap-report".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("render-cap-report".to_string(), context);
+        let page_url = format!("http://{address}/page");
+        let images = (0..RESOURCE_COUNT)
+            .map(|index| format!(r#"<img src="http://{address}/asset-{index}.svg">"#))
+            .collect::<String>();
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html(&format!("<html><body>{images}</body></html>")));
+        runtime.set_url(&page_url);
+        runtime.run_page_init();
+        page.js = Some(runtime);
+        page.url = Some(url::Url::parse(&page_url).unwrap());
+
+        let report = page.prepare_screenshot_resources_with_report(5_000).await;
+        assert_eq!(report.discovered, RESOURCE_COUNT);
+        assert_eq!(report.attempted, ATTEMPT_CAP);
+        assert_eq!(report.loaded, ATTEMPT_CAP);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.timed_out, 0);
+        assert_eq!(report.remaining, 1);
+        assert!(!report.is_complete());
     }
 
     #[cfg(feature = "render")]
@@ -6157,7 +11635,11 @@ mod tests {
         page.navigate(&page_url).await.unwrap();
 
         let mut paths = (0..3)
-            .map(|_| seen_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap())
+            .map(|_| {
+                seen_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+            })
             .collect::<Vec<_>>();
         paths.sort();
         assert_eq!(
@@ -6169,12 +11651,8 @@ mod tests {
             ]
         );
         let js = page.js.as_ref().expect("navigation runtime");
-        assert!(js.render_resource_is_known(&format!(
-            "http://{address}/dynamic.svg"
-        )));
-        assert!(js.render_resource_is_known(&format!(
-            "http://{address}/dynamic.woff2"
-        )));
+        assert!(js.render_resource_is_known(&format!("http://{address}/dynamic.svg")));
+        assert!(js.render_resource_is_known(&format!("http://{address}/dynamic.woff2")));
     }
 
     #[cfg(feature = "render")]
@@ -6335,9 +11813,9 @@ mod tests {
         .expect("materialized graph");
 
         assert!(materialized.starts_with("@media print {\n"));
-        assert!(materialized.contains(
-            r#".print{background:url("https://example.test/css/mark.svg")}"#
-        ));
+        assert!(
+            materialized.contains(r#".print{background:url("https://example.test/css/mark.svg")}"#)
+        );
         assert!(materialized.ends_with(".root{color:red}"));
     }
 
@@ -6687,11 +12165,7 @@ mod tests {
             750
         );
         assert_eq!(
-            remaining_settle_resource_warmup_ms(
-                1_000,
-                std::time::Duration::from_millis(250),
-                100,
-            ),
+            remaining_settle_resource_warmup_ms(1_000, std::time::Duration::from_millis(250), 100,),
             100
         );
         assert_eq!(

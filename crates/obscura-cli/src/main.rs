@@ -2,7 +2,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
-use obscura_browser::{BrowserContext, Page};
+use obscura_browser::{
+    BrowserContext, CapturedResource, Page, ResourceCapture, ResourceCaptureLimits,
+};
+use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 use tokio::time::{timeout, Duration};
@@ -151,6 +154,20 @@ enum Command {
 
         #[arg(long, short = 'o')]
         output: Option<std::path::PathBuf>,
+
+        /// Write a byte-exact archive of resources belonging to the final
+        /// top-level document. Requires `--dump assets` and a render-enabled
+        /// build so HTMLImageElement and CSS image/font requests are real.
+        #[arg(long, value_name = "DIR", conflicts_with = "file")]
+        assets_dir: Option<std::path::PathBuf>,
+
+        /// Maximum total response bytes retained for --assets-dir.
+        #[arg(long, default_value_t = 512 * 1024 * 1024)]
+        assets_max_bytes: usize,
+
+        /// Maximum response count retained for --assets-dir.
+        #[arg(long, default_value_t = 4_096)]
+        assets_max_resources: usize,
 
         #[arg(long, short)]
         quiet: bool,
@@ -424,6 +441,9 @@ async fn main() -> anyhow::Result<()> {
             user_agent,
             eval,
             output,
+            assets_dir,
+            assets_max_bytes,
+            assets_max_resources,
             quiet,
             storage_dir,
             file,
@@ -476,6 +496,9 @@ async fn main() -> anyhow::Result<()> {
                     stealth,
                     eval,
                     output,
+                    assets_dir,
+                    assets_max_bytes,
+                    assets_max_resources,
                     quiet,
                     global_proxy,
                     storage_dir,
@@ -663,13 +686,129 @@ async fn run_multi_worker_serve(
     }
 }
 
-async fn settle_page(page: &mut Page, wait_secs: u64, fixed: bool) {
+async fn settle_page(page: &mut Page, wait_secs: u64, fixed: bool) -> anyhow::Result<()> {
     let wait_ms = wait_secs.saturating_mul(1000);
     if fixed {
-        page.settle_for_duration(wait_ms).await;
+        page.settle_for_duration_following_navigations(wait_ms)
+            .await?;
     } else {
         page.settle(wait_ms).await;
+        while page.process_pending_navigation().await? {
+            page.settle(wait_ms).await;
+        }
     }
+    Ok(())
+}
+
+fn normalized_path_for_overlap(path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    use std::path::Component;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut lexical = std::path::PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => lexical.push(prefix.as_os_str()),
+            Component::RootDir => lexical.push(std::path::Path::new(std::path::MAIN_SEPARATOR_STR)),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                lexical.pop();
+            }
+            Component::Normal(part) => lexical.push(part),
+        }
+    }
+
+    // Resolve every existing ancestor so aliases through symlinked parents do
+    // not evade the containment check. The leaf itself commonly does not exist
+    // yet, so append missing components after canonicalizing the nearest parent.
+    let mut probe = lexical.clone();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(&probe) {
+            Ok(mut canonical) => {
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = probe.file_name().map(ToOwned::to_owned) else {
+                    return Err(error.into());
+                };
+                missing.push(name);
+                if !probe.pop() {
+                    return Err(error.into());
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn path_starts_with_components(
+    path: &std::path::Path,
+    base: &std::path::Path,
+    case_insensitive: bool,
+) -> bool {
+    let mut path_components = path.components();
+    for base_component in base.components() {
+        let Some(path_component) = path_components.next() else {
+            return false;
+        };
+        let equal = if case_insensitive {
+            path_component
+                .as_os_str()
+                .to_string_lossy()
+                .to_lowercase()
+                == base_component
+                    .as_os_str()
+                    .to_string_lossy()
+                    .to_lowercase()
+        } else {
+            path_component == base_component
+        };
+        if !equal {
+            return false;
+        }
+    }
+    true
+}
+
+fn asset_paths_overlap(archive: &std::path::Path, candidate: &std::path::Path) -> bool {
+    // Windows paths and the default macOS APFS configuration are
+    // case-insensitive.  Treat every macOS volume conservatively here: a
+    // false positive on a case-sensitive volume only rejects an ambiguous
+    // output layout, while a false negative lets --output overwrite a file
+    // that the archive writer just created (for example manifest.json).
+    let case_insensitive = cfg!(any(windows, target_os = "macos"));
+    path_starts_with_components(candidate, archive, case_insensitive)
+        || path_starts_with_components(archive, candidate, case_insensitive)
+}
+
+fn ensure_asset_output_paths_are_disjoint(
+    assets_dir: &std::path::Path,
+    output: Option<&std::path::Path>,
+    screenshot: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let archive = normalized_path_for_overlap(assets_dir)?;
+    for (flag, candidate) in [("--output", output), ("--screenshot", screenshot)] {
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        let candidate = normalized_path_for_overlap(candidate)?;
+        if asset_paths_overlap(&archive, &candidate) {
+            anyhow::bail!(
+                "{} path must be outside --assets-dir (archive: {}, path: {})",
+                flag,
+                assets_dir.display(),
+                candidate.display(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn configure_fetch_navigation_timeout(page: &mut Page, timeout_secs: u64) {
@@ -688,6 +827,9 @@ async fn run_fetch(
     stealth: bool,
     eval: Option<String>,
     output: Option<std::path::PathBuf>,
+    assets_dir: Option<std::path::PathBuf>,
+    assets_max_bytes: usize,
+    assets_max_resources: usize,
     quiet: bool,
     proxy: Option<String>,
     storage_dir: Option<std::path::PathBuf>,
@@ -700,6 +842,23 @@ async fn run_fetch(
     // eval's async work settles (issue #248).
     let dump_specified = dump.is_some();
     let dump = dump.unwrap_or(DumpFormat::Html);
+
+    if assets_dir.is_some() && dump != DumpFormat::Assets {
+        anyhow::bail!("--assets-dir requires --dump assets");
+    }
+    #[cfg(not(feature = "render"))]
+    if assets_dir.is_some() {
+        anyhow::bail!(
+            "--assets-dir requires a build with the render feature (cargo build --features render)"
+        );
+    }
+    if let Some(directory) = assets_dir.as_deref() {
+        ensure_asset_output_paths_are_disjoint(
+            directory,
+            output.as_deref(),
+            screenshot.as_deref(),
+        )?;
+    }
 
     // --dump original short-circuits the browser stack entirely: fetch the raw
     // response body via HTTP and stream the bytes verbatim. Useful for binary
@@ -729,6 +888,12 @@ async fn run_fetch(
     context.obey_robots = obey_robots;
     let context = Arc::new(context);
     let mut page = Page::new("fetch-page".to_string(), context.clone());
+    if assets_dir.is_some() {
+        page.enable_resource_capture(ResourceCaptureLimits {
+            max_resources: assets_max_resources,
+            max_total_bytes: assets_max_bytes,
+        });
+    }
     // Keep the browser's end-to-end navigation ceiling aligned with the CLI
     // request deadline. Previously Page retained its independent 30s default,
     // so `fetch --timeout 50` could still fail after 30 seconds.
@@ -802,10 +967,26 @@ async fn run_fetch(
             2
         } else {
             1
+        }
+        // Resource preparation can make an image/font onload handler request
+        // another document. Each of the bounded archive warm-up rounds gets a
+        // complete settle window, so the hard watchdog must budget those too.
+        .saturating_add(if assets_dir.is_some() { 4 } else { 0 });
+        let archive_warmup_secs = if assets_dir.is_some() {
+            std::env::var("OBSCURA_RENDER_RESOURCE_DEADLINE_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(5_000)
+                .saturating_mul(4)
+                .saturating_add(999)
+                / 1_000
+        } else {
+            0
         };
         let hard = Duration::from_secs(
             timeout_secs
                 .saturating_add(wait_secs.saturating_mul(settle_passes))
+                .saturating_add(archive_warmup_secs)
                 .saturating_add(10),
         );
         std::thread::spawn(move || {
@@ -842,7 +1023,8 @@ async fn run_fetch(
     // and completion callbacks (e.g. testharness's add_completion_callback) run
     // before we read the page. Returns early once the loop is idle, so static
     // pages stay fast.
-    settle_page(&mut page, wait_secs, wait_is_fixed).await;
+    let settle_is_fixed = wait_is_fixed || assets_dir.is_some();
+    settle_page(&mut page, wait_secs, settle_is_fixed).await?;
 
     let mut deferred_eval_output = None;
     let initial_controlled_scroll = if eval_at_capture_boundary {
@@ -864,7 +1046,7 @@ async fn run_fetch(
         None
     };
     if initial_controlled_scroll.is_some() {
-        settle_page(&mut page, wait_secs, wait_is_fixed).await;
+        settle_page(&mut page, wait_secs, settle_is_fixed).await?;
     }
 
     if !eval_at_capture_boundary {
@@ -897,7 +1079,7 @@ async fn run_fetch(
             // listener) that writes the DOM. Drive the event loop again so that
             // work completes, then fall through to selector/capture/dump instead
             // of returning the still-pending eval value (issue #248).
-            settle_page(&mut page, wait_secs, wait_is_fixed).await;
+            settle_page(&mut page, wait_secs, settle_is_fixed).await?;
         }
     }
 
@@ -905,6 +1087,133 @@ async fn run_fetch(
         let found = wait_for_selector(&mut page, sel, wait_secs).await;
         if !found {
             eprintln!("Warning: selector '{}' not found after {}s", sel, wait_secs);
+        }
+        settle_page(&mut page, wait_secs, settle_is_fixed).await?;
+    }
+
+    if let Some(ref directory) = assets_dir {
+        let mut warmup_failed = 0usize;
+        let mut warmup_timed_out = 0usize;
+        let mut warmup_remaining = 0usize;
+        #[cfg(feature = "render")]
+        {
+            let resource_deadline_ms = std::env::var("OBSCURA_RENDER_RESOURCE_DEADLINE_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(5_000);
+            // A final resource warm-up discovers CSS images, fonts, picture
+            // candidates and poster images that do not necessarily start a
+            // request until style/layout is resolved. Resource completion may
+            // run an onload handler which navigates; give every round a full
+            // bounded settle window, then repeat against the replacement
+            // document. Frame realms own separate dynamic-script queues, so a
+            // zero render-resource count is not by itself an idle signal.
+            for round in 0..4 {
+                let before = page.url_string();
+                let pending_before = page.has_pending_resource_work();
+                let report = page
+                    .prepare_screenshot_resources_with_report(resource_deadline_ms)
+                    .await;
+                // The top-level fixed wait can attach a child frame near its
+                // end. Give that frame one complete archive resource window
+                // even if it is momentarily between a message/timer and its
+                // first request; a 100ms idle probe alone strands real widgets
+                // in their initial placeholder DOM.
+                if round == 0
+                    || report.discovered != 0
+                    || pending_before
+                    || page.has_pending_resource_work()
+                {
+                    page.settle_for_duration_following_navigations(resource_deadline_ms)
+                        .await?;
+                } else {
+                    page.settle_for_duration_following_navigations(100).await?;
+                }
+                let after = page.url_string();
+                if after != before {
+                    // The response archive itself resets on top-level
+                    // navigation. Do the same for diagnostics belonging to the
+                    // superseded document so only the final generation decides
+                    // completeness.
+                    warmup_failed = 0;
+                    warmup_timed_out = 0;
+                    warmup_remaining = 0;
+                    continue;
+                }
+                warmup_failed = warmup_failed.saturating_add(report.failed);
+                warmup_timed_out = warmup_timed_out.saturating_add(report.timed_out);
+
+                // Settling may run an onload/timer callback which inserts a new
+                // image or font after the pre-settle scan. Probe again without
+                // starting I/O; otherwise an apparently idle first scan can
+                // strand a final-DOM resource and still claim completeness.
+                let post_settle = page.prepare_screenshot_resources_with_report(0).await;
+                warmup_remaining = post_settle.remaining;
+                if round != 0
+                    && report.is_complete()
+                    && post_settle.remaining == 0
+                    && !page.has_pending_resource_work()
+                {
+                    break;
+                }
+            }
+        }
+
+        let final_url = page.url_string();
+        let page_html = dump_html(&page);
+        let (frames, frame_capture_reasons) = capture_frame_documents(&mut page);
+        let mut incomplete_reasons = frame_capture_reasons;
+        incomplete_reasons.extend(page.resource_archive_incomplete_reasons());
+        if warmup_failed != 0 {
+            incomplete_reasons.push(format!(
+                "{} renderer resource request(s) failed during final-page warmup",
+                warmup_failed,
+            ));
+        }
+        if warmup_timed_out != 0 {
+            incomplete_reasons.push(format!(
+                "{} renderer resource request attempt(s) exceeded the bounded warmup deadline",
+                warmup_timed_out,
+            ));
+        }
+        if warmup_remaining != 0 {
+            incomplete_reasons.push(format!(
+                "{} renderer resource(s) remained unresolved after the final warmup pass",
+                warmup_remaining,
+            ));
+        }
+        let capture = page
+            .take_resource_capture()
+            .ok_or_else(|| anyhow::anyhow!("resource capture was not enabled"))?;
+        incomplete_reasons.extend(missing_classic_script_reasons(
+            &page_html,
+            &final_url,
+            &frames,
+            &capture,
+        ));
+        let summary = write_asset_archive(
+            directory,
+            url_str,
+            &final_url,
+            &page_html,
+            &frames,
+            capture,
+            incomplete_reasons,
+        )?;
+        if !quiet {
+            eprintln!(
+                "Asset archive written: {} ({} responses, {} unique files, {} bytes)",
+                directory.display(),
+                summary.resources,
+                summary.unique_files,
+                summary.bytes,
+            );
+        }
+        if !summary.complete {
+            anyhow::bail!(
+                "asset archive is incomplete; see {}",
+                directory.join("manifest.json").display()
+            );
         }
     }
 
@@ -1917,16 +2226,429 @@ fn dump_assets(page: &Page) -> String {
     lines.join("\n")
 }
 
+fn resource_type_name(resource_type: obscura_net::ResourceType) -> &'static str {
+    match resource_type {
+        obscura_net::ResourceType::Document => "document",
+        obscura_net::ResourceType::Script => "script",
+        obscura_net::ResourceType::Stylesheet => "stylesheet",
+        obscura_net::ResourceType::Image => "image",
+        obscura_net::ResourceType::Font => "font",
+        obscura_net::ResourceType::Xhr => "xhr",
+        obscura_net::ResourceType::Fetch => "fetch",
+        obscura_net::ResourceType::Other => "other",
+    }
+}
+
+fn response_content_type(resource: &CapturedResource) -> String {
+    resource
+        .response_headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value)
+        .map(|value| value.split(';').next().unwrap_or(value).trim().to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn archive_extension(content_type: &str, url: &url::Url) -> String {
+    let known = match content_type {
+        "text/html" | "application/xhtml+xml" => Some("html"),
+        "text/css" => Some("css"),
+        "text/javascript" | "application/javascript" | "application/x-javascript" => Some("js"),
+        "application/json" | "text/json" => Some("json"),
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        "image/avif" => Some("avif"),
+        "image/svg+xml" => Some("svg"),
+        "font/woff2" | "application/font-woff2" => Some("woff2"),
+        "font/woff" | "application/font-woff" => Some("woff"),
+        "font/ttf" | "application/x-font-ttf" => Some("ttf"),
+        "font/otf" | "application/x-font-opentype" => Some("otf"),
+        "application/wasm" => Some("wasm"),
+        "application/pdf" => Some("pdf"),
+        "video/mp4" => Some("mp4"),
+        "video/webm" => Some("webm"),
+        "audio/mpeg" => Some("mp3"),
+        "audio/ogg" => Some("ogg"),
+        _ => None,
+    };
+    if let Some(extension) = known {
+        return extension.to_string();
+    }
+
+    std::path::Path::new(url.path())
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| {
+            !extension.is_empty()
+                && extension.len() <= 12
+                && extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_else(|| "bin".to_string())
+}
+
+fn comparable_resource_url(raw: &str) -> Option<String> {
+    let mut parsed = url::Url::parse(raw).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    parsed.set_fragment(None);
+    Some(parsed.to_string())
+}
+
+/// Classic external scripts visible in the final serialized document. This is
+/// intentionally narrower than `--dump assets`: hints such as preconnect and
+/// unselected `<picture><source>` candidates are valid DOM URLs without being
+/// response bodies a browser must have loaded. A connected classic script,
+/// however, must have produced a network outcome before an archive can claim
+/// that the rendered document's resource set is complete.
+fn classic_script_urls(html: &str, document_url: &str) -> Vec<String> {
+    let dom = obscura_dom::parse_html(html);
+    let Some(document_url) = url::Url::parse(document_url).ok() else {
+        return Vec::new();
+    };
+    let base_url = dom
+        .query_selector_all("base[href]")
+        .unwrap_or_default()
+        .into_iter()
+        .find_map(|id| {
+            dom.get_node(id).and_then(|node| {
+                node.get_attribute("href")
+                    .and_then(|href| document_url.join(href).ok())
+            })
+        })
+        .unwrap_or(document_url);
+    let mut urls = std::collections::BTreeSet::new();
+    for id in dom.query_selector_all("script[src]").unwrap_or_default() {
+        let Some(node) = dom.get_node(id) else {
+            continue;
+        };
+        let script_type = node
+            .get_attribute("type")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if !matches!(
+            script_type.as_str(),
+            ""
+                | "text/javascript"
+                | "application/javascript"
+                | "application/x-javascript"
+                | "text/ecmascript"
+                | "application/ecmascript"
+        ) {
+            continue;
+        }
+        let Some(src) = node.get_attribute("src") else {
+            continue;
+        };
+        let Ok(resolved) = base_url.join(src.trim()) else {
+            continue;
+        };
+        if let Some(url) = comparable_resource_url(resolved.as_str()) {
+            urls.insert(url);
+        }
+    }
+    urls.into_iter().collect()
+}
+
+fn missing_classic_script_reasons(
+    page_html: &str,
+    final_url: &str,
+    frames: &[(u32, String, String)],
+    capture: &ResourceCapture,
+) -> Vec<String> {
+    let mut captured = std::collections::HashSet::new();
+    for resource in &capture.resources {
+        for candidate in [&resource.requested_url, &resource.final_url] {
+            if let Some(url) = comparable_resource_url(candidate.as_str()) {
+                captured.insert((resource.frame_id, url));
+            }
+        }
+    }
+
+    let mut missing = Vec::new();
+    for url in classic_script_urls(page_html, final_url) {
+        if !captured.contains(&(0, url.clone())) {
+            missing.push(format!(
+                "top-level classic script {} is present in the final DOM but has no captured response",
+                url,
+            ));
+        }
+    }
+    for (frame_id, frame_url, html) in frames {
+        for url in classic_script_urls(html, frame_url) {
+            if !captured.contains(&(*frame_id, url.clone())) {
+                missing.push(format!(
+                    "frame {} ({}) classic script {} is present in the final DOM but has no captured response",
+                    frame_id, frame_url, url,
+                ));
+            }
+        }
+    }
+    missing
+}
+
+fn capture_frame_documents(page: &mut Page) -> (Vec<(u32, String, String)>, Vec<String>) {
+    let snapshots = page.frame_snapshots();
+    let mut documents = Vec::with_capacity(snapshots.len());
+    let mut incomplete_reasons = Vec::new();
+    for (index, snapshot) in snapshots.into_iter().enumerate() {
+        match page.evaluate_in_frame(index, "document.documentElement.outerHTML") {
+            Ok(serde_json::Value::String(html)) => {
+                documents.push((snapshot.frame_id, snapshot.url, html));
+            }
+            Ok(_) => incomplete_reasons.push(format!(
+                "frame {} ({}) could not be archived because DOM serialization returned a non-string value",
+                snapshot.frame_id, snapshot.url,
+            )),
+            Err(error) => incomplete_reasons.push(format!(
+                "frame {} ({}) could not be archived because DOM serialization failed: {}",
+                snapshot.frame_id, snapshot.url, error,
+            )),
+        }
+    }
+    (documents, incomplete_reasons)
+}
+
+struct AssetArchiveSummary {
+    complete: bool,
+    resources: usize,
+    unique_files: usize,
+    bytes: usize,
+}
+
+fn prepare_asset_archive_directory(directory: &std::path::Path) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(directory) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                anyhow::bail!(
+                    "asset archive path must not be a symbolic link: {}",
+                    directory.display(),
+                );
+            }
+            if !metadata.is_dir() {
+                anyhow::bail!("asset archive path is not a directory: {}", directory.display());
+            }
+
+            let mut contains_entry = false;
+            for entry in std::fs::read_dir(directory)? {
+                let entry = entry?;
+                contains_entry = true;
+                if entry.file_type()?.is_symlink() {
+                    anyhow::bail!(
+                        "asset archive contains a symbolic link and must be empty: {}",
+                        entry.path().display(),
+                    );
+                }
+            }
+            if contains_entry {
+                anyhow::bail!(
+                    "asset archive directory must be empty: {}",
+                    directory.display()
+                );
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = directory.parent().filter(|path| !path.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    anyhow::anyhow!(
+                        "failed to create asset archive parent {}: {}",
+                        parent.display(),
+                        error,
+                    )
+                })?;
+            }
+            std::fs::create_dir(directory).map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to create new asset archive directory {}: {}",
+                    directory.display(),
+                    error,
+                )
+            })?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn create_new_archive_directory(directory: &std::path::Path) -> anyhow::Result<()> {
+    match std::fs::create_dir(directory) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Ok(metadata) = std::fs::symlink_metadata(directory) {
+                if metadata.file_type().is_symlink() {
+                    anyhow::bail!(
+                        "asset archive target must not be a symbolic link: {}",
+                        directory.display(),
+                    );
+                }
+            }
+            Err(anyhow::anyhow!(
+                "failed to create new asset archive directory {}: {}",
+                directory.display(),
+                error,
+            ))
+        }
+    }
+}
+
+fn write_new_archive_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!(
+                "asset archive target must not be a symbolic link: {}",
+                path.display(),
+            );
+        }
+        anyhow::bail!("asset archive target already exists: {}", path.display());
+    }
+
+    // create_new maps to exclusive creation, so a target introduced after the
+    // metadata check is rejected instead of being followed or truncated.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to create new asset archive file {}: {}",
+                path.display(),
+                error,
+            )
+        })?;
+    if let Err(error) = file.write_all(bytes) {
+        anyhow::bail!(
+            "failed to write asset archive file {}: {}",
+            path.display(),
+            error,
+        );
+    }
+    Ok(())
+}
+
+fn write_asset_archive(
+    directory: &std::path::Path,
+    input_url: &str,
+    final_url: &str,
+    page_html: &str,
+    frames: &[(u32, String, String)],
+    mut capture: ResourceCapture,
+    mut incomplete_reasons: Vec<String>,
+) -> anyhow::Result<AssetArchiveSummary> {
+    prepare_asset_archive_directory(directory)?;
+
+    let resources_dir = directory.join("resources");
+    let frames_dir = directory.join("frames");
+    create_new_archive_directory(&resources_dir)?;
+    if !frames.is_empty() {
+        create_new_archive_directory(&frames_dir)?;
+    }
+    write_new_archive_file(&directory.join("page.html"), page_html.as_bytes())?;
+
+    let mut frame_records = Vec::new();
+    for (ordinal, (frame_id, url, html)) in frames.iter().enumerate() {
+        let relative = format!("frames/{ordinal:04}.html");
+        write_new_archive_file(&directory.join(&relative), html.as_bytes())?;
+        frame_records.push(serde_json::json!({
+            "frame_id": frame_id,
+            "url": url,
+            "path": relative,
+        }));
+    }
+
+    capture.resources.sort_by(|left, right| {
+        left.frame_id
+            .cmp(&right.frame_id)
+            .then_with(|| resource_type_name(left.resource_type).cmp(resource_type_name(right.resource_type)))
+            .then_with(|| left.final_url.as_str().cmp(right.final_url.as_str()))
+            .then_with(|| left.requested_url.as_str().cmp(right.requested_url.as_str()))
+            .then_with(|| left.method.cmp(&right.method))
+    });
+
+    let mut written_files: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+    let mut asset_records = Vec::with_capacity(capture.resources.len());
+    for resource in &capture.resources {
+        let hash = format!("{:x}", Sha256::digest(&resource.body));
+        let content_type = response_content_type(resource);
+        let extension = archive_extension(&content_type, &resource.final_url);
+        let file_key = (hash.clone(), extension.clone());
+        let relative = if let Some(existing) = written_files.get(&file_key) {
+            existing.clone()
+        } else {
+            let relative = format!("resources/{hash}.{extension}");
+            write_new_archive_file(&directory.join(&relative), &resource.body)?;
+            written_files.insert(file_key, relative.clone());
+            relative
+        };
+        asset_records.push(serde_json::json!({
+            "request_url": resource.requested_url,
+            "final_url": resource.final_url,
+            "redirected_from": resource.redirected_from,
+            "method": resource.method,
+            "resource_type": resource_type_name(resource.resource_type),
+            "document_generation": resource.document_generation,
+            "frame_id": resource.frame_id,
+            "initiator": resource.initiator,
+            "status": resource.status,
+            "content_type": content_type,
+            "bytes": resource.body.len(),
+            "sha256": hash,
+            "path": relative,
+        }));
+    }
+
+    if capture.omitted_resources != 0 {
+        incomplete_reasons.push(format!(
+            "capture limits omitted {} responses ({} bytes)",
+            capture.omitted_resources, capture.omitted_bytes
+        ));
+    }
+    incomplete_reasons.sort();
+    let complete = incomplete_reasons.is_empty();
+    let manifest = serde_json::json!({
+        "version": 1,
+        "input_url": input_url,
+        "final_url": final_url,
+        "complete": complete,
+        "incomplete_reasons": incomplete_reasons,
+        "document_generation": capture.document_generation,
+        "rendered_document": "page.html",
+        "frames": frame_records,
+        "captured_response_bytes": capture.total_bytes,
+        "assets": asset_records,
+    });
+    write_new_archive_file(
+        &directory.join("manifest.json"),
+        &serde_json::to_vec_pretty(&manifest)?,
+    )?;
+
+    Ok(AssetArchiveSummary {
+        complete,
+        resources: capture.resources.len(),
+        unique_files: written_files.len(),
+        bytes: capture.total_bytes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        configure_fetch_navigation_timeout, effective_v8_flags, extract_assets,
-        extract_readable_text, fetch_original_bytes, is_quiet_command, link_kind_from_rel,
-        merge_proxy, normalize_v8_flags, read_urls_from_file, resolve_asset_url, select_log_filter,
-        write_or_print, write_or_print_bytes, Args, Command, DumpFormat, DEFAULT_V8_FLAGS,
+        asset_paths_overlap, classic_script_urls, configure_fetch_navigation_timeout,
+        effective_v8_flags, extract_assets, extract_readable_text, fetch_original_bytes,
+        is_quiet_command, link_kind_from_rel, merge_proxy, missing_classic_script_reasons,
+        normalize_v8_flags, path_starts_with_components, read_urls_from_file, resolve_asset_url,
+        select_log_filter, write_or_print, write_or_print_bytes, Args, CapturedResource, Command,
+        DumpFormat, ResourceCapture, DEFAULT_V8_FLAGS,
     };
     use clap::Parser;
     use obscura_dom::parse_html;
+    use obscura_net::ResourceType;
 
     // Issue #117 — `--dump original` short-circuits the browser stack and
     // streams the raw response body verbatim, including for binary payloads.
@@ -2399,6 +3121,9 @@ mod tests {
             eval: None,
             quiet: true,
             output: None,
+            assets_dir: None,
+            assets_max_bytes: 512 * 1024 * 1024,
+            assets_max_resources: 4_096,
             storage_dir: None,
             screenshot: None,
         });
@@ -2489,6 +3214,31 @@ mod tests {
     }
 
     #[test]
+    fn case_folding_platform_path_overlap_is_case_insensitive_by_component() {
+        let archive = std::path::Path::new("/Temp/Capture/Assets");
+        let aliased_child = std::path::Path::new("/temp/capture/assets/Manifest.JSON");
+        let aliased_parent = std::path::Path::new("/TEMP/CAPTURE");
+        let sibling = std::path::Path::new("/temp/capture/assets-old/manifest.json");
+
+        assert!(path_starts_with_components(
+            aliased_child,
+            archive,
+            true,
+        ));
+        assert!(path_starts_with_components(archive, aliased_parent, true));
+        assert!(!path_starts_with_components(sibling, archive, true));
+        assert!(
+            !path_starts_with_components(aliased_child, archive, false),
+            "the test must exercise case folding rather than ordinary Path prefix matching",
+        );
+        assert_eq!(
+            asset_paths_overlap(archive, aliased_child),
+            cfg!(any(windows, target_os = "macos")),
+            "the production helper must conservatively fold case on Windows and macOS",
+        );
+    }
+
+    #[test]
     fn resolve_asset_url_keeps_absolute_unchanged() {
         let base = url::Url::parse("https://page.test/a/b").unwrap();
         let abs = "https://cdn.test/x.js";
@@ -2510,6 +3260,63 @@ mod tests {
         let base = url::Url::parse("https://page.test/").unwrap();
         assert!(resolve_asset_url("", Some(&base)).is_none());
         assert!(resolve_asset_url("   ", Some(&base)).is_none());
+    }
+
+    #[test]
+    fn final_classic_script_audit_uses_document_base_and_skips_non_classic_types() {
+        let urls = classic_script_urls(
+            r#"<html><head><base href="/assets/"></head><body>
+                <script src="app.js"></script>
+                <script type="text/javascript" src="legacy.js#ignored"></script>
+                <script type="module" src="module.js"></script>
+                <script type="application/json" src="data.json"></script>
+            </body></html>"#,
+            "https://example.test/path/page.html",
+        );
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.test/assets/app.js".to_string(),
+                "https://example.test/assets/legacy.js".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn final_classic_script_audit_requires_a_response_from_the_owning_frame() {
+        let script_url = url::Url::parse("https://cdn.example.test/shared.js").unwrap();
+        let capture = ResourceCapture {
+            document_generation: 1,
+            resources: vec![CapturedResource {
+                requested_url: script_url.clone(),
+                final_url: script_url,
+                method: "GET".to_string(),
+                resource_type: ResourceType::Script,
+                document_generation: 1,
+                frame_id: 0,
+                initiator: Some(url::Url::parse("https://example.test/").unwrap()),
+                status: 200,
+                request_headers: Default::default(),
+                response_headers: Default::default(),
+                redirected_from: Vec::new(),
+                body: b"window.shared = true;".to_vec(),
+            }],
+            total_bytes: 21,
+            omitted_resources: 0,
+            omitted_bytes: 0,
+        };
+        let reasons = missing_classic_script_reasons(
+            r#"<script src="https://cdn.example.test/shared.js"></script>"#,
+            "https://example.test/",
+            &[(
+                7,
+                "https://frame.example.test/".to_string(),
+                r#"<script src="https://cdn.example.test/shared.js"></script>"#.to_string(),
+            )],
+            &capture,
+        );
+        assert_eq!(reasons.len(), 1, "top-level capture must not cover frame 7");
+        assert!(reasons[0].contains("frame 7"));
     }
 
     #[test]

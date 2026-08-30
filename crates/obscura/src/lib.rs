@@ -28,5 +28,10 @@ pub use error::Error;
 pub use page::Page;
 
 // Request/response interception types (issue #306).
-pub use obscura_browser::{InterceptedRequest, InterceptResolution};
+pub use obscura_browser::{
+    CapturedResource, InterceptedRequest, InterceptResolution, ResourceCapture,
+    ResourceCaptureLimits,
+};
+#[cfg(feature = "render")]
+pub use obscura_browser::ScreenshotResourceWarmupReport;
 pub use obscura_net::{RequestCallback, RequestInfo, ResourceType, Response, ResponseCallback};

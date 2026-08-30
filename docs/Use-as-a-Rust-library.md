@@ -5,7 +5,7 @@ The `obscura` crate embeds the engine in a Rust program with a `Browser` / `Page
 ```toml
 [dependencies]
 obscura = { git = "https://github.com/h4ckf0r0day/obscura" }
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
 ```
 
@@ -13,6 +13,13 @@ The first build compiles V8 from source, so it is slow and needs the same build 
 
 ```toml
 obscura = { git = "https://github.com/h4ckf0r0day/obscura", tag = "v0.1.7" }
+```
+
+Enable the `render` feature when the application must download resources loaded
+through `new Image()` or `<img>` (including images created inside child frames):
+
+```toml
+obscura = { git = "https://github.com/h4ckf0r0day/obscura", features = ["render"] }
 ```
 
 ## Quickstart
@@ -51,10 +58,17 @@ async fn main() -> anyhow::Result<()> {
 - `goto(url).await` navigate and wait for load
 - `content()` rendered HTML
 - `url()` current URL
+- `frame_urls()` child-frame URLs in creation order
+- `evaluate_in_frame(index, js)` run JavaScript in a child frame realm
+- `fetched_urls()` resource URLs fetched by the page and its child frames
 - `evaluate(js)` run JavaScript, returns a `serde_json::Value`
 - `query_selector(css)` first match as an `Element`, or `None`
 - `wait_for_selector(css, Duration).await` poll until present
 - `settle(max_ms).await` drive the event loop so async work (`fetch`, timers) completes
+- `settle_following_navigations(max_ms).await` settle and commit delayed top-level `location` navigations
+- `enable_resource_capture(limits)` / `take_resource_capture()` retain byte-exact responses for the final document generation
+- `has_pending_resource_work()` report top-level or child-frame request/dynamic-script work that can still extend a capture
+- `resource_archive_incomplete_reasons()` report engine caps, frame probe failures, unsupported frame work, and pending queues without silently treating them as empty
 - `on_request(cb)` / `on_response(cb)` passive callbacks for every request and response
 - `enable_interception()` channel to block, mock, or rewrite requests
 - `add_preload_script(js)` run a script before the page's own scripts
@@ -133,6 +147,102 @@ page.goto("https://example.com").await?;
 ```
 
 `resource_type` reports `Fetch` for JS-initiated requests and does not yet split `Xhr` from `Fetch`.
+
+### Final-document resource capture
+
+Use resource capture when response bodies must be archived rather than merely
+observed. Requests snapshot the current top-level document generation when they
+start. A later real navigation resets the capture, and a slow response from the
+replaced page cannot leak into the final result.
+
+This response-completeness workflow requires the renderer warmup API, so
+enable the `render` feature shown above. Do not conditionally skip the warmup
+when describing the captured response set as complete under its bounded policy.
+
+```rust
+use obscura::{Browser, ResourceCaptureLimits};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let browser = Browser::new()?;
+    let mut page = browser.new_page().await?;
+    page.enable_resource_capture(ResourceCaptureLimits::default());
+    page.goto("https://example.com").await?;
+    page.settle_following_navigations(5_000).await?;
+
+    // Repeat because loading one resource can run an onload handler that
+    // inserts another resource or commits a replacement document.
+    let mut warmup_complete = false;
+    for round in 0..4 {
+        let before = page.url();
+        let warmup = page.prepare_screenshot_resources_with_report(5_000).await;
+        page.settle_following_navigations(5_000).await?;
+        if page.url() != before {
+            continue;
+        }
+        anyhow::ensure!(
+            warmup.failed == 0 && warmup.timed_out == 0,
+            "resource warmup failed or timed out: {warmup:?}",
+        );
+        let post_settle = page.prepare_screenshot_resources_with_report(0).await;
+        if round != 0
+            && warmup.remaining == 0
+            && post_settle.remaining == 0
+            && !page.has_pending_resource_work()
+        {
+            warmup_complete = true;
+            break;
+        }
+    }
+    anyhow::ensure!(
+        warmup_complete,
+        "resource work did not reach a complete bounded capture state",
+    );
+    let incomplete_reasons = page.resource_archive_incomplete_reasons();
+    anyhow::ensure!(
+        incomplete_reasons.is_empty(),
+        "engine reported an incomplete archive: {incomplete_reasons:?}",
+    );
+
+    let capture = page.take_resource_capture().expect("capture enabled");
+    anyhow::ensure!(
+        capture.omitted_resources == 0 && capture.omitted_bytes == 0,
+        "capture limits omitted {} resources ({} bytes)",
+        capture.omitted_resources,
+        capture.omitted_bytes,
+    );
+
+    // Use a fresh directory: create_dir refuses to reuse one, so a later run
+    // cannot silently overwrite files from an earlier capture.
+    let output_dir = std::path::Path::new("responses");
+    std::fs::create_dir(output_dir)?;
+    for (ordinal, response) in capture.resources.into_iter().enumerate() {
+        let path = output_dir.join(format!("response-{ordinal:06}.bin"));
+        std::fs::write(path, response.body)?;
+    }
+    Ok(())
+}
+```
+
+`ResourceCaptureLimits` bounds count and total retained bytes. If either limit
+is reached, `omitted_resources` is non-zero and `omitted_bytes` reports the
+discarded body bytes (which can itself be zero); applications must treat either
+reported omission as incomplete. Before describing a capture as complete,
+repeat renderer warmup followed by bounded settling, probe again after each
+settle, and require `has_pending_resource_work()` to be false. Every accepted
+`prepare_screenshot_resources_with_report()` pass must have zero `failed` and
+`timed_out` fields; a non-zero `remaining` must be drained by a later bounded
+pass. The report makes the per-pass resource limit and deadline explicit
+instead of treating `loaded == 0` as an idle signal. Finally require
+`resource_archive_incomplete_reasons()` to be empty; it covers stylesheet
+depth/count caps, frame queue/realm caps, failed frame diagnostics, and
+unsupported or pending child-frame work.
+
+Those are the engine-side response checks. A writer claiming parity with the
+CLI manifest must additionally serialize every live frame successfully and
+verify that each final-DOM classic script has a captured response owned by the
+same frame. See [Archive final-page resources](Archive-final-page-resources.md)
+for the full manifest contract.
 
 ## When to use which interface
 

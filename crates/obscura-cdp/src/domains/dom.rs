@@ -4,6 +4,21 @@ use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
 
+/// Parse the synthetic object id returned when `DOM.resolveNode` cannot retain
+/// a regular runtime object. Keep this deliberately narrower than a general
+/// integer parser: only the exact canonical `node-<u32>` form we mint is
+/// accepted by later DOM operations.
+fn synthetic_node_id(object_id: &str) -> Option<u32> {
+    let digits = object_id.strip_prefix("node-")?;
+    if digits.is_empty()
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        || (digits.len() > 1 && digits.starts_with('0'))
+    {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 /// Resolve a DOM `nodeId` from CDP params. Honors `nodeId`, `backendNodeId`,
 /// and `objectId` in that order. Playwright commonly passes only `objectId`
 /// (returned by a prior `DOM.resolveNode`); without this fallback those
@@ -23,10 +38,24 @@ fn resolve_node_id(page: &mut Page, params: &Value) -> Result<u64, String> {
         );
         let result = page.evaluate(&code);
         let nid = result.as_f64().map(|n| n as i64).unwrap_or(-1);
-        if nid < 0 {
-            return Err(format!("objectId {oid} could not be resolved to a node"));
+        if nid >= 0 {
+            return Ok(nid as u64);
         }
-        return Ok(nid as u64);
+
+        // `DOM.resolveNode` has a best-effort fallback for runtimes which
+        // cannot retain the wrapper. Make that id round-trip without treating
+        // arbitrary `node-...` strings as node identifiers or truncating a
+        // value to NodeId's u32 representation.
+        if let Some(nid) = synthetic_node_id(oid) {
+            let exists = page
+                .with_dom(|dom| dom.get_node(NodeId::new(nid)).is_some())
+                .unwrap_or(false);
+            if exists {
+                return Ok(nid as u64);
+            }
+        }
+
+        return Err(format!("objectId {oid} could not be resolved to a node"));
     }
     Err("nodeId, backendNodeId, or objectId required".to_string())
 }
@@ -174,18 +203,8 @@ pub async fn handle(
 
             let js_code = format!(
                 "(function() {{\
-                    var nid = {};\
-                    var node = null;\
-                    if (globalThis._cache && globalThis._cache.has(nid)) {{\
-                        node = globalThis._cache.get(nid);\
-                    }} else {{\
-                        var t = +Deno.core.ops.op_dom('node_type', String(nid), '', globalThis.__obscura_frameId >>> 0);\
-                        if (t === 1) node = new Element(nid);\
-                        else if (t === 9) node = globalThis.document;\
-                        else node = new Node(nid);\
-                        if (globalThis._cache) globalThis._cache.set(nid, node);\
-                    }}\
-                    return node;\
+                    var wrap = globalThis._wrap;\
+                    return typeof wrap === 'function' ? wrap({}) : null;\
                 }})()",
                 node_id,
             );
@@ -534,6 +553,24 @@ mod tests {
     // the id as a JSON literal rather than splicing it into a single-quoted
     // string, so there is no per-domain escaping left to assert on.
 
+    #[test]
+    fn synthetic_node_object_ids_are_strict_canonical_u32_values() {
+        assert_eq!(synthetic_node_id("node-0"), Some(0));
+        assert_eq!(synthetic_node_id("node-42"), Some(42));
+        assert_eq!(synthetic_node_id("node-4294967295"), Some(u32::MAX));
+
+        for invalid in [
+            "node-", "node-00", "node-01", "node-+1", "node--1", "node-1.0",
+            "node-4294967296", "node-5);globalThis.compromised=true;//", "object-5",
+        ] {
+            assert_eq!(
+                synthetic_node_id(invalid),
+                None,
+                "accepted malformed synthetic object id {invalid:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn dom_focus_sets_active_element() {
         // CDP clients (browser-use) focus an input via DOM.focus before typing;
@@ -615,11 +652,13 @@ mod tests {
             .as_str()
             .expect("button objectId")
             .to_string();
+        let synthetic_object_id = format!("node-{node_id}");
 
         for params in [
             json!({ "nodeId": node_id }),
             json!({ "backendNodeId": node_id }),
             json!({ "objectId": object_id }),
+            json!({ "objectId": synthetic_object_id }),
         ] {
             ctx.get_session_page_mut(&session)
                 .unwrap()
@@ -667,6 +706,20 @@ mod tests {
         assert_eq!(
             error,
             "node 999999 could not be resolved to a scrollable element"
+        );
+
+        let error = handle(
+            "scrollIntoViewIfNeeded",
+            &json!({ "objectId": "node-999999" }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect_err("a stale synthetic node object id should fail");
+
+        assert_eq!(
+            error,
+            "objectId node-999999 could not be resolved to a node"
         );
     }
 

@@ -181,9 +181,10 @@ tar xzf obscura-x86_64-macos.tar.gz
 Download the `.zip` from the releases page and extract it manually.
 ```
 
-No Chrome, no Node.js, no dependencies. Release archives include both
-`obscura` and `obscura-worker`; keep them in the same directory for the
-parallel `scrape` command.
+No Chrome or Node.js is required. Release archives include both `obscura` and
+`obscura-worker`; keep them in the same directory for the parallel `scrape`
+command. The binaries still depend on the target operating-system ABI/runtime;
+Linux downloads require glibc 2.35 or newer.
 
 | Archive suffix | Rendering | Stealth transport |
 |----------------|-----------|-------------------|
@@ -254,8 +255,12 @@ obscura fetch https://example.com --dump text --output page.txt
 # Use this for images, JSON, JS, CSS, or any non-HTML resource.
 obscura fetch https://picsum.photos/200/300 --dump original > photo.jpg
 
-# List every sub-resource URL the page would fetch (NDJSON; one record per asset)
+# Best-effort URL inventory (NDJSON; not the response manifest)
 obscura fetch https://example.com --dump assets
+
+# Save final-page HTML, frame documents, JS/images/etc. and a resource manifest
+obscura fetch https://example.com --dump assets --assets-dir ./page-assets \
+  --output ./page-assets.ndjson --wait 5
 
 # Fetch through an HTTP or SOCKS proxy
 obscura --proxy socks5://127.0.0.1:1080 fetch https://example.com --dump text
@@ -271,6 +276,11 @@ obscura fetch https://example.com --screenshot page.png
 
 # The screenshot flag also has a short form
 obscura fetch https://example.com -s page.png
+```
+
+The [final-page resource archive guide](docs/Archive-final-page-resources.md)
+documents the manifest schema, iframe and dynamic-resource coverage,
+completeness contract, limits, and destination safety checks.
 
 ### Testing against localhost / LAN dev servers
 
@@ -287,7 +297,6 @@ obscura serve --port 9222 --allow-private-network
 
 See [docs/Environment-variables.md](docs/Environment-variables.md) for the
 full allow/deny rules (DNS-resolution-time checks included).
-```
 
 ## Rendering
 
@@ -490,11 +499,12 @@ Fetch and render a single page.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--dump` | `html` | Output: `html`, `text`, `links`, `markdown`, `assets` (NDJSON of every sub-resource URL the page references), or `original` (raw response body) |
+| `--dump` | `html` | Output: `html`, `text`, `links`, `markdown`, `assets` (best-effort URL inventory as NDJSON), or `original` (raw response body) |
+| `--assets-dir` | — | With `--dump assets`, save final-document HTML, frame HTML, a manifest, and byte-exact content-addressed response files (render build required) |
 | `--eval` | — | JavaScript expression to evaluate |
 | `--wait-until` | `load` | Wait: `load`, `domcontentloaded`, `networkidle0` |
-| `--timeout` | `30` | Maximum navigation time in seconds |
-| `--wait` | adaptive, up to `5` | Post-load settling; an explicit value is a fixed delay in seconds |
+| `--timeout` | `30` | Navigation/eval deadline in seconds |
+| `--wait` | adaptive, up to `5` | Post-load settling; explicit values are fixed, and archive mode uses a fixed 5s default |
 | `--selector` | — | Wait for CSS selector |
 | `-s`, `--screenshot` | — | Write a PNG screenshot (single URL; render-enabled build) |
 | `--stealth` | off | Anti-detection mode |
