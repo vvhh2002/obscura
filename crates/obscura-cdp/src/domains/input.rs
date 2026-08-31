@@ -106,12 +106,40 @@ pub async fn handle(
             let event_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("");
             let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let button = params.get("button").and_then(|v| v.as_str()).unwrap_or("left");
+            let screen_x = params
+                .get("globalX")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(x);
+            let screen_y = params
+                .get("globalY")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(y);
+            let movement_x = params
+                .get("movementX")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let movement_y = params
+                .get("movementY")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let default_button = match event_type {
+                "mousePressed" | "mouseReleased" => "left",
+                _ => "none",
+            };
+            let button = params
+                .get("button")
+                .and_then(|v| v.as_str())
+                .unwrap_or(default_button);
             let button_code = mouse_button_code(button);
+            let default_buttons = if event_type == "mousePressed" {
+                mouse_button_mask(button)
+            } else {
+                0
+            };
             let buttons = params
                 .get("buttons")
                 .and_then(|v| v.as_u64())
-                .unwrap_or_else(|| mouse_button_mask(button));
+                .unwrap_or(default_buttons);
             let click_count = params.get("clickCount").and_then(|v| v.as_u64()).unwrap_or(1);
             let modifiers = params.get("modifiers").and_then(|v| v.as_u64()).unwrap_or(0);
             let (alt_key, ctrl_key, meta_key, shift_key) = modifier_flags(modifiers);
@@ -123,12 +151,45 @@ pub async fn handle(
                             var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
                             if (!target) return;\
                             globalThis.__obscura_click_target = target;\
-                            globalThis.__obscura_mouse_down = {{target:target,button:{button_code},clickCount:{click_count}}};\
-                            var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                            globalThis.__obscura_mouse_down = {{target:target,button:{button_code},clickCount:{click_count},dragging:false}};\
+                            var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,view:globalThis,screenX:{screen_x},screenY:{screen_y},clientX:{x},clientY:{y},movementX:{movement_x},movementY:{movement_y},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             target.dispatchEvent(evt);\
                         }})()",
                         x = x,
                         y = y,
+                        screen_x = screen_x,
+                        screen_y = screen_y,
+                        movement_x = movement_x,
+                        movement_y = movement_y,
+                        button_code = button_code,
+                        buttons = buttons,
+                        click_count = click_count,
+                        alt_key = alt_key,
+                        ctrl_key = ctrl_key,
+                        meta_key = meta_key,
+                        shift_key = shift_key,
+                    );
+                    page.evaluate(&code);
+                }
+            } else if event_type == "mouseMoved" {
+                if let Some(page) = ctx.get_session_page_mut(session_id) {
+                    let code = format!(
+                        "(function() {{\
+                            var down = globalThis.__obscura_mouse_down;\
+                            var hit = (document.elementFromPoint && document.elementFromPoint({x},{y})) || null;\
+                            var captured = down && down.target && down.target.isConnected !== false ? down.target : null;\
+                            var target = captured || hit || globalThis.__obscura_click_target || document.activeElement || document.body;\
+                            if (!target) return;\
+                            if (down && {buttons} !== 0) down.dragging = true;\
+                            var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousemove', {{bubbles:true,cancelable:true,view:globalThis,screenX:{screen_x},screenY:{screen_y},clientX:{x},clientY:{y},movementX:{movement_x},movementY:{movement_y},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                            target.dispatchEvent(evt);\
+                        }})()",
+                        x = x,
+                        y = y,
+                        screen_x = screen_x,
+                        screen_y = screen_y,
+                        movement_x = movement_x,
+                        movement_y = movement_y,
                         button_code = button_code,
                         buttons = buttons,
                         click_count = click_count,
@@ -143,15 +204,17 @@ pub async fn handle(
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let code = format!(
                         "(function() {{\
-                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
-                            if (!target) return;\
                             var down = globalThis.__obscura_mouse_down;\
                             globalThis.__obscura_mouse_down = null;\
-                            var evt = globalThis.__obscura_markTrusted(new MouseEvent('mouseup', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                            var hit = (document.elementFromPoint && document.elementFromPoint({x},{y})) || null;\
+                            var captured = down && down.dragging && down.target && down.target.isConnected !== false ? down.target : null;\
+                            var target = captured || hit || globalThis.__obscura_click_target || document.activeElement || document.body;\
+                            if (!target) return;\
+                            var evt = globalThis.__obscura_markTrusted(new MouseEvent('mouseup', {{bubbles:true,cancelable:true,view:globalThis,screenX:{screen_x},screenY:{screen_y},clientX:{x},clientY:{y},movementX:{movement_x},movementY:{movement_y},button:{button_code},buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             target.dispatchEvent(evt);\
                             if (!down || down.button !== {button_code} || {button_code} !== 0) return;\
                             var clickTarget = down.target;\
-                            while (clickTarget && clickTarget !== target && !(clickTarget.contains && clickTarget.contains(target))) {{\
+                            while (clickTarget && clickTarget !== hit && !(clickTarget.contains && clickTarget.contains(hit))) {{\
                                 clickTarget = clickTarget.parentElement;\
                             }}\
                             if (!clickTarget) return;\
@@ -177,7 +240,7 @@ pub async fn handle(
                             }} else if (checkable) {{\
                                 clickTarget.checked = !oldChecked;\
                             }}\
-                            var click = globalThis.__obscura_markTrusted(new MouseEvent('click', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:0,buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                            var click = globalThis.__obscura_markTrusted(new MouseEvent('click', {{bubbles:true,cancelable:true,view:globalThis,screenX:{screen_x},screenY:{screen_y},clientX:{x},clientY:{y},movementX:{movement_x},movementY:{movement_y},button:0,buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             var cancelled = !clickTarget.dispatchEvent(click);\
                             if (cancelled) {{\
                                 if (radioStates) {{\
@@ -215,6 +278,10 @@ pub async fn handle(
                         }})()",
                         x = x,
                         y = y,
+                        screen_x = screen_x,
+                        screen_y = screen_y,
+                        movement_x = movement_x,
+                        movement_y = movement_y,
                         button_code = button_code,
                         click_count = click_count,
                         alt_key = alt_key,
@@ -258,7 +325,7 @@ pub async fn handle(
                         "(function() {{\
                             var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || document.body || document.documentElement;\
                             if (!target) return;\
-                            var wheel = globalThis.__obscura_markTrusted(new WheelEvent('wheel', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},deltaX:{delta_x},deltaY:{delta_y},deltaMode:0,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                            var wheel = globalThis.__obscura_markTrusted(new WheelEvent('wheel', {{bubbles:true,cancelable:true,view:globalThis,screenX:{screen_x},screenY:{screen_y},clientX:{x},clientY:{y},movementX:{movement_x},movementY:{movement_y},button:{button_code},buttons:{buttons},deltaX:{delta_x},deltaY:{delta_y},deltaMode:0,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             if (!target.dispatchEvent(wheel)) return;\
                             var dx = {delta_x}, dy = {delta_y};\
                             var root = document.scrollingElement || document.documentElement || document.body;\
@@ -290,6 +357,12 @@ pub async fn handle(
                         }})()",
                         x = x,
                         y = y,
+                        screen_x = screen_x,
+                        screen_y = screen_y,
+                        movement_x = movement_x,
+                        movement_y = movement_y,
+                        button_code = button_code,
+                        buttons = buttons,
                         delta_x = delta_x,
                         delta_y = delta_y,
                         alt_key = alt_key,
@@ -380,7 +453,13 @@ pub async fn handle(
 
             Ok(json!({}))
         }
-        "dispatchTouchEvent" => Ok(json!({})),
+        // Touch/TouchEvent do not yet have a DOM model in obscura-js. Returning
+        // success here made clients believe a gesture ran when no page event
+        // was dispatched. Callers should normalize pointer input to the
+        // implemented mousePressed/mouseMoved/mouseReleased sequence for now.
+        "dispatchTouchEvent" => Err(
+            "Input.dispatchTouchEvent is not supported; use dispatchMouseEvent".to_string(),
+        ),
         "setIgnoreInputEvents" => Ok(json!({})),
         _ => Err(format!("Unknown Input method: {}", method)),
     }

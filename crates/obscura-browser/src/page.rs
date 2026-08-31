@@ -8960,6 +8960,24 @@ impl Page {
         }
     }
 
+    /// Evaluate a browser-owned expression which may contain credentials or
+    /// another short-lived secret. Unlike [`Self::evaluate_with_timeout`], the
+    /// expression is never copied into debug logs on failure. Callers must
+    /// still serialize values safely and must not persist the returned value.
+    #[doc(hidden)]
+    pub fn evaluate_sensitive_with_timeout(
+        &mut self,
+        expression: &str,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value, String> {
+        let js = self.js.as_mut().ok_or_else(|| "no runtime".to_string())?;
+        js.evaluate_with_timeout(expression, timeout)
+            .map_err(|error| {
+                tracing::debug!("sensitive browser-owned evaluation failed");
+                error
+            })
+    }
+
     pub fn evaluate(&mut self, expression: &str) -> serde_json::Value {
         if let Some(js) = &mut self.js {
             match js.evaluate(expression) {

@@ -52,3 +52,6 @@ hkdf = "0.12"
 # CSPRNG for getRandomValues / randomUUID (replaces Math.random).
 getrandom = "0.2"
 obscura-render = { workspace = true, optional = true }
+
+[dev-dependencies]
+async-trait = "0.1"

@@ -7,6 +7,7 @@ members = [
     "crates/obscura-cdp",
     "crates/obscura-js",
     "crates/obscura-mcp",
+    "crates/obscura-legacy-gateway",
     "crates/obscura-render",
     "crates/obscura-cli",
     "crates/obscura",
@@ -25,6 +26,7 @@ obscura-browser = { path = "crates/obscura-browser" }
 obscura-cdp = { path = "crates/obscura-cdp" }
 obscura-js = { path = "crates/obscura-js" }
 obscura-mcp = { path = "crates/obscura-mcp" }
+obscura-legacy-gateway = { path = "crates/obscura-legacy-gateway", default-features = false }
 obscura-render = { path = "crates/obscura-render" }
 
 html5ever = "0.39"

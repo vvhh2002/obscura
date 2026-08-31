@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Obscura Legacy Gateway E2E Fixture</title>
+  <link rel="icon" href="data:,">
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #19253d;
+      background: #eaf0f8;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      min-height: 100vh;
+      margin: 0;
+      display: grid;
+      place-items: center;
+      background:
+        radial-gradient(circle at 15% 15%, rgba(68, 112, 255, 0.2), transparent 28rem),
+        linear-gradient(145deg, #f7f9fd, #e7edf7);
+    }
+
+    main {
+      width: min(92vw, 760px);
+      min-height: 590px;
+      padding: 36px;
+      border: 1px solid #d4deed;
+      border-radius: 24px;
+      background: rgba(255, 255, 255, 0.96);
+      box-shadow: 0 28px 72px rgba(35, 55, 91, 0.17);
+    }
+
+    h1, h2 { margin: 0; }
+    h1 { font-size: 28px; }
+    h2 { font-size: 22px; }
+
+    .muted { color: #687590; }
+
+    form {
+      display: grid;
+      gap: 12px;
+      margin-top: 24px;
+    }
+
+    label { font-size: 13px; font-weight: 700; }
+
+    input {
+      width: 100%;
+      height: 44px;
+      padding: 0 13px;
+      border: 1px solid #c8d3e5;
+      border-radius: 10px;
+      background: #fbfcff;
+      color: #19253d;
+      font: inherit;
+    }
+
+    input:focus {
+      outline: 3px solid rgba(49, 100, 255, 0.16);
+      border-color: #3164ff;
+    }
+
+    button {
+      border: 0;
+      border-radius: 10px;
+      font: inherit;
+      font-weight: 760;
+      cursor: pointer;
+    }
+
+    #legacy-submit, #legacy-action {
+      height: 44px;
+      color: white;
+      background: #244dde;
+    }
+
+    #tianai-captcha {
+      position: relative;
+      width: 360px;
+      height: 224px;
+      margin: 8px auto 2px;
+      overflow: hidden;
+      border: 1px solid #c8d3e5;
+      border-radius: 14px;
+      background: linear-gradient(145deg, #9cc8e8 0 44%, #70aa74 44% 100%);
+      user-select: none;
+    }
+
+    #tianai-captcha-slider-bg-img {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 164px;
+      object-fit: cover;
+      opacity: 0.18;
+    }
+
+    #tianai-captcha-slider-move-img {
+      position: absolute;
+      top: 66px;
+      left: 126px;
+      width: 42px;
+      height: 42px;
+      border: 3px solid rgba(255, 255, 255, 0.96);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.27);
+      box-shadow: 0 5px 18px rgba(24, 54, 90, 0.28);
+    }
+
+    .tianai-track {
+      position: absolute;
+      right: 10px;
+      bottom: 10px;
+      left: 10px;
+      height: 40px;
+      overflow: hidden;
+      border-radius: 10px;
+      background: #e6ebf4;
+    }
+
+    .tianai-track::after {
+      content: "按住滑块向右拖动";
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      color: #6e7b95;
+      font-size: 13px;
+      pointer-events: none;
+    }
+
+    #tianai-captcha-slider-move-btn {
+      position: absolute;
+      z-index: 2;
+      top: 0;
+      left: 0;
+      width: 44px;
+      height: 40px;
+      border-radius: 9px;
+      color: #fff;
+      background: #3164ff;
+      box-shadow: 0 4px 12px rgba(49, 100, 255, 0.3);
+      touch-action: none;
+    }
+
+    #captcha-status, #login-message, #fixture-output {
+      min-height: 21px;
+      margin: 0;
+      color: #687590;
+      font-size: 13px;
+    }
+
+    #tianai-captcha.solved .tianai-track { background: #dff4e5; }
+    #tianai-captcha.solved #tianai-captcha-slider-move-btn { background: #169b56; }
+    #tianai-captcha.solved .tianai-track::after { content: "验证完成"; color: #117c46; }
+
+    #authenticated {
+      display: grid;
+      gap: 20px;
+    }
+
+    .authenticated-banner {
+      padding: 18px;
+      border: 1px solid #bce2ca;
+      border-radius: 14px;
+      background: #ebf8f0;
+    }
+
+    .workspace {
+      display: grid;
+      gap: 12px;
+      padding: 20px;
+      border: 1px solid #d4deed;
+      border-radius: 14px;
+      background: #f8faff;
+    }
+
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <main>
+    <section id="login-shell" aria-labelledby="login-title">
+      <h1 id="login-title">遗留身份平台</h1>
+      <p class="muted">用于 Obscura legacy-gateway 的确定性离线 E2E 页面</p>
+
+      <form id="legacy-login-form" method="post" action="/" autocomplete="off">
+        <label for="legacy-username">用户名</label>
+        <input id="legacy-username" name="username" type="text" value="fixture-user" required>
+
+        <label for="legacy-password">密码</label>
+        <input id="legacy-password" name="password" type="password" value="fixture-password" required>
+
+        <div id="tianai-captcha" class="tianai-captcha-slider" aria-label="Tianai slide fixture">
+          <img id="tianai-captcha-slider-bg-img" alt="fixture captcha background"
+               src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z4l8AAAAASUVORK5CYII=">
+          <img id="tianai-captcha-slider-move-img" alt="fixture captcha puzzle"
+               src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z4l8AAAAASUVORK5CYII=">
+          <div class="tianai-track">
+            <button id="tianai-captcha-slider-move-btn" type="button" aria-label="拖动滑块">›</button>
+          </div>
+        </div>
+        <p id="captcha-status" role="status">等待滑动验证</p>
+
+        <button id="legacy-submit" type="submit">登录旧系统</button>
+        <p id="login-message" role="alert"></p>
+      </form>
+    </section>
+
+    <section id="authenticated" hidden aria-labelledby="workspace-title">
+      <div class="authenticated-banner">
+        <h2 id="workspace-title">旧系统会话已认证</h2>
+        <p>当前身份：<strong id="legacy-subject">fixture-user</strong></p>
+      </div>
+      <div class="workspace">
+        <label for="legacy-workspace-input">远程输入测试</label>
+        <input id="legacy-workspace-input" type="text" placeholder="从新系统 iframe 输入文本">
+        <button id="legacy-action" type="button">远程点击测试</button>
+        <p id="fixture-output" role="status">点击次数：0 · 输入：空</p>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    (() => {
+      'use strict';
+
+      const captcha = document.getElementById('tianai-captcha');
+      const thumb = document.getElementById('tianai-captcha-slider-move-btn');
+      const track = thumb.parentElement;
+      const captchaStatus = document.getElementById('captcha-status');
+      let dragging = false;
+      let startX = 0;
+      let furthestDistance = 0;
+      let captchaPassed = false;
+
+      function thumbTravel() {
+        return Math.max(1, track.clientWidth - thumb.offsetWidth);
+      }
+
+      thumb.addEventListener('mousedown', (event) => {
+        if (event.button !== 0 || captchaPassed) return;
+        dragging = true;
+        startX = event.clientX;
+        furthestDistance = 0;
+        captchaStatus.textContent = '正在接收真实滑动轨迹';
+      });
+
+      thumb.addEventListener('mousemove', (event) => {
+        if (!dragging) return;
+        const distance = Math.max(0, Math.min(thumbTravel(), event.clientX - startX));
+        furthestDistance = Math.max(furthestDistance, distance);
+        thumb.style.left = `${distance}px`;
+      });
+
+      thumb.addEventListener('mouseup', () => {
+        if (!dragging) return;
+        dragging = false;
+        captchaPassed = furthestDistance >= Math.min(120, thumbTravel() * 0.45);
+        if (captchaPassed) {
+          captcha.classList.add('solved');
+          captchaStatus.textContent = 'Tianai fixture 滑动验证通过';
+        } else {
+          thumb.style.left = '0px';
+          captchaStatus.textContent = '滑动距离不足，请重试';
+        }
+      });
+
+      document.getElementById('legacy-login-form').addEventListener('submit', (event) => {
+        event.preventDefault();
+        const message = document.getElementById('login-message');
+        if (!captchaPassed) {
+          message.textContent = '请先完成滑动验证';
+          return;
+        }
+        const username = document.getElementById('legacy-username').value.trim();
+        const password = document.getElementById('legacy-password').value;
+        if (!username || !password) {
+          message.textContent = '用户名和密码不能为空';
+          return;
+        }
+        document.getElementById('legacy-subject').textContent = username;
+        document.getElementById('login-shell').hidden = true;
+        document.getElementById('authenticated').hidden = false;
+      });
+
+      const workspaceInput = document.getElementById('legacy-workspace-input');
+      const action = document.getElementById('legacy-action');
+      const output = document.getElementById('fixture-output');
+      let clicks = 0;
+      function renderOutput() {
+        output.textContent = `点击次数：${clicks} · 输入：${workspaceInput.value || '空'}`;
+      }
+      workspaceInput.addEventListener('input', renderOutput);
+      action.addEventListener('click', () => {
+        clicks += 1;
+        renderOutput();
+      });
+
+      // Read-only UI/remote-view QA can start from an authenticated fixture
+      // without automating the CAPTCHA. Production examples omit this query.
+      if (new URLSearchParams(location.search).get('preauthenticated') === '1') {
+        document.getElementById('login-shell').hidden = true;
+        document.getElementById('authenticated').hidden = false;
+      }
+    })();
+  </script>
+</body>
+</html>

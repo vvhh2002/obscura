@@ -40,10 +40,7 @@ impl BrowserContext {
     /// Create a BrowserContext with an optional storage directory.
     /// When `storage_dir` is set, cookies are automatically loaded from
     /// `{storage_dir}/cookies.json` on creation.
-    pub fn with_storage(
-        id: String,
-        storage_dir: Option<PathBuf>,
-    ) -> Self {
+    pub fn with_storage(id: String, storage_dir: Option<PathBuf>) -> Self {
         Self::_new_inner(id, None, false, None, storage_dir, false)
     }
 
@@ -69,7 +66,14 @@ impl BrowserContext {
         storage_dir: Option<PathBuf>,
         allow_private_network: bool,
     ) -> Self {
-        Self::_new_inner(id, proxy_url, stealth, user_agent, storage_dir, allow_private_network)
+        Self::_new_inner(
+            id,
+            proxy_url,
+            stealth,
+            user_agent,
+            storage_dir,
+            allow_private_network,
+        )
     }
 
     fn _new_inner(
@@ -92,7 +96,11 @@ impl BrowserContext {
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        tracing::warn!("Failed to load cookies from {}: {}", cookie_path.display(), e);
+                        tracing::warn!(
+                            "Failed to load cookies from {}: {}",
+                            cookie_path.display(),
+                            e
+                        );
                     }
                 }
             }
@@ -227,12 +235,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn with_full_options_falls_back_to_chrome_default() {
-        let ctx = BrowserContext::with_full_options(
-            "test".to_string(),
-            None,
-            false,
-            None,
-        );
+        let ctx = BrowserContext::with_full_options("test".to_string(), None, false, None);
         assert!(ctx.user_agent.contains("Chrome"));
         let client_ua = ctx.http_client.user_agent.read().await.clone();
         assert!(client_ua.contains("Chrome"));
@@ -253,7 +256,10 @@ mod tests {
             false,
             Some("Template-UA/1.0".to_string()),
         );
-        source.cookie_jar.set_cookie("sid=source", &url::Url::parse("https://example.com").unwrap());
+        source.cookie_jar.set_cookie(
+            "sid=source",
+            &url::Url::parse("https://example.com").unwrap(),
+        );
 
         let persistent = source.isolated_copy("persistent".to_string(), true);
         let incognito = source.isolated_copy("incognito".to_string(), false);
@@ -261,9 +267,15 @@ mod tests {
         assert_eq!(persistent.cookie_jar.get_all_cookies().len(), 1);
         assert!(incognito.cookie_jar.get_all_cookies().is_empty());
         persistent.cookie_jar.clear();
-        persistent.http_client.set_user_agent("Changed-UA/2.0").await;
+        persistent
+            .http_client
+            .set_user_agent("Changed-UA/2.0")
+            .await;
 
         assert_eq!(source.cookie_jar.get_all_cookies().len(), 1);
-        assert_eq!(source.http_client.user_agent.read().await.as_str(), "Template-UA/1.0");
+        assert_eq!(
+            source.http_client.user_agent.read().await.as_str(),
+            "Template-UA/1.0"
+        );
     }
 }

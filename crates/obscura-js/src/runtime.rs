@@ -14836,6 +14836,44 @@ mod tests {
     }
 
     #[test]
+    fn mouse_event_page_coordinates_include_the_creating_realms_scroll() {
+        let mut rt = setup_runtime(r#"<div style="width:2000px;height:2000px"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"(() => {
+            scrollTo(37, 59);
+            const direct = new MouseEvent('mousemove', {
+                view: window, clientX: 11, clientY: 13, screenX: 101, screenY: 103,
+                movementX: 7, movementY: -5
+            });
+            const legacy = document.createEvent('MouseEvent');
+            legacy.initMouseEvent(
+                'mousemove', true, true, window, 0,
+                201, 203, 17, 19, false, false, false, false, 0, null
+            );
+            return [
+                scrollX, scrollY,
+                direct.clientX, direct.clientY, direct.pageX, direct.pageY,
+                direct.screenX, direct.screenY, direct.movementX, direct.movementY,
+                legacy.clientX, legacy.clientY, legacy.pageX, legacy.pageY,
+                legacy.screenX, legacy.screenY, legacy.movementX, legacy.movementY
+            ];
+        })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                37, 59,
+                11, 13, 48, 72,
+                101, 103, 7, -5,
+                17, 19, 54, 78,
+                201, 203, 0, 0
+            ])
+        );
+    }
+
+    #[test]
     fn test_location_href_assignment_updates_navigation_state() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let href = rt

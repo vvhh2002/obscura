@@ -246,6 +246,9 @@ enum Command {
         quiet: bool,
     },
 
+    /// Present one fixed legacy login page through a loopback-only conversion UI.
+    LegacyGateway(LegacyGatewayArgs),
+
     Mcp {
         #[arg(long)]
         http: bool,
@@ -262,6 +265,169 @@ enum Command {
         #[arg(long)]
         user_agent: Option<String>,
     },
+}
+
+#[derive(clap::Args)]
+struct LegacyGatewayArgs {
+    /// Fixed legacy login URL. Omit only when --config is supplied.
+    #[arg(
+        value_name = "LEGACY_URL",
+        required_unless_present = "config",
+        conflicts_with = "config"
+    )]
+    legacy_url: Option<String>,
+
+    /// Save a validated, secret-free integration manifest after one confirmed login.
+    #[arg(
+        long,
+        value_name = "FILE",
+        requires = "legacy_url",
+        conflicts_with = "config"
+    )]
+    discover_output: Option<std::path::PathBuf>,
+
+    /// Run from a manifest produced by --discover-output.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = [
+            "legacy_url",
+            "captcha_adapter",
+            "username_selector",
+            "password_selector",
+            "submit_selector",
+            "success_selector",
+            "subject_selector",
+            "allowed_navigation_origin",
+            "allowed_resource_origin",
+            "allow_insecure_legacy_http",
+            "viewport_width",
+            "viewport_height",
+            "session_ttl",
+            "user_agent"
+        ]
+    )]
+    config: Option<std::path::PathBuf>,
+
+    /// Loopback IP on which the conversion UI listens.
+    #[arg(long, default_value = "127.0.0.1")]
+    host: std::net::IpAddr,
+
+    /// Loopback port. Zero asks the operating system for an unused port.
+    #[arg(long, default_value_t = 0)]
+    port: u16,
+
+    /// Supported slider widget family/mode to recognize.
+    #[arg(long, value_enum)]
+    captcha_adapter: Option<LegacyCaptchaAdapterArg>,
+
+    /// Fixed CSS selector for the legacy username field (auto-detected if omitted).
+    #[arg(long, value_parser = parse_legacy_selector)]
+    username_selector: Option<String>,
+
+    /// Fixed CSS selector for the legacy password field (auto-detected if omitted).
+    #[arg(long, value_parser = parse_legacy_selector)]
+    password_selector: Option<String>,
+
+    /// Fixed CSS selector for the legacy submit control (auto-detected if omitted).
+    #[arg(long, value_parser = parse_legacy_selector)]
+    submit_selector: Option<String>,
+
+    /// Selector that becomes uniquely visible after the old system has authenticated.
+    #[arg(long, value_parser = parse_legacy_selector, required_unless_present = "config")]
+    success_selector: Option<String>,
+
+    /// Optional post-login selector whose text is display-only identity evidence.
+    #[arg(long, value_parser = parse_legacy_selector)]
+    subject_selector: Option<String>,
+
+    /// Additional exact origin allowed after legacy navigation/redirects. Repeatable.
+    #[arg(
+        long,
+        visible_alias = "allow-navigation-origin",
+        value_name = "ORIGIN",
+        action = clap::ArgAction::Append
+    )]
+    allowed_navigation_origin: Vec<String>,
+
+    /// Exact origin allowed for scripts, images, fonts, frames, and fetch/XHR. Repeatable.
+    #[arg(
+        long,
+        value_name = "ORIGIN",
+        action = clap::ArgAction::Append
+    )]
+    allowed_resource_origin: Vec<String>,
+
+    /// Explicitly allow the configured legacy URL and allowed origins to use HTTP.
+    #[arg(long)]
+    allow_insecure_legacy_http: bool,
+
+    /// Remote viewport width in CSS pixels.
+    #[arg(
+        long,
+        value_name = "PIXELS",
+        value_parser = clap::value_parser!(u32).range(320..=4096)
+    )]
+    viewport_width: Option<u32>,
+
+    /// Remote viewport height in CSS pixels.
+    #[arg(
+        long,
+        value_name = "PIXELS",
+        value_parser = clap::value_parser!(u32).range(240..=2160)
+    )]
+    viewport_height: Option<u32>,
+
+    /// Lifetime of the loopback UI session in seconds.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        value_parser = clap::value_parser!(u64).range(60..=24 * 60 * 60)
+    )]
+    session_ttl: Option<u64>,
+
+    /// User-Agent for the isolated legacy browser contexts.
+    #[arg(long)]
+    user_agent: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
+enum LegacyCaptchaAdapterArg {
+    Auto,
+    Tianai,
+    #[value(
+        name = "gocaptcha-slide",
+        alias = "go-captcha-slide",
+        alias = "go-captcha"
+    )]
+    GoCaptchaSlide,
+    #[value(name = "aj-captcha", alias = "ajcaptcha")]
+    AjCaptcha,
+    #[value(name = "slider-captcha-js", alias = "slider-captcha")]
+    SliderCaptchaJs,
+}
+
+impl From<LegacyCaptchaAdapterArg> for obscura_browser::CaptchaAdapter {
+    fn from(value: LegacyCaptchaAdapterArg) -> Self {
+        match value {
+            LegacyCaptchaAdapterArg::Auto => Self::Auto,
+            LegacyCaptchaAdapterArg::Tianai => Self::Tianai,
+            LegacyCaptchaAdapterArg::GoCaptchaSlide => Self::GoCaptcha,
+            LegacyCaptchaAdapterArg::AjCaptcha => Self::AjCaptcha,
+            LegacyCaptchaAdapterArg::SliderCaptchaJs => Self::SliderCaptchaJs,
+        }
+    }
+}
+
+fn parse_legacy_selector(value: &str) -> Result<String, String> {
+    let selector = value.trim();
+    if selector.is_empty() {
+        return Err("selector must not be empty".to_string());
+    }
+    if selector.len() > 1_024 {
+        return Err("selector must not exceed 1024 bytes".to_string());
+    }
+    Ok(selector.to_string())
 }
 
 #[derive(Clone, Debug, clap::ValueEnum, PartialEq, Eq)]
@@ -348,7 +514,12 @@ fn is_quiet_command(cmd: &Option<Command>) -> bool {
             })
             | Some(Command::Scrape { quiet: true, .. })
             | Some(Command::Serve { quiet: true, .. })
+            | Some(Command::LegacyGateway(_))
     )
+}
+
+fn is_legacy_gateway_command(cmd: &Option<Command>) -> bool {
+    matches!(cmd, Some(Command::LegacyGateway(_)))
 }
 
 fn is_captcha_command(cmd: &Option<Command>) -> bool {
@@ -429,9 +600,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let quiet = is_quiet_command(&args.command);
+    let legacy_gateway = is_legacy_gateway_command(&args.command);
     let filter = select_log_filter(args.verbose, quiet);
     let force_captcha_log_redaction = is_captcha_command(&args.command) && !args.verbose;
-    let env_filter = if force_captcha_log_redaction {
+    let env_filter = if legacy_gateway {
+        // The gateway has exactly one intentional stdout value: its local
+        // fragment launch URL. Do not let RUST_LOG or --verbose disclose the
+        // fixed legacy URL, bearer fragment, selectors, or page diagnostics.
+        tracing_subscriber::EnvFilter::new("off")
+    } else if force_captcha_log_redaction {
         tracing_subscriber::EnvFilter::new(filter)
     } else {
         tracing_subscriber::EnvFilter::try_from_default_env()
@@ -460,6 +637,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let global_proxy = args.proxy.clone();
+    let global_user_agent = args.user_agent.clone();
     let stealth = args.stealth;
     let obey_robots = args.obey_robots;
 
@@ -631,6 +809,16 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
         }
+        Some(Command::LegacyGateway(options)) => {
+            run_legacy_gateway(
+                options,
+                global_proxy,
+                global_user_agent,
+                stealth,
+                args.allow_private_network,
+            )
+            .await?;
+        }
         Some(Command::Mcp {
             http,
             host,
@@ -655,6 +843,286 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(feature = "render")]
+async fn run_legacy_gateway(
+    options: LegacyGatewayArgs,
+    global_proxy: Option<String>,
+    global_user_agent: Option<String>,
+    stealth: bool,
+    allow_private_network: bool,
+) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    use obscura_browser::LegacyLoginSelectors;
+    use obscura_legacy_gateway::{
+        BoundGateway, DiscoveryCommitHook, DiscoveryProfile, GatewayConfig, LegacyGatewayManifest,
+        ManifestAuthentication, ManifestViewport, ObscuraBackendConfig, ObscuraLegacyBackend,
+        Viewport,
+    };
+
+    // StealthHttpClient does not currently pass through the ordinary network
+    // interception/allowlist path. A fixed legacy bridge must fail closed
+    // rather than silently create a page whose requests bypass that boundary.
+    if stealth {
+        anyhow::bail!(
+            "legacy-gateway does not support --stealth because its transport bypasses the gateway network allowlist"
+        );
+    }
+
+    let LegacyGatewayArgs {
+        legacy_url,
+        discover_output,
+        config,
+        host,
+        port,
+        captcha_adapter,
+        username_selector,
+        password_selector,
+        submit_selector,
+        success_selector,
+        subject_selector,
+        allowed_navigation_origin,
+        allowed_resource_origin,
+        allow_insecure_legacy_http,
+        viewport_width,
+        viewport_height,
+        session_ttl,
+        user_agent,
+    } = options;
+
+    let (mut gateway_config, backend_config, user_agent, discovery_commit) =
+        if let Some(config_path) = config {
+            let manifest = LegacyGatewayManifest::read(&config_path).map_err(|error| {
+                anyhow::anyhow!(
+                    "legacy gateway manifest {} is invalid: {error}",
+                    config_path.display()
+                )
+            })?;
+            let gateway_config = manifest.to_gateway_config()?;
+            let viewport = gateway_config.viewport;
+            let backend_config = ObscuraBackendConfig {
+                captcha_adapter: manifest.captcha_adapter.into(),
+                login_selectors: (&manifest.selectors).into(),
+                success_selector: manifest.authentication.success_selector.clone(),
+                subject_selector: manifest.authentication.subject_selector.clone(),
+                viewport,
+                operation_timeout: Duration::from_secs(2),
+                interaction_settle_ms: 500,
+                allowed_navigation_origins: gateway_config.allowed_navigation_origins.clone(),
+                allowed_resource_origins: gateway_config.allowed_resource_origins.clone(),
+                expected_discovery_profile: Some(manifest.expected_discovery_profile()?),
+                discovery_mode: false,
+            };
+            (
+                gateway_config,
+                backend_config,
+                global_user_agent.clone().or(manifest.user_agent),
+                None,
+            )
+        } else {
+            let legacy_url = legacy_url.expect("clap requires LEGACY_URL without --config");
+            let legacy_url = url::Url::parse(&legacy_url).map_err(|_| {
+                anyhow::anyhow!(
+                    "LEGACY_URL must be a valid absolute HTTP(S) URL without credentials"
+                )
+            })?;
+            let viewport = Viewport {
+                width: viewport_width.unwrap_or(1280),
+                height: viewport_height.unwrap_or(720),
+            };
+            let mut gateway_config = GatewayConfig::new(legacy_url);
+            gateway_config.allow_insecure_legacy_http = allow_insecure_legacy_http;
+            gateway_config.viewport = viewport;
+            gateway_config.session_ttl = Duration::from_secs(session_ttl.unwrap_or(30 * 60));
+            for origin in allowed_navigation_origin {
+                let origin = url::Url::parse(&origin).map_err(|_| {
+                    anyhow::anyhow!(
+                        "--allowed-navigation-origin values must be absolute HTTP(S) origins"
+                    )
+                })?;
+                gateway_config.allow_navigation_origin(&origin)?;
+            }
+            for origin in allowed_resource_origin {
+                let origin = url::Url::parse(&origin).map_err(|_| {
+                    anyhow::anyhow!(
+                        "--allowed-resource-origin values must be absolute HTTP(S) origins"
+                    )
+                })?;
+                gateway_config.allow_resource_origin(&origin)?;
+            }
+            let success_selector =
+                success_selector.expect("clap requires --success-selector without --config");
+            let effective_user_agent = user_agent.or(global_user_agent.clone());
+            let discovery_mode = discover_output.is_some();
+            let backend_config = ObscuraBackendConfig {
+                captcha_adapter: captcha_adapter
+                    .unwrap_or(LegacyCaptchaAdapterArg::Auto)
+                    .into(),
+                login_selectors: LegacyLoginSelectors {
+                    username: username_selector,
+                    password: password_selector,
+                    submit: submit_selector,
+                },
+                success_selector: success_selector.clone(),
+                subject_selector: subject_selector.clone(),
+                viewport,
+                operation_timeout: Duration::from_secs(2),
+                interaction_settle_ms: 500,
+                allowed_navigation_origins: gateway_config.allowed_navigation_origins.clone(),
+                allowed_resource_origins: gateway_config.allowed_resource_origins.clone(),
+                expected_discovery_profile: None,
+                discovery_mode,
+            };
+            let discovery_commit = if let Some(output) = discover_output {
+                validate_new_manifest_destination(&output)?;
+                let login_url = gateway_config.legacy_url.to_string();
+                let authentication = ManifestAuthentication {
+                    success_selector,
+                    subject_selector,
+                };
+                let origins = (
+                    gateway_config.allowed_navigation_origins.clone(),
+                    gateway_config.allowed_resource_origins.clone(),
+                );
+                let ttl = gateway_config.session_ttl.as_secs();
+                let allow_http = gateway_config.allow_insecure_legacy_http;
+                let manifest_user_agent = effective_user_agent.clone();
+                Some(Box::new(move |profile: &DiscoveryProfile| {
+                    let mut manifest = LegacyGatewayManifest::from_discovery_profile(
+                        login_url.clone(),
+                        profile,
+                        authentication.clone(),
+                        allow_http,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    manifest.origins.navigation = origins.0.clone();
+                    manifest.origins.resources = origins.1.clone();
+                    manifest.viewport = ManifestViewport {
+                        width: viewport.width,
+                        height: viewport.height,
+                    };
+                    manifest.session_ttl_seconds = ttl;
+                    manifest.user_agent = manifest_user_agent.clone();
+                    manifest
+                        .write_atomic_new(&output)
+                        .map_err(|error| error.to_string())?;
+                    eprintln!("discovery manifest saved to {}", output.display());
+                    Ok(())
+                }) as DiscoveryCommitHook)
+            } else {
+                None
+            };
+            (
+                gateway_config,
+                backend_config,
+                effective_user_agent,
+                discovery_commit,
+            )
+        };
+
+    gateway_config.bind_addr = std::net::SocketAddr::new(host, port);
+    // Validate before creating any browser state or touching the fixed URL.
+    gateway_config.validate()?;
+
+    let page_factory = legacy_page_factory(
+        global_proxy,
+        user_agent,
+        allow_private_network,
+        Duration::from_secs(30),
+    );
+    let backend = ObscuraLegacyBackend::new(page_factory, backend_config)
+        .map_err(|_| anyhow::anyhow!("legacy gateway browser configuration is invalid"))?;
+    let gateway = if discovery_commit.is_some() {
+        BoundGateway::bind_with_discovery_commit(
+            gateway_config,
+            Box::new(backend),
+            discovery_commit,
+        )
+        .await?
+    } else {
+        BoundGateway::bind(gateway_config, Box::new(backend)).await?
+    };
+
+    // This is deliberately the only successful-command output. The bearer is
+    // in the fragment, so it is not sent in HTTP request targets; hand this
+    // value directly to the local browser and never log or persist it.
+    {
+        let stdout = std::io::stdout();
+        let mut stdout = stdout.lock();
+        writeln!(stdout, "{}", gateway.launch_url())?;
+        stdout.flush()?;
+    }
+    gateway.serve().await?;
+    Ok(())
+}
+
+#[cfg(feature = "render")]
+fn legacy_page_factory(
+    proxy: Option<String>,
+    user_agent: Option<String>,
+    allow_private_network: bool,
+    navigation_timeout: Duration,
+) -> Box<dyn FnMut() -> Page> {
+    let mut generation = 0_u64;
+    Box::new(move || {
+        generation = generation.saturating_add(1);
+        let id = format!("legacy-gateway-{generation}");
+        // No storage directory is accepted here. Every factory invocation
+        // owns a new CookieJar/HTTP client, so logout drops HttpOnly cookies,
+        // Web Storage, and every other legacy session object as one unit.
+        let context = Arc::new(BrowserContext::with_storage_and_network(
+            id.clone(),
+            proxy.clone(),
+            false,
+            user_agent.clone(),
+            None,
+            allow_private_network,
+        ));
+        let mut page = Page::new(id, context);
+        page.set_navigation_timeout(navigation_timeout);
+        page
+    })
+}
+
+#[cfg(feature = "render")]
+fn validate_new_manifest_destination(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::io::ErrorKind;
+
+    if path.file_name().is_none() {
+        anyhow::bail!("--discover-output must name a JSON file");
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => anyhow::bail!(
+            "--discover-output destination already exists: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    if !parent.is_dir() {
+        anyhow::bail!(
+            "--discover-output parent directory does not exist: {}",
+            parent.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "render"))]
+async fn run_legacy_gateway(
+    _options: LegacyGatewayArgs,
+    _global_proxy: Option<String>,
+    _global_user_agent: Option<String>,
+    _stealth: bool,
+    _allow_private_network: bool,
+) -> anyhow::Result<()> {
+    anyhow::bail!("legacy-gateway requires a render-enabled build (cargo build --features render)")
 }
 
 async fn run_multi_worker_serve(
@@ -2917,11 +3385,11 @@ mod tests {
     use super::{
         asset_paths_overlap, classic_script_urls, configure_fetch_navigation_timeout,
         effective_v8_flags, extract_assets, extract_readable_text, fetch_original_bytes,
-        is_captcha_command, is_quiet_command, link_kind_from_rel, merge_proxy,
-        missing_classic_script_reasons, normalize_v8_flags, path_starts_with_components,
-        read_urls_from_file, resolve_asset_url, select_log_filter, write_or_print,
-        write_or_print_bytes, Args, CaptchaAdapterArg, CapturedResource, Command, DumpFormat,
-        ResourceCapture, DEFAULT_V8_FLAGS,
+        is_captcha_command, is_legacy_gateway_command, is_quiet_command, link_kind_from_rel,
+        merge_proxy, missing_classic_script_reasons, normalize_v8_flags,
+        path_starts_with_components, read_urls_from_file, resolve_asset_url, select_log_filter,
+        write_or_print, write_or_print_bytes, Args, CaptchaAdapterArg, CapturedResource, Command,
+        DumpFormat, LegacyCaptchaAdapterArg, ResourceCapture, DEFAULT_V8_FLAGS,
     };
     use clap::Parser;
     use obscura_dom::parse_html;
@@ -3026,6 +3494,299 @@ mod tests {
             "document.body.click()",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn parsed_legacy_gateway_has_safe_defaults_and_fixed_configuration() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "legacy-gateway",
+            "https://legacy.example/login",
+            "--success-selector",
+            "#signed-in-shell",
+            "--captcha-adapter",
+            "gocaptcha-slide",
+            "--username-selector",
+            "#account",
+            "--password-selector",
+            "#password",
+            "--submit-selector",
+            "button[type=submit]",
+            "--subject-selector",
+            ".current-user",
+            "--allowed-navigation-origin",
+            "https://sso.example",
+            "--allowed-navigation-origin",
+            "https://legacy-static.example:8443",
+            "--allowed-resource-origin",
+            "https://cdn.example",
+            "--allowed-resource-origin",
+            "https://api.example:9443",
+        ])
+        .expect("legacy gateway configuration should parse");
+
+        assert!(is_quiet_command(&args.command));
+        assert!(is_legacy_gateway_command(&args.command));
+        let Some(Command::LegacyGateway(options)) = args.command else {
+            panic!("expected LegacyGateway command");
+        };
+        assert_eq!(
+            options.legacy_url.as_deref(),
+            Some("https://legacy.example/login")
+        );
+        assert_eq!(options.discover_output, None);
+        assert_eq!(options.config, None);
+        assert_eq!(options.host, std::net::Ipv4Addr::LOCALHOST);
+        assert_eq!(options.port, 0);
+        assert_eq!(
+            options.captcha_adapter,
+            Some(LegacyCaptchaAdapterArg::GoCaptchaSlide)
+        );
+        assert_eq!(options.username_selector.as_deref(), Some("#account"));
+        assert_eq!(options.password_selector.as_deref(), Some("#password"));
+        assert_eq!(
+            options.submit_selector.as_deref(),
+            Some("button[type=submit]")
+        );
+        assert_eq!(
+            options.success_selector.as_deref(),
+            Some("#signed-in-shell")
+        );
+        assert_eq!(options.subject_selector.as_deref(), Some(".current-user"));
+        assert_eq!(
+            options.allowed_navigation_origin,
+            [
+                "https://sso.example".to_string(),
+                "https://legacy-static.example:8443".to_string(),
+            ]
+        );
+        assert_eq!(
+            options.allowed_resource_origin,
+            [
+                "https://cdn.example".to_string(),
+                "https://api.example:9443".to_string(),
+            ]
+        );
+        assert!(!options.allow_insecure_legacy_http);
+        assert_eq!(
+            (options.viewport_width, options.viewport_height),
+            (None, None)
+        );
+        assert_eq!(options.session_ttl, None);
+    }
+
+    #[test]
+    fn legacy_gateway_requires_authentication_probe_and_valid_bounds() {
+        assert!(Args::try_parse_from([
+            "obscura",
+            "legacy-gateway",
+            "https://legacy.example/login",
+        ])
+        .is_err());
+        assert!(Args::try_parse_from([
+            "obscura",
+            "legacy-gateway",
+            "https://legacy.example/login",
+            "--success-selector",
+            "   ",
+        ])
+        .is_err());
+        assert!(Args::try_parse_from([
+            "obscura",
+            "legacy-gateway",
+            "https://legacy.example/login",
+            "--success-selector",
+            "#ready",
+            "--session-ttl",
+            "59",
+        ])
+        .is_err());
+        assert!(Args::try_parse_from([
+            "obscura",
+            "legacy-gateway",
+            "https://legacy.example/login",
+            "--success-selector",
+            "#ready",
+            "--viewport-width",
+            "319",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn legacy_gateway_accepts_each_supported_slide_mode() {
+        for (name, expected) in [
+            ("auto", obscura_browser::CaptchaAdapter::Auto),
+            ("tianai", obscura_browser::CaptchaAdapter::Tianai),
+            (
+                "gocaptcha-slide",
+                obscura_browser::CaptchaAdapter::GoCaptcha,
+            ),
+            ("aj-captcha", obscura_browser::CaptchaAdapter::AjCaptcha),
+            (
+                "slider-captcha-js",
+                obscura_browser::CaptchaAdapter::SliderCaptchaJs,
+            ),
+        ] {
+            let args = Args::try_parse_from([
+                "obscura",
+                "legacy-gateway",
+                "https://legacy.example/login",
+                "--success-selector",
+                "#ready",
+                "--captcha-adapter",
+                name,
+            ])
+            .unwrap_or_else(|error| panic!("adapter {name} should parse: {error}"));
+            let Some(Command::LegacyGateway(options)) = args.command else {
+                panic!("expected LegacyGateway command");
+            };
+            let actual: obscura_browser::CaptchaAdapter =
+                options.captcha_adapter.expect("explicit adapter").into();
+            assert_eq!(actual, expected, "adapter mapping for {name}");
+        }
+
+        assert!(Args::try_parse_from([
+            "obscura",
+            "legacy-gateway",
+            "https://legacy.example/login",
+            "--success-selector",
+            "#ready",
+            "--captcha-adapter",
+            "gocaptcha-slide-region",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn legacy_gateway_discovery_and_manifest_modes_are_exclusive() {
+        let discovered = Args::try_parse_from([
+            "obscura",
+            "legacy-gateway",
+            "https://legacy.example/login",
+            "--success-selector",
+            "#ready",
+            "--discover-output",
+            "legacy-login.json",
+        ])
+        .expect("discovery mode should parse");
+        let Some(Command::LegacyGateway(discovered)) = discovered.command else {
+            panic!("expected LegacyGateway command");
+        };
+        assert_eq!(
+            discovered.discover_output.as_deref(),
+            Some(std::path::Path::new("legacy-login.json"))
+        );
+        assert_eq!(discovered.config, None);
+
+        let served = Args::try_parse_from([
+            "obscura",
+            "legacy-gateway",
+            "--config",
+            "legacy-login.json",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "48120",
+        ])
+        .expect("manifest serve mode should parse without URL/selectors");
+        let Some(Command::LegacyGateway(served)) = served.command else {
+            panic!("expected LegacyGateway command");
+        };
+        assert_eq!(served.legacy_url, None);
+        assert_eq!(
+            served.config.as_deref(),
+            Some(std::path::Path::new("legacy-login.json"))
+        );
+        assert_eq!(served.port, 48120);
+
+        assert!(Args::try_parse_from([
+            "obscura",
+            "legacy-gateway",
+            "--config",
+            "legacy-login.json",
+            "--success-selector",
+            "#override",
+        ])
+        .is_err());
+        assert!(Args::try_parse_from([
+            "obscura",
+            "legacy-gateway",
+            "--config",
+            "legacy-login.json",
+            "https://other.example/login",
+        ])
+        .is_err());
+        assert!(Args::try_parse_from(["obscura", "legacy-gateway"]).is_err());
+    }
+
+    #[cfg(not(feature = "render"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_gateway_without_render_returns_a_clear_error() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "legacy-gateway",
+            "https://legacy.example/login",
+            "--success-selector",
+            "#ready",
+        ])
+        .expect("configuration should parse without render");
+        let Some(Command::LegacyGateway(options)) = args.command else {
+            panic!("expected LegacyGateway command");
+        };
+        let error = super::run_legacy_gateway(options, None, None, false, false)
+            .await
+            .expect_err("non-render build must reject the gateway");
+        assert!(error
+            .to_string()
+            .contains("requires a render-enabled build"));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_gateway_rejects_stealth_before_navigation() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "legacy-gateway",
+            "https://legacy.example/login",
+            "--success-selector",
+            "#ready",
+        ])
+        .expect("configuration should parse");
+        let Some(Command::LegacyGateway(options)) = args.command else {
+            panic!("expected LegacyGateway command");
+        };
+        let error = super::run_legacy_gateway(options, None, None, true, false)
+            .await
+            .expect_err("stealth transport must fail closed");
+        assert!(error.to_string().contains("does not support --stealth"));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn legacy_page_factory_never_reuses_browser_session_state() {
+        let mut factory = super::legacy_page_factory(
+            None,
+            Some("Legacy-UA/1.0".to_string()),
+            false,
+            std::time::Duration::from_secs(17),
+        );
+        let first = factory();
+        let second = factory();
+
+        assert_ne!(first.id, second.id);
+        assert!(!std::sync::Arc::ptr_eq(&first.context, &second.context));
+        assert!(!std::sync::Arc::ptr_eq(
+            &first.context.cookie_jar,
+            &second.context.cookie_jar
+        ));
+        assert!(first.context.storage_dir.is_none());
+        assert!(second.context.storage_dir.is_none());
+        assert_eq!(first.context.user_agent, "Legacy-UA/1.0");
+        assert_eq!(
+            first.navigation_timeout(),
+            std::time::Duration::from_secs(17)
+        );
     }
 
     #[test]

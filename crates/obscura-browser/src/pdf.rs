@@ -571,7 +571,9 @@ mod tests {
             let stream_start = digits_end
                 + find_bytes(&pdf[digits_end..], b"stream\n").expect("image stream")
                 + b"stream\n".len();
-            let stream_end = stream_start.checked_add(length).expect("bounded stream end");
+            let stream_end = stream_start
+                .checked_add(length)
+                .expect("bounded stream end");
             let raster = image::load_from_memory_with_format(
                 &pdf[stream_start..stream_end],
                 image::ImageFormat::Jpeg,
@@ -687,8 +689,7 @@ mod tests {
 
         let base = pagination_plan(800.0, 2_000.0, printable_width, printable_height, 1.0)
             .expect("base geometry");
-        let impossible_height =
-            base.css_page_height * (MAX_PDF_DOCUMENT_PAGES as f32 + 16.0);
+        let impossible_height = base.css_page_height * (MAX_PDF_DOCUMENT_PAGES as f32 + 16.0);
         assert_eq!(
             pagination_plan(
                 800.0,
@@ -717,8 +718,7 @@ mod tests {
         assert_eq!(enlarged.css_page_height, normal.css_page_height / 2.0);
         assert!(enlarged.page_count >= normal.page_count);
         assert_eq!(
-            pagination_plan(800.0, 2_000.0, printable_width, printable_height, 0.09,)
-                .unwrap_err(),
+            pagination_plan(800.0, 2_000.0, printable_width, printable_height, 0.09,).unwrap_err(),
             RasterPdfError::InvalidScale
         );
     }

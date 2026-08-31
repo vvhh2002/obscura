@@ -1344,6 +1344,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
+name = "httpdate"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
 name = "hyper"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1356,6 +1362,7 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",
@@ -1873,11 +1880,13 @@ dependencies = [
  "obscura-dom",
  "obscura-js",
  "obscura-net",
+ "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -1915,6 +1924,7 @@ dependencies = [
  "obscura-cdp",
  "obscura-dom",
  "obscura-js",
+ "obscura-legacy-gateway",
  "obscura-mcp",
  "obscura-net",
  "serde",
@@ -1947,6 +1957,7 @@ dependencies = [
  "aes",
  "aes-gcm",
  "anyhow",
+ "async-trait",
  "base64",
  "cbc",
  "ctr",
@@ -1970,6 +1981,26 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "obscura-legacy-gateway"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "obscura-browser",
+ "obscura-net",
+ "serde",
+ "serde_json",
+ "subtle",
+ "thiserror 2.0.18",
+ "tokio",
+ "url",
+ "uuid",
 ]
 
 [[package]]

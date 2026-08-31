@@ -550,10 +550,28 @@ impl FrameRealm {
         } else {
             150.0
         };
+        #[cfg(feature = "render")]
+        {
+            let state = self
+                .realms
+                .borrow()
+                .by_frame_id(self.frame_id)
+                .ok_or_else(|| "frame realm is no longer live".to_string())?;
+            let mut state = state.borrow_mut();
+            let viewport = (width as f32, height as f32);
+            if state.viewport != viewport {
+                state.viewport = viewport;
+                state.prepared_render = None;
+                state.pending_style_mutations.clear();
+                state.resolved_scroll = None;
+            }
+        }
         self.execute_script(
             parent,
             &format!(
-                "globalThis.innerWidth={width};globalThis.innerHeight={height};\
+                "globalThis.__obscura_viewport_w={width};\
+                 globalThis.__obscura_viewport_h={height};\
+                 globalThis.innerWidth={width};globalThis.innerHeight={height};\
                  if(globalThis.visualViewport){{\
                    globalThis.visualViewport.width={width};\
                    globalThis.visualViewport.height={height};\
@@ -3683,6 +3701,66 @@ mod tests {
                 .unwrap(),
             serde_json::json!([300, 65, 300, 65]),
         );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn frame_viewport_updates_native_layout_state() {
+        let mut parent = page(
+            "https://parent.example/page",
+            "<html><body><iframe style='width:300px;height:65px'></iframe></body></html>",
+        );
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/frame",
+            "<html style='margin:0'><body style='margin:0'><div id='box' style='width:100%;height:20px;visibility:hidden'></div></body></html>",
+        )
+        .expect("frame realm");
+
+        frame.set_viewport(&mut parent, 300.0, 65.0).unwrap();
+        let first = frame
+            .evaluate(
+                &mut parent,
+                "[document.getElementById('box').getBoundingClientRect().width, innerWidth, getComputedStyle(document.getElementById('box')).visibility]",
+            )
+            .unwrap();
+        let first = first.as_array().unwrap();
+        let first_width = first[0].as_f64().unwrap();
+        assert!(first_width > 0.0);
+        assert_eq!(first[1], serde_json::json!(300));
+        assert_eq!(first[2], serde_json::json!("hidden"));
+        let state = frame
+            .realms
+            .borrow()
+            .by_frame_id(frame.frame_id())
+            .expect("live frame state");
+        {
+            let state = state.borrow();
+            assert_eq!(state.viewport, (300.0, 65.0));
+            assert!(state.prepared_render.is_some());
+        }
+
+        frame.set_viewport(&mut parent, 500.0, 65.0).unwrap();
+        {
+            let state = state.borrow();
+            assert_eq!(state.viewport, (500.0, 65.0));
+            assert!(state.prepared_render.is_none());
+            assert!(state.pending_style_mutations.is_empty());
+            assert!(state.resolved_scroll.is_none());
+        }
+        let second = frame
+            .evaluate(
+                &mut parent,
+                "[document.getElementById('box').getBoundingClientRect().width, innerWidth, getComputedStyle(document.getElementById('box')).visibility]",
+            )
+            .unwrap();
+        let second = second.as_array().unwrap();
+        let second_width = second[0].as_f64().unwrap();
+        assert!(second_width > 0.0);
+        assert_eq!(second[1], serde_json::json!(500));
+        assert_eq!(second[2], serde_json::json!("hidden"));
     }
 
     /// A frame must not look like a different browser than its parent. Anti-bot

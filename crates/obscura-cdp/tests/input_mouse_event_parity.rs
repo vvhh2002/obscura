@@ -2,18 +2,11 @@
 
 use obscura_cdp::dispatch::{dispatch, CdpContext};
 use obscura_cdp::types::CdpRequest;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 
 async fn serve_fixture() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let mut buf = [0u8; 2048];
-        let _ = socket.read(&mut buf).await.unwrap();
-        let body = r#"<!doctype html><html><head><style>
+    let body = r#"<!doctype html><html><head><style>
             html, body { margin: 0; }
             #page { width: 1800px; height: 2400px; }
             #box { position: absolute; left: 20px; top: 20px; width: 180px;
@@ -28,13 +21,7 @@ async fn serve_fixture() -> String {
             <input id="radio-b" type="radio" name="choice">
           </form>
         </body></html>"#;
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let _ = socket.write_all(response.as_bytes()).await;
-    });
-    format!("http://{addr}/")
+    format!("data:text/html;base64,{}", BASE64.encode(body))
 }
 
 async fn cdp(
@@ -321,6 +308,172 @@ async fn press_release_orders_events_and_defers_click_activation() {
     assert_eq!(released["log"][2]["ctrl"], true);
     assert_eq!(released["log"][2]["shift"], true);
     assert_eq!(released["log"][2]["trusted"], true);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn drag_dispatches_moved_events_with_document_and_screen_coordinates() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(
+        &mut ctx,
+        2,
+        r#"(() => {
+            scrollTo(120, 80);
+            const bar = document.createElement('div');
+            bar.id = 'drag-bar';
+            const handle = document.createElement('button');
+            handle.id = 'drag-handle';
+            const outside = document.createElement('div');
+            outside.id = 'outside';
+            bar.appendChild(handle);
+            document.body.append(bar, outside);
+
+            let hit = handle;
+            document.elementFromPoint = () => hit;
+            globalThis.setDragHit = id => { hit = document.getElementById(id); };
+            globalThis.dragLog = [];
+            globalThis.dragClicks = 0;
+            handle.addEventListener('click', () => dragClicks++);
+            for (const type of ['mousedown', 'mousemove', 'mouseup']) {
+                addEventListener(type, event => dragLog.push({
+                    type,
+                    target: event.target.id,
+                    currentIsWindow: event.currentTarget === globalThis,
+                    clientX: event.clientX,
+                    clientY: event.clientY,
+                    pageX: event.pageX,
+                    pageY: event.pageY,
+                    screenX: event.screenX,
+                    screenY: event.screenY,
+                    movementX: event.movementX,
+                    movementY: event.movementY,
+                    button: event.button,
+                    buttons: event.buttons,
+                    ctrl: event.ctrlKey,
+                    shift: event.shiftKey,
+                    trusted: event.isTrusted
+                }));
+            }
+        })()"#,
+        &sid,
+    )
+    .await;
+
+    cdp(
+        &mut ctx,
+        3,
+        "Input.dispatchMouseEvent",
+        json!({
+            "type": "mousePressed", "x": 10.0, "y": 15.0,
+            "globalX": 210.0, "globalY": 315.0,
+            "button": "left", "buttons": 1, "modifiers": 10
+        }),
+        &sid,
+    )
+    .await;
+    cdp(
+        &mut ctx,
+        4,
+        "Input.dispatchMouseEvent",
+        json!({
+            "type": "mouseMoved", "x": 40.0, "y": 50.0,
+            "globalX": 240.0, "globalY": 350.0,
+            "movementX": 30.0, "movementY": 35.0,
+            "button": "left", "buttons": 1, "modifiers": 10
+        }),
+        &sid,
+    )
+    .await;
+    cdp(
+        &mut ctx,
+        5,
+        "Input.dispatchMouseEvent",
+        json!({
+            "type": "mouseMoved", "x": 60.0, "y": 70.0,
+            "globalX": 260.0, "globalY": 370.0,
+            "button": "left", "buttons": 1, "modifiers": 10
+        }),
+        &sid,
+    )
+    .await;
+    evaluate(&mut ctx, 6, "setDragHit('outside')", &sid).await;
+    cdp(
+        &mut ctx,
+        7,
+        "Input.dispatchMouseEvent",
+        json!({
+            "type": "mouseReleased", "x": 80.0, "y": 90.0,
+            "globalX": 280.0, "globalY": 390.0,
+            "button": "left", "buttons": 0, "modifiers": 10
+        }),
+        &sid,
+    )
+    .await;
+
+    let result = evaluate(
+        &mut ctx,
+        8,
+        "JSON.stringify({log: dragLog, clicks: dragClicks, scrollX, scrollY})",
+        &sid,
+    )
+    .await;
+    let result: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(result["scrollX"], 120.0);
+    assert_eq!(result["scrollY"], 80.0);
+    assert_eq!(result["clicks"], 0, "release outside the pressed control must not click");
+
+    let log = result["log"].as_array().unwrap();
+    let types: Vec<&str> = log
+        .iter()
+        .map(|entry| entry["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(types, ["mousedown", "mousemove", "mousemove", "mouseup"]);
+    for event in log {
+        assert_eq!(event["target"], "drag-handle", "drag events retain their start target");
+        assert_eq!(event["currentIsWindow"], true, "drag event must bubble to window");
+        assert_eq!(event["button"], 0);
+        assert_eq!(event["ctrl"], true);
+        assert_eq!(event["shift"], true);
+        assert_eq!(event["trusted"], true);
+    }
+    assert_eq!(log[0]["buttons"], 1);
+    assert_eq!(log[1]["buttons"], 1);
+    assert_eq!(log[2]["buttons"], 1);
+    assert_eq!(log[3]["buttons"], 0);
+    assert_eq!(log[1]["clientX"], 40.0);
+    assert_eq!(log[1]["clientY"], 50.0);
+    assert_eq!(log[1]["pageX"], 160.0);
+    assert_eq!(log[1]["pageY"], 130.0);
+    assert_eq!(log[1]["screenX"], 240.0);
+    assert_eq!(log[1]["screenY"], 350.0);
+    assert_eq!(log[1]["movementX"], 30.0);
+    assert_eq!(log[1]["movementY"], 35.0);
+    assert_eq!(log[3]["pageX"], 200.0);
+    assert_eq!(log[3]["pageY"], 170.0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn touch_dispatch_reports_that_touch_events_are_not_supported() {
+    let (mut ctx, sid) = setup().await;
+    let response = dispatch(
+        &CdpRequest {
+            id: 2,
+            method: "Input.dispatchTouchEvent".to_string(),
+            params: json!({
+                "type": "touchStart",
+                "touchPoints": [{"x": 10.0, "y": 20.0}]
+            }),
+            session_id: Some(sid),
+        },
+        &mut ctx,
+    )
+    .await;
+    let error = response.error.expect("touch dispatch must not silently succeed");
+    assert_eq!(error.code, -32601);
+    assert!(
+        error.message.contains("dispatchTouchEvent is not supported"),
+        "unexpected CDP error: {}",
+        error.message
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

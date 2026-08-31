@@ -12,6 +12,7 @@ use deno_core::JsBuffer;
 use deno_core::OpState;
 use obscura_dom::tree::{AttachShadowError, ShadowRootMode};
 use obscura_dom::{DomTree, NodeData, NodeId, ParserInsertionYield, StreamingDocumentParser};
+use obscura_net::interceptor::InterceptAction;
 #[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
 use obscura_net::{
@@ -2398,6 +2399,53 @@ fn cors_response_allows(
     }
 }
 
+/// Apply the browser context's transport interceptor to a request assembled by
+/// the JavaScript fetch/XHR path.
+///
+/// `op_fetch_url` sends with the context's raw reqwest client because it has to
+/// implement Fetch/CORS semantics itself.  That must not make this path a way
+/// around the interceptor used by navigation and static resources.  Continue
+/// and Block have unambiguous meanings here.  Fulfill and ModifyHeaders cannot
+/// be safely spliced into this independently implemented transport yet, so
+/// they fail closed instead of silently bypassing policy.
+async fn enforce_script_request_interceptor(
+    http_client: Option<&Arc<ObscuraHttpClient>>,
+    request: &RequestInfo,
+) -> Result<(), String> {
+    let Some(http_client) = http_client else {
+        return Ok(());
+    };
+    let interceptor = http_client.interceptor.read().await;
+    let Some(interceptor) = interceptor.as_ref() else {
+        return Ok(());
+    };
+
+    match interceptor.intercept(request).await {
+        InterceptAction::Continue => Ok(()),
+        InterceptAction::Block => Err("blocked by request interceptor".to_string()),
+        InterceptAction::Fulfill(_) => Err(
+            "request interceptor Fulfill is unsupported for scripted fetch and was blocked"
+                .to_string(),
+        ),
+        InterceptAction::ModifyHeaders(_) => Err(
+            "request interceptor ModifyHeaders is unsupported for scripted fetch and was blocked"
+                .to_string(),
+        ),
+    }
+}
+
+fn blocked_script_fetch(url: &str, reason: impl Into<String>) -> String {
+    serde_json::json!({
+        "status": 0,
+        "body": "",
+        "url": url,
+        "headers": {},
+        "blocked": true,
+        "error": reason.into(),
+    })
+    .to_string()
+}
+
 fn resource_owner_is_reserved_for(
     page: &ObscuraState,
     realm_frame_id: u32,
@@ -2541,18 +2589,17 @@ async fn op_fetch_url(
     let allow_private_network = http_client
         .as_ref()
         .is_some_and(|client| client.allow_private_network);
-    if let Ok(parsed_url) = url::Url::parse(&url) {
-        if let Err(e) = validate_fetch_url(&parsed_url, allow_private_network) {
-            return Ok(serde_json::json!({
-                "status": 0,
-                "body": "",
-                "url": url,
-                "headers": {},
-                "blocked": true,
-                "error": e,
-            })
-            .to_string());
+    let parsed_initial_url = match url::Url::parse(&url) {
+        Ok(url) => url,
+        Err(error) => {
+            return Ok(blocked_script_fetch(
+                &url,
+                format!("invalid fetch URL: {error}"),
+            ));
         }
+    };
+    if let Err(error) = validate_fetch_url(&parsed_initial_url, allow_private_network) {
+        return Ok(blocked_script_fetch(&url, error));
     }
     struct PageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
     impl Drop for PageInFlightGuard {
@@ -2581,8 +2628,8 @@ async fn op_fetch_url(
 
     let initial_custom_headers: HashMap<String, String> =
         serde_json::from_str(&headers_json).unwrap_or_default();
-    let initial_request_info = url::Url::parse(&url).ok().map(|parsed| RequestInfo {
-        url: parsed,
+    let initial_request_info = Some(RequestInfo {
+        url: parsed_initial_url,
         method: method.clone(),
         headers: initial_custom_headers.clone(),
         resource_type,
@@ -2602,6 +2649,14 @@ async fn op_fetch_url(
     let _network_activity_cancellation = network_activity
         .as_ref()
         .map(obscura_net::NetworkActivityTracker::cancellation_guard);
+    if let Some(info) = initial_request_info.as_ref() {
+        if let Err(reason) = enforce_script_request_interceptor(http_client.as_ref(), info).await {
+            if let Some(activity) = network_activity.as_ref() {
+                activity.fail(reason.clone());
+            }
+            return Ok(blocked_script_fetch(&url, reason));
+        }
+    }
     if let (Some(cbs), Some(info)) = (callbacks.as_ref(), initial_request_info.as_ref()) {
         if cbs.has_request_callbacks().await {
             cbs.fire_request(info).await;
@@ -2731,17 +2786,20 @@ async fn op_fetch_url(
     // below). Without this re-validation a rewrite to an internal address would
     // bypass validate_fetch_url entirely.
     let url = if let Some(new_url) = override_url {
-        if let Ok(parsed) = url::Url::parse(&new_url) {
-            if let Err(reason) = validate_fetch_url(&parsed, allow_private_network) {
-                return Ok(serde_json::json!({
-                    "status": 0,
-                    "body": "",
-                    "url": new_url,
-                    "blocked": true,
-                    "error": format!("Intercept rewrite to forbidden URL blocked: {}", reason),
-                })
-                .to_string());
+        let parsed = match url::Url::parse(&new_url) {
+            Ok(url) => url,
+            Err(error) => {
+                return Ok(blocked_script_fetch(
+                    &new_url,
+                    format!("Intercept rewrite to invalid URL blocked: {error}"),
+                ));
             }
+        };
+        if let Err(reason) = validate_fetch_url(&parsed, allow_private_network) {
+            return Ok(blocked_script_fetch(
+                &new_url,
+                format!("Intercept rewrite to forbidden URL blocked: {reason}"),
+            ));
         }
         new_url
     } else {
@@ -2771,6 +2829,33 @@ async fn op_fetch_url(
     let custom_headers: std::collections::HashMap<String, String> =
         override_headers.unwrap_or(initial_custom_headers);
 
+    let effective_url =
+        url::Url::parse(&url).expect("initial and CDP-rewritten fetch URLs were validated above");
+    let effective_request_info = RequestInfo {
+        url: effective_url,
+        method: method.clone(),
+        headers: custom_headers.clone(),
+        resource_type,
+        document_generation: callback_generation,
+        frame_id,
+        initiator: initiator.clone(),
+    };
+    let effective_request_changed = initial_request_info.as_ref().is_none_or(|initial| {
+        initial.url != effective_request_info.url
+            || initial.method != effective_request_info.method
+            || initial.headers != effective_request_info.headers
+    });
+    if effective_request_changed {
+        if let Err(reason) =
+            enforce_script_request_interceptor(http_client.as_ref(), &effective_request_info).await
+        {
+            if let Some(activity) = network_activity.as_ref() {
+                activity.fail(reason.clone());
+            }
+            return Ok(blocked_script_fetch(&url, reason));
+        }
+    }
+
     let needs_preflight = is_cross_origin
         && mode == "cors"
         && (req_method != reqwest::Method::GET
@@ -2785,19 +2870,42 @@ async fn op_fetch_url(
             }));
 
     if needs_preflight {
+        let requested_headers = custom_headers
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let preflight_info = RequestInfo {
+            url: url::Url::parse(&url).expect("effective fetch URL was validated above"),
+            method: "OPTIONS".to_string(),
+            headers: HashMap::from([
+                ("origin".to_string(), page_origin.clone()),
+                ("access-control-request-method".to_string(), method.clone()),
+                (
+                    "access-control-request-headers".to_string(),
+                    requested_headers.clone(),
+                ),
+            ]),
+            resource_type,
+            document_generation: callback_generation,
+            frame_id,
+            initiator: initiator.clone(),
+        };
+        if let Err(reason) =
+            enforce_script_request_interceptor(http_client.as_ref(), &preflight_info).await
+        {
+            if let Some(activity) = network_activity.as_ref() {
+                activity.fail(reason.clone());
+            }
+            return Ok(blocked_script_fetch(&url, reason));
+        }
+
         let preflight = client
             .request(reqwest::Method::OPTIONS, &url)
             .timeout(fetch_timeout())
             .header("Origin", &page_origin)
             .header("Access-Control-Request-Method", method.as_str())
-            .header(
-                "Access-Control-Request-Headers",
-                custom_headers
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            )
+            .header("Access-Control-Request-Headers", requested_headers)
             .send()
             .await
             .map_err(|e| {
@@ -2837,6 +2945,7 @@ async fn op_fetch_url(
         if let Some(stealth) = stealth {
             return stealth_fetch_all(
                 stealth,
+                http_client.clone(),
                 url.clone(),
                 req_method.as_str().to_string(),
                 custom_headers.clone(),
@@ -2984,15 +3093,44 @@ async fn op_fetch_url(
         }
 
         // Browser semantics: 301/302/303 downgrade to GET with no body.
-        // 307/308 preserve method and body.
+        // 307/308 preserve method and body. Compute the request as it will be
+        // sent before asking the transport interceptor about this hop.
         let status_code = resp.status().as_u16();
+        let mut next_method = current_method.clone();
+        let mut next_body = current_body.clone();
         if status_code == 301 || status_code == 302 || status_code == 303 {
-            current_method = reqwest::Method::GET;
-            current_body.clear();
+            next_method = reqwest::Method::GET;
+            next_body.clear();
+        }
+        let mut next_headers = custom_headers.clone();
+        if request_origin(next_url.as_str())
+            .map(|request_origin| request_origin != page_origin)
+            .unwrap_or(false)
+        {
+            next_headers.insert("origin".to_string(), page_origin.clone());
+        }
+        let redirect_request_info = RequestInfo {
+            url: next_url.clone(),
+            method: next_method.as_str().to_string(),
+            headers: next_headers,
+            resource_type,
+            document_generation: callback_generation,
+            frame_id,
+            initiator: initiator.clone(),
+        };
+        if let Err(reason) =
+            enforce_script_request_interceptor(http_client.as_ref(), &redirect_request_info).await
+        {
+            if let Some(activity) = network_activity.as_ref() {
+                activity.fail(reason.clone());
+            }
+            return Ok(blocked_script_fetch(next_url.as_str(), reason));
         }
 
         redirected_from.push(base);
         current_url = next_url.to_string();
+        current_method = next_method;
+        current_body = next_body;
     };
 
     let status = response.status().as_u16();
@@ -3152,6 +3290,7 @@ fn fetch_response(
 #[cfg(feature = "stealth")]
 async fn stealth_fetch_all(
     stealth: Arc<StealthHttpClient>,
+    http_client: Option<Arc<ObscuraHttpClient>>,
     url: String,
     method: String,
     custom_headers: HashMap<String, String>,
@@ -3237,12 +3376,37 @@ async fn stealth_fetch_all(
             .to_string());
         }
         // Browser semantics: 301/302/303 downgrade to GET with no body.
+        let mut next_method = current_method.clone();
+        let mut next_body = current_body.clone();
         if r.status == 301 || r.status == 302 || r.status == 303 {
-            current_method = "GET".to_string();
-            current_body.clear();
+            next_method = "GET".to_string();
+            next_body.clear();
+        }
+        let mut next_headers = custom_headers.clone();
+        if next_url.origin().ascii_serialization() != page_origin {
+            next_headers.insert("origin".to_string(), page_origin.clone());
+        }
+        let redirect_request_info = RequestInfo {
+            url: next_url.clone(),
+            method: next_method.clone(),
+            headers: next_headers,
+            resource_type,
+            document_generation,
+            frame_id,
+            initiator: initiator.clone(),
+        };
+        if let Err(reason) =
+            enforce_script_request_interceptor(http_client.as_ref(), &redirect_request_info).await
+        {
+            if let Some(activity) = network_activity.as_ref() {
+                activity.fail(reason.clone());
+            }
+            return Ok(blocked_script_fetch(next_url.as_str(), reason));
         }
         redirected_from.push(parsed_current);
         current_url = next_url.to_string();
+        current_method = next_method;
+        current_body = next_body;
     };
 
     if let (Some(activity), Ok(final_url)) =
@@ -3378,6 +3542,156 @@ mod tests {
     use obscura_dom::ShadowRootMode;
 
     use super::{pbkdf2_derive, PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES};
+
+    enum RecordingInterceptorRule {
+        ExactOrigin(String),
+        BlockMethod(String),
+        Fulfill,
+        ModifyHeaders,
+    }
+
+    struct RecordingRequestInterceptor {
+        rule: RecordingInterceptorRule,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<obscura_net::RequestInfo>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl obscura_net::interceptor::RequestInterceptor for RecordingRequestInterceptor {
+        async fn intercept(
+            &self,
+            request: &obscura_net::RequestInfo,
+        ) -> obscura_net::interceptor::InterceptAction {
+            self.seen.lock().unwrap().push(request.clone());
+            match &self.rule {
+                RecordingInterceptorRule::ExactOrigin(allowed) => {
+                    if request.url.origin().ascii_serialization() == *allowed {
+                        obscura_net::interceptor::InterceptAction::Continue
+                    } else {
+                        obscura_net::interceptor::InterceptAction::Block
+                    }
+                }
+                RecordingInterceptorRule::BlockMethod(method) => {
+                    if request.method.eq_ignore_ascii_case(method) {
+                        obscura_net::interceptor::InterceptAction::Block
+                    } else {
+                        obscura_net::interceptor::InterceptAction::Continue
+                    }
+                }
+                RecordingInterceptorRule::Fulfill => {
+                    obscura_net::interceptor::InterceptAction::Fulfill(obscura_net::Response {
+                        url: request.url.clone(),
+                        status: 200,
+                        headers: std::collections::HashMap::new(),
+                        body: b"not-safe-to-splice".to_vec(),
+                        redirected_from: Vec::new(),
+                    })
+                }
+                RecordingInterceptorRule::ModifyHeaders => {
+                    obscura_net::interceptor::InterceptAction::ModifyHeaders(
+                        std::collections::HashMap::from([(
+                            "x-unsafe".to_string(),
+                            "must-not-apply".to_string(),
+                        )]),
+                    )
+                }
+            }
+        }
+    }
+
+    struct ScriptFetchTestServer {
+        origin: String,
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        stop: std::sync::mpsc::Sender<()>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for ScriptFetchTestServer {
+        fn drop(&mut self) {
+            let _ = self.stop.send(());
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn spawn_script_fetch_test_server(
+        handler: impl Fn(&str) -> String + Send + 'static,
+    ) -> ScriptFetchTestServer {
+        // reqwest honours ambient proxy variables. Keep these loopback-only
+        // fixtures local even on developer machines which export HTTP_PROXY.
+        for key in ["NO_PROXY", "no_proxy"] {
+            let mut exclusions = std::env::var(key).unwrap_or_default();
+            if !exclusions.is_empty() {
+                exclusions.push(',');
+            }
+            exclusions.push_str("127.0.0.1,localhost");
+            std::env::set_var(key, exclusions);
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let thread_hits = hits.clone();
+        let thread_requests = requests.clone();
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            loop {
+                if stopped.try_recv().is_ok() {
+                    return;
+                }
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+                let mut buffer = [0u8; 4096];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request_line = String::from_utf8_lossy(&buffer[..read])
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                thread_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                thread_requests.lock().unwrap().push(request_line.clone());
+                let _ = stream.write_all(handler(&request_line).as_bytes());
+            }
+        });
+
+        ScriptFetchTestServer {
+            origin: format!("http://{address}"),
+            hits,
+            requests,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn response(status: &str, headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn runtime_with_http_client(
+        page_url: &str,
+        client: std::sync::Arc<obscura_net::ObscuraHttpClient>,
+    ) -> ObscuraJsRuntime {
+        let mut runtime = ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html("<html><body></body></html>"));
+        runtime.set_url(page_url);
+        runtime.set_http_client(client);
+        runtime.run_page_init();
+        runtime
+    }
 
     #[test]
     fn bounded_frame_document_queue_records_each_refusal_once() {
@@ -3694,6 +4008,283 @@ mod tests {
             err.to_lowercase().contains("scheme"),
             "error should name the forbidden scheme: {err}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_interceptor_fails_closed_for_unsupported_actions() {
+        let request = obscura_net::RequestInfo {
+            url: url::Url::parse("https://allowed.example/data").unwrap(),
+            method: "GET".to_string(),
+            headers: std::collections::HashMap::new(),
+            resource_type: obscura_net::ResourceType::Fetch,
+            document_generation: 1,
+            frame_id: 0,
+            initiator: Some(url::Url::parse("https://allowed.example/page").unwrap()),
+        };
+
+        for (rule, expected) in [
+            (RecordingInterceptorRule::Fulfill, "Fulfill"),
+            (RecordingInterceptorRule::ModifyHeaders, "ModifyHeaders"),
+        ] {
+            let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ));
+            *client.interceptor.write().await = Some(Box::new(RecordingRequestInterceptor {
+                rule,
+                seen: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }));
+            let error = super::enforce_script_request_interceptor(Some(&client), &request)
+                .await
+                .expect_err("unsupported scripted-fetch actions must fail closed");
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_interceptor_blocks_direct_and_redirected_cross_origin_fetches() {
+        let blocked = spawn_script_fetch_test_server(|_| {
+            response(
+                "200 OK",
+                "Content-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\n",
+                "must-not-arrive",
+            )
+        });
+        let blocked_direct_url = format!("{}/direct", blocked.origin);
+        let blocked_redirect_url = format!("{}/redirect-target", blocked.origin);
+        let redirect_target = blocked_redirect_url.clone();
+        let allowed = spawn_script_fetch_test_server(move |request_line| {
+            if request_line.contains(" /redirect ") {
+                response("302 Found", &format!("Location: {redirect_target}\r\n"), "")
+            } else {
+                response("200 OK", "Content-Type: text/plain\r\n", "allowed")
+            }
+        });
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()),
+            None,
+            true,
+        ));
+        *client.interceptor.write().await = Some(Box::new(RecordingRequestInterceptor {
+            rule: RecordingInterceptorRule::ExactOrigin(allowed.origin.clone()),
+            seen: seen.clone(),
+        }));
+        let mut runtime = runtime_with_http_client(&format!("{}/page", allowed.origin), client);
+        let allowed_url = format!("{}/ok", allowed.origin);
+        let redirect_url = format!("{}/redirect", allowed.origin);
+        let script = format!(
+            r#"async () => {{
+                const outcome = async url => {{
+                    try {{ return await (await fetch(url)).text(); }}
+                    catch (_) {{ return "blocked"; }}
+                }};
+                return {{
+                    allowed: await outcome({}),
+                    direct: await outcome({}),
+                    redirect: await outcome({}),
+                }};
+            }}"#,
+            serde_json::to_string(&allowed_url).unwrap(),
+            serde_json::to_string(&blocked_direct_url).unwrap(),
+            serde_json::to_string(&redirect_url).unwrap(),
+        );
+        let result = runtime
+            .call_function_on_for_cdp(&script, None, &[], true, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "allowed": "allowed",
+                "direct": "blocked",
+                "redirect": "blocked",
+            })
+        );
+        assert_eq!(
+            blocked.hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the disallowed origin must not receive direct or redirected traffic"
+        );
+        assert!(blocked.requests.lock().unwrap().is_empty());
+        assert_eq!(
+            allowed.hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "only the allowed request and allowed redirect source should be sent"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.iter()
+                .map(|request| request.url.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                allowed_url.as_str(),
+                blocked_direct_url.as_str(),
+                redirect_url.as_str(),
+                blocked_redirect_url.as_str(),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_without_request_interceptor_still_follows_cross_origin_redirect() {
+        let target = spawn_script_fetch_test_server(|_| {
+            response(
+                "200 OK",
+                "Content-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\n",
+                "arrived",
+            )
+        });
+        let target_url = format!("{}/target", target.origin);
+        let redirect_target = target_url.clone();
+        let source = spawn_script_fetch_test_server(move |_| {
+            response("302 Found", &format!("Location: {redirect_target}\r\n"), "")
+        });
+        let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()),
+            None,
+            true,
+        ));
+        let mut runtime = runtime_with_http_client(&format!("{}/page", source.origin), client);
+        let result = runtime
+            .call_function_on_for_cdp(
+                r#"async () => (await fetch("/redirect")).text()"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.value.unwrap(), serde_json::json!("arrived"));
+        assert_eq!(source.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(target.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_interceptor_rechecks_cdp_continue_url_rewrite() {
+        let blocked = spawn_script_fetch_test_server(|_| {
+            response("200 OK", "Content-Type: text/plain\r\n", "blocked")
+        });
+        let blocked_url = format!("{}/rewritten", blocked.origin);
+        let allowed = spawn_script_fetch_test_server(|_| {
+            response("200 OK", "Content-Type: text/plain\r\n", "unexpected")
+        });
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()),
+            None,
+            true,
+        ));
+        *client.interceptor.write().await = Some(Box::new(RecordingRequestInterceptor {
+            rule: RecordingInterceptorRule::ExactOrigin(allowed.origin.clone()),
+            seen: seen.clone(),
+        }));
+        let mut runtime = runtime_with_http_client(&format!("{}/page", allowed.origin), client);
+        let (intercept_tx, mut intercept_rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime.set_intercept_tx(intercept_tx);
+        runtime.set_intercept_enabled(true);
+        let rewrite_url = blocked_url.clone();
+        let responder = tokio::spawn(async move {
+            let intercepted = intercept_rx.recv().await.expect("intercepted request");
+            intercepted
+                .resolver
+                .send(InterceptResolution::Continue {
+                    url: Some(rewrite_url),
+                    method: None,
+                    headers: None,
+                    body: None,
+                })
+                .unwrap();
+        });
+        let result = runtime
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    try { await fetch("/original"); return "sent"; }
+                    catch (_) { return "blocked"; }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        responder.await.unwrap();
+
+        assert_eq!(result.value.unwrap(), serde_json::json!("blocked"));
+        assert_eq!(allowed.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(blocked.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].url.as_str(), format!("{}/original", allowed.origin));
+        assert_eq!(seen[1].url.as_str(), blocked_url);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_interceptor_checks_cors_preflight_before_network() {
+        let target = spawn_script_fetch_test_server(|_| {
+            response(
+                "204 No Content",
+                "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST\r\nAccess-Control-Allow-Headers: x-policy-test\r\n",
+                "",
+            )
+        });
+        let page = spawn_script_fetch_test_server(|_| {
+            response("200 OK", "Content-Type: text/html\r\n", "")
+        });
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()),
+            None,
+            true,
+        ));
+        *client.interceptor.write().await = Some(Box::new(RecordingRequestInterceptor {
+            rule: RecordingInterceptorRule::BlockMethod("OPTIONS".to_string()),
+            seen: seen.clone(),
+        }));
+        let mut runtime = runtime_with_http_client(&format!("{}/page", page.origin), client);
+        let target_url = format!("{}/preflight", target.origin);
+        let script = format!(
+            r#"async () => {{
+                try {{
+                    await fetch({}, {{
+                        method: "POST",
+                        headers: {{ "x-policy-test": "yes" }},
+                        body: "payload",
+                    }});
+                    return "sent";
+                }} catch (_) {{
+                    return "blocked";
+                }}
+            }}"#,
+            serde_json::to_string(&target_url).unwrap(),
+        );
+        let result = runtime
+            .call_function_on_for_cdp(&script, None, &[], true, true)
+            .await
+            .unwrap();
+
+        assert_eq!(result.value.unwrap(), serde_json::json!("blocked"));
+        assert_eq!(
+            target.hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a blocked preflight must not connect to the target origin"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            vec!["POST", "OPTIONS"]
+        );
+        assert!(seen
+            .iter()
+            .all(|request| request.url.as_str() == target_url));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6552,8 +7143,12 @@ fn clamp_scroll_offset_for_consumer(
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_layout_geometry(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    #[string] nid_str: String,
+) -> String {
+    let shared = realm_state(scope, state);
     let nid: u32 = nid_str.parse().unwrap_or(0);
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();
@@ -6735,8 +7330,12 @@ fn op_intersection_observer_measurements(state: &OpState, #[string] nids_json: S
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_computed_style(state: &OpState, #[string] nid_str: String) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_computed_style(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    #[string] nid_str: String,
+) -> String {
+    let shared = realm_state(scope, state);
     let nid: u32 = nid_str.parse().unwrap_or(0);
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();

@@ -1,6 +1,7 @@
 pub mod captcha;
 pub mod context;
 mod fork_virtual_url;
+pub mod legacy;
 pub mod lifecycle;
 pub mod page;
 #[cfg(feature = "render")]
@@ -12,6 +13,14 @@ pub use captcha::{
     CaptchaEvidenceKind, CaptchaExtraction, CaptchaImageRole, CaptchaSourceKind,
 };
 pub use context::BrowserContext;
+pub use legacy::{
+    dispatch_legacy_captcha_pointer, dispatch_legacy_view_pointer, dispatch_legacy_view_wheel,
+    fill_legacy_credentials, inspect_legacy_page, install_legacy_bridge_preload,
+    legacy_captcha_target_is_current, legacy_frame_top_offset, locate_legacy_view_target,
+    probe_legacy_authentication, submit_legacy_login, type_into_legacy_view, LegacyAuthProbe,
+    LegacyCaptchaTarget, LegacyInspection, LegacyLoginSelectors, LegacyLoginTarget,
+    LegacyPointerPhase, LegacyRect, LegacyTargetLease, LegacyViewTarget,
+};
 pub use lifecycle::{CaptureReadyOptions, CaptureReadyReport, LifecycleState, WaitUntil};
 pub use obscura_js::HTML_TO_MARKDOWN_JS;
 #[cfg(feature = "render")]

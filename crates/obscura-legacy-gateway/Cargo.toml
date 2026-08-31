@@ -1,0 +1,29 @@
+[package]
+name = "obscura-legacy-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["render"]
+render = ["obscura-browser/render"]
+
+[dependencies]
+obscura-browser = { path = "../obscura-browser" }
+obscura-net = { path = "../obscura-net" }
+tokio = { workspace = true }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "http1", "tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+subtle = "2"
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true }

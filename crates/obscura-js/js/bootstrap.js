@@ -11010,7 +11010,30 @@ globalThis.CustomEvent = class extends Event {
   }
 };
 globalThis.MouseEvent = class extends Event {
-  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.screenX=o.screenX||0;this.screenY=o.screenY||0;this.clientX=o.clientX||0;this.clientY=o.clientY||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.button=o.button||0;this.buttons=o.buttons||0;this.relatedTarget=o.relatedTarget||null; }
+  constructor(t,o={}) {
+    super(t,o);
+    this.view=o.view||null;
+    this.detail=o.detail||0;
+    this.screenX=o.screenX||0;
+    this.screenY=o.screenY||0;
+    this.clientX=o.clientX||0;
+    this.clientY=o.clientY||0;
+    // pageX/pageY are document coordinates, not aliases for clientX/clientY.
+    // CDP supplies viewport-relative x/y, so a trusted input event created in
+    // a scrolled realm must snapshot that realm's scroll offset here.
+    const coordinateView=this.view||globalThis;
+    this.pageX=this.clientX+(Number(coordinateView.scrollX??coordinateView.pageXOffset)||0);
+    this.pageY=this.clientY+(Number(coordinateView.scrollY??coordinateView.pageYOffset)||0);
+    this.movementX=Number(o.movementX)||0;
+    this.movementY=Number(o.movementY)||0;
+    this.ctrlKey=!!o.ctrlKey;
+    this.altKey=!!o.altKey;
+    this.shiftKey=!!o.shiftKey;
+    this.metaKey=!!o.metaKey;
+    this.button=o.button||0;
+    this.buttons=o.buttons||0;
+    this.relatedTarget=o.relatedTarget||null;
+  }
   // Legacy DOM Level 2 initializer. Positional signature per UI Events spec.
   initMouseEvent(type,canBubble,cancelable,view,detail,screenX,screenY,clientX,clientY,ctrlKey,altKey,shiftKey,metaKey,button,relatedTarget) {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'initMouseEvent' on 'MouseEvent': 1 argument required, but only 0 present.");
@@ -11021,6 +11044,13 @@ globalThis.MouseEvent = class extends Event {
     this.screenY=screenY||0;
     this.clientX=clientX||0;
     this.clientY=clientY||0;
+    const coordinateView=this.view||globalThis;
+    this.pageX=this.clientX+(Number(coordinateView.scrollX??coordinateView.pageXOffset)||0);
+    this.pageY=this.clientY+(Number(coordinateView.scrollY??coordinateView.pageYOffset)||0);
+    // initMouseEvent predates relative movement coordinates and has no
+    // positional arguments for them.
+    this.movementX=0;
+    this.movementY=0;
     this.ctrlKey=!!ctrlKey;
     this.altKey=!!altKey;
     this.shiftKey=!!shiftKey;

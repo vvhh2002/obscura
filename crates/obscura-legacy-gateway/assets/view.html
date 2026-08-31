@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>旧系统远程视图</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body class="view-body">
+  <main class="remote-view">
+    <div class="remote-canvas" id="remote-canvas">
+      <img id="remote-frame" draggable="false" alt="旧系统当前页面画面">
+      <div class="remote-message" id="remote-message">正在建立隔离视图…</div>
+    </div>
+    <form class="remote-input" id="remote-input-form" method="post" action="/view" autocomplete="off">
+      <label for="remote-input">向已点击的旧系统输入框写入内容</label>
+      <div>
+        <input id="remote-input" autocomplete="off" maxlength="4096" placeholder="先点击画面中的输入框，再在此输入" disabled>
+        <button type="submit" disabled>写入</button>
+      </div>
+    </form>
+  </main>
+  <script src="/assets/view.js" defer></script>
+</body>
+</html>

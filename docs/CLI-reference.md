@@ -143,6 +143,178 @@ See [Archive final-page resources](Archive-final-page-resources.md) for the
 manifest v1 schema, exact completeness contract, supported resource owners,
 destination safety rules, and verification examples.
 
+## `obscura legacy-gateway [<LEGACY_URL> | --config <FILE>]`
+
+Expose one administrator-configured legacy login page through a loopback-only
+conversion UI. The command recognizes a login form and the slide mode of
+Tianai, GoCaptcha, AJ-Captcha, or slider-captcha-js. Other CAPTCHA modes are
+out of scope. It shows the authenticated legacy page as a remote PNG viewport
+inside a same-origin iframe; the iframe does not navigate to the legacy URL.
+
+Login and the remote viewport reuse the same Obscura `BrowserContext + Page`,
+so the legacy session naturally continues after authentication. The gateway
+does not copy legacy cookies into the new UI. One user gesture is submitted as
+one bounded batch of real `down -> move+ -> up` samples with the CAPTCHA
+generation, sequence numbers, normalized coordinates, and relative timing.
+The server validates the generation and replays the samples with bounded
+original inter-sample timing. It neither solves the CAPTCHA nor calculates or
+accepts a final distance.
+
+```
+    --discover-output <FILE>             After one confirmed login, create a
+                                         validated version 1 integration manifest
+    --config <FILE>                      Serve from a manifest created by
+                                         --discover-output; LEGACY_URL is omitted
+    --success-selector <CSS>             Required post-login authentication probe
+    --subject-selector <CSS>             Optional display-only identity text
+    --username-selector <CSS>            Override username-field detection
+    --password-selector <CSS>            Override password-field detection
+    --submit-selector <CSS>              Override submit-control detection
+    --captcha-adapter <ADAPTER>          auto | tianai | gocaptcha-slide |
+                                         aj-captcha |
+                                         slider-captcha-js (default auto)
+    --allowed-navigation-origin <ORIGIN> Allow an exact redirect/navigation origin;
+                                         repeat for additional origins
+    --allowed-resource-origin <ORIGIN>   Allow an exact script/image/font/frame/
+                                         fetch origin; repeat for additional origins
+    --allow-insecure-legacy-http         Explicitly permit HTTP legacy origins
+    --host <IP>                          Loopback listen IP (default 127.0.0.1)
+    --port <PORT>                        Listen port; 0 selects a free port (default 0)
+    --viewport-width <PX>                320..4096 (default 1280)
+    --viewport-height <PX>               240..2160 (default 720)
+    --session-ttl <SECONDS>              60..86400 (default 1800)
+    --user-agent <UA>                    Legacy browser User-Agent override
+    --proxy <URL>                        HTTP or SOCKS5 proxy (global)
+    --allow-private-network              Permit loopback/RFC1918/link-local fetches (global)
+```
+
+The startup origin is automatically included in both allowlists. Navigation
+and resource origins are separate: allowing an SSO redirect does not silently
+allow that origin to host scripts or receive fetch/XHR requests. Origins are
+matched by scheme, host, and effective port. HTTPS is required unless
+`--allow-insecure-legacy-http` is present, and the gateway rejects non-loopback
+`--host` values.
+
+For a repeatable integration, run the gateway in two stages. The first command
+starts the ordinary conversion UI but, after one login has been confirmed,
+creates a secret-free discovery manifest instead of retaining that session:
+
+```bash
+obscura legacy-gateway https://legacy.example/login \
+  --discover-output ./legacy-login.json \
+  --success-selector '#application-shell' \
+  --subject-selector '.current-user'
+```
+
+Discovery requires two consecutive pre-login probes in the same document
+generation with no visible success-selector match and no multiple-match
+ambiguity. One hidden candidate is permitted in this logged-out baseline, but
+multiple candidates fail closed. Post-login, the selector must have exactly one
+connected and visible match in two consecutive probes. Discovery then loads the
+login URL in a fresh logged-out browser context and requires the same concrete
+CAPTCHA adapter/mode, labels, and stable unique login selectors. Its success
+selector must again have no visible match and no multiple-match ambiguity in
+two consecutive probes. Before the version 1 JSON is published, both the
+authenticated discovery context and this preflight context are destroyed;
+neither session can become the production session. A failed preflight is
+configuration drift and no manifest is written.
+
+The destination must not already exist. Publication is atomic and create-new:
+discovery never truncates, replaces, or follows an existing destination. Once
+the file has been reviewed, start the long-lived integration with:
+
+```bash
+obscura legacy-gateway --config ./legacy-login.json
+```
+
+The version 1 manifest contains only stable integration metadata:
+
+```json
+{
+  "schemaVersion": 1,
+  "loginUrl": "https://legacy.example/login",
+  "captchaAdapter": "gocaptcha-slide",
+  "selectors": {
+    "username": "input[name=\"username\"]",
+    "password": "input[name=\"password\"]",
+    "submit": "button[type=\"submit\"]"
+  },
+  "authentication": {
+    "successSelector": "#application-shell",
+    "subjectSelector": ".current-user"
+  },
+  "detection": {
+    "captchaMode": "slide",
+    "usernameLabel": "Account",
+    "passwordLabel": "Password",
+    "submitLabel": "Sign in"
+  },
+  "origins": {
+    "navigation": ["https://legacy.example"],
+    "resources": ["https://legacy.example", "https://static.example"]
+  },
+  "viewport": { "width": 1280, "height": 720 },
+  "sessionTtlSeconds": 1800,
+  "allowInsecureLegacyHttp": false,
+  "userAgent": "Legacy Browser/1.0"
+}
+```
+
+`captchaAdapter` is always a concrete supported adapter, never `auto`, and
+`detection.captchaMode` is its exact supported mode. `userAgent` is optional.
+The schema has no fields for usernames, passwords, cookies, bearer/provider
+tokens, dynamic CAPTCHA URLs, challenge images, or image/canvas fingerprints.
+Unknown fields and invalid or non-canonical values are rejected.
+
+In `--config` mode, the initial logged-out page must exactly match the persisted
+adapter, mode, labels, and selectors before credentials are accepted. A missing,
+ambiguous, or changed profile fails closed as configuration drift; the gateway
+does not fall back to fresh auto-detection or update the manifest in place.
+
+`--config` conflicts with `LEGACY_URL`, `--discover-output`, the CAPTCHA adapter,
+all login and authentication selector flags, both origin flags, the HTTP opt-in,
+viewport flags, session TTL, and the subcommand-local `--user-agent`. `--host`
+and `--port` remain runtime choices. Process-level network options such as
+`--proxy` and `--allow-private-network` also remain available. A top-level
+`--user-agent` placed before `legacy-gateway` is a runtime override and takes
+precedence over the optional manifest value; `--stealth` remains unsupported.
+
+If neither `--discover-output` nor `--config` is supplied, the original one-shot
+form remains unchanged: pass `LEGACY_URL` and `--success-selector`, detect the
+page at startup, and keep that run's authenticated context until logout, expiry,
+or process termination. It does not read or write a manifest.
+
+`--session-ttl` is an absolute lifetime rather than an idle timeout. It starts
+when the UI session is issued and restarts once when successful authentication
+rotates that session; polling and input do not extend it. On expiry, the next
+request permanently retires that process's launch token, discards the legacy
+`BrowserContext + Page`, installs a blank isolated context, and returns HTTP
+410. Restart `legacy-gateway` to create a new launch URL.
+
+The command requires a build with `--features render`. It rejects `--stealth`
+because the current stealth transport bypasses the exact resource-origin
+interceptor. It also deliberately ignores persistent `--storage-dir` state:
+initial login and every logout use a newly allocated `BrowserContext`, CookieJar,
+HTTP client, and Page.
+
+On success the process prints exactly one launch URL, such as
+`http://127.0.0.1:49152/#...`, then serves until stopped. The fragment is a
+process-local bearer and must be handed directly to the local browser rather
+than logged, copied into monitoring systems, or persisted. Neither the fixed
+legacy URL nor selectors can be replaced through an HTTP request.
+
+```bash
+cargo run --release --features render -p obscura-cli -- \
+  legacy-gateway https://legacy.example/login \
+  --success-selector '#application-shell' \
+  --subject-selector '.current-user' \
+  --captcha-adapter gocaptcha-slide \
+  --allowed-resource-origin https://static.example
+```
+
+See [旧系统登录与滑块验证码转换网关](Legacy-System-Gateway.zh-CN.md)
+for the interaction lease, authentication probe, iframe, and security model.
+
 ## `obscura serve`
 
 Run the CDP server. Puppeteer and Playwright connect over WebSocket.

@@ -30,6 +30,7 @@ the wreq/BoringSSL transport and browser-identity protections.
 - [Build from source](Build-from-source.md)
 - [Archive final-page resources](Archive-final-page-resources.md)
 - [提取滑块验证码图形与 URL](Slide-Captcha-Adapters.zh-CN.md)
+- [旧系统登录与滑块验证码转换网关](Legacy-System-Gateway.zh-CN.md)
 - [Document loading and capture readiness](Document-loading-and-capture-ready.md)
 - [Optional online Tencent CAPTCHA smoke](Optional-online-Tencent-smoke.md)
 - [Configure stealth and proxies](Configure-stealth-and-proxies.md)

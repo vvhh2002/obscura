@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Obscura 旧系统接入</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-mark" aria-hidden="true">O</div>
+      <div class="brand-copy">
+        <strong>Obscura 旧系统接入</strong>
+        <span>隔离登录 · 同步会话 · 安全远程视图</span>
+      </div>
+      <div class="connection" id="connection"><span class="signal"></span><span>正在连接</span></div>
+    </header>
+
+    <main class="workspace">
+      <section class="login-panel" aria-labelledby="login-title">
+        <div class="section-kicker">旧系统身份同步</div>
+        <h1 id="login-title">登录并完成验证</h1>
+        <p class="intro">网关不会持久化凭据；凭据只写入本机隔离的旧系统页面。浏览器密码管理器仍遵循你的本机设置。</p>
+
+        <ol class="progress" aria-label="登录进度">
+          <li id="step-detect" class="active"><span>1</span>识别入口</li>
+          <li id="step-captcha"><span>2</span>人工验证</li>
+          <li id="step-session"><span>3</span>同步会话</li>
+        </ol>
+
+        <div class="notice" id="notice" role="status" aria-live="polite">
+          <span class="notice-icon" aria-hidden="true">i</span>
+          <span id="notice-text">正在识别旧系统登录表单与滑块组件…</span>
+        </div>
+
+        <form id="credentials-form" method="post" action="/" autocomplete="off">
+          <label for="username">用户名</label>
+          <input id="username" name="username" autocomplete="off" maxlength="512" required placeholder="请输入旧系统账号" disabled>
+
+          <label for="password">密码</label>
+          <div class="password-field">
+            <input id="password" name="password" type="password" autocomplete="off" maxlength="4096" required placeholder="请输入旧系统密码" disabled>
+            <button type="button" class="text-button" id="toggle-password" aria-label="显示密码" disabled>显示</button>
+          </div>
+
+          <button class="primary" id="fill-credentials" type="submit" disabled>写入旧系统</button>
+        </form>
+
+        <section class="captcha-card" id="captcha-card" aria-labelledby="captcha-title" hidden>
+          <div class="card-heading">
+            <div>
+              <span class="eyebrow" id="captcha-provider">滑块验证</span>
+              <h2 id="captcha-title">请完成安全验证</h2>
+            </div>
+            <button type="button" class="icon-button" id="rescan" aria-label="重新识别验证码">↻</button>
+          </div>
+          <div class="captcha-visual">
+            <img id="captcha-background" alt="旧系统滑块验证码画面">
+            <div class="captcha-loading" id="captcha-loading">正在载入验证码画面</div>
+          </div>
+          <div class="slider" id="slider" aria-label="向右拖动完成旧系统验证码" role="slider" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" tabindex="0">
+            <div class="slider-fill" id="slider-fill"></div>
+            <div class="slider-copy" id="slider-copy">按住滑块并向右拖动</div>
+            <div class="slider-thumb" id="slider-thumb" aria-hidden="true">›</div>
+          </div>
+          <p class="privacy-note">仅转发你的真实拖动轨迹，不计算答案或最终距离。</p>
+        </section>
+
+        <div class="actions">
+          <button type="button" class="primary" id="submit-login" disabled>登录并打开旧系统</button>
+          <button type="button" class="secondary" id="logout">清除本机会话</button>
+        </div>
+      </section>
+
+      <section class="legacy-panel" aria-labelledby="legacy-title">
+        <div class="legacy-toolbar">
+          <div>
+            <span class="eyebrow">隔离远程视图</span>
+            <h2 id="legacy-title">旧系统工作区</h2>
+          </div>
+          <div class="view-status"><span class="signal"></span><span id="view-status-text">等待登录</span></div>
+        </div>
+        <div class="empty-state" id="empty-state">
+          <div class="empty-window" aria-hidden="true">
+            <span></span><span></span><span></span>
+            <div></div>
+          </div>
+          <h3>登录成功后在此打开旧系统</h3>
+          <p>页面会以受控画面显示在同源 iframe 中，旧系统 Cookie 与令牌始终留在 Obscura 会话内。</p>
+        </div>
+        <iframe id="legacy-view" title="旧系统隔离远程视图" src="/view" sandbox="allow-scripts allow-same-origin" hidden></iframe>
+      </section>
+    </main>
+  </div>
+  <noscript>此接入界面需要 JavaScript 才能安全转发交互。</noscript>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>
