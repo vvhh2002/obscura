@@ -1,3 +1,4 @@
+pub mod captcha;
 pub mod context;
 mod fork_virtual_url;
 pub mod lifecycle;
@@ -6,6 +7,10 @@ pub mod page;
 pub mod pdf;
 pub mod profiles;
 
+pub use captcha::{
+    extract_captcha, install_captcha_capture_preload, CaptchaAdapter, CaptchaArtifact,
+    CaptchaEvidenceKind, CaptchaExtraction, CaptchaImageRole, CaptchaSourceKind,
+};
 pub use context::BrowserContext;
 pub use lifecycle::{CaptureReadyOptions, CaptureReadyReport, LifecycleState, WaitUntil};
 pub use obscura_js::HTML_TO_MARKDOWN_JS;

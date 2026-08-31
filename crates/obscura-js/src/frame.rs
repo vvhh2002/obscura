@@ -878,6 +878,16 @@ impl FrameRealm {
         parent.eval_json_in_realm(&self.context, expression)
     }
 
+    /// Watchdog-bounded evaluation for browser-owned probes.
+    pub fn evaluate_with_timeout(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+        expression: &str,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value, String> {
+        parent.eval_json_in_realm_with_timeout(&self.context, expression, timeout)
+    }
+
     /// Runs the frame document's classic scripts, in document order.
     ///
     /// `load_external` resolves a `src=` script to its source text; returning

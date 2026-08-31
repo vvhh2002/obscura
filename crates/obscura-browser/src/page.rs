@@ -3888,6 +3888,18 @@ impl Page {
             .any(|frame| frame.has_pending_dynamic_scripts(js))
     }
 
+    /// Whether any request in the current document generation failed before a
+    /// complete response was available. CAPTCHA API-only extraction uses this
+    /// as a conservative fence against reviving an older successful challenge
+    /// after a newer refresh failed at the transport layer.
+    pub(crate) fn has_current_transport_failures(&self) -> bool {
+        !self
+            .transport_failure_reasons
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
     /// Evaluates an expression inside one of the page's child frames.
     pub fn evaluate_in_frame(
         &mut self,
@@ -3897,6 +3909,20 @@ impl Page {
         let realm = self.frames.get(index).ok_or("no such frame")?;
         let js = self.js.as_mut().ok_or("no runtime")?;
         realm.evaluate(js, expression)
+    }
+
+    /// Evaluates an expression in a child frame with a synchronous V8
+    /// watchdog. This is the bounded counterpart to [`Self::evaluate_in_frame`]
+    /// for browser-owned inspection of untrusted documents.
+    pub fn evaluate_in_frame_with_timeout(
+        &mut self,
+        index: usize,
+        expression: &str,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value, String> {
+        let realm = self.frames.get(index).ok_or("no such frame")?;
+        let js = self.js.as_mut().ok_or("no runtime")?;
+        realm.evaluate_with_timeout(js, expression, timeout)
     }
 
     /// Update the page's CSS viewport. Calling this before navigation makes
@@ -9838,6 +9864,34 @@ impl Page {
             )
         };
         Some(self.retain_final_resource_scope(capture))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_resource_capture_for_test(&mut self, mut capture: ResourceCapture) {
+        if self.resource_capture.is_none() {
+            self.enable_resource_capture(ResourceCaptureLimits::default());
+        }
+        let generation = self.callbacks.document_generation();
+        capture.document_generation = generation;
+        for resource in &mut capture.resources {
+            resource.document_generation = generation;
+        }
+        let state = self
+            .resource_capture
+            .as_ref()
+            .expect("test resource capture was enabled");
+        state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .capture = capture;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn add_transport_failure_for_test(&self) {
+        self.transport_failure_reasons
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert("test transport failure".to_string());
     }
 
     /// Stop lossless response retention and return everything captured so far.

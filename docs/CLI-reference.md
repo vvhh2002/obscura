@@ -34,6 +34,15 @@ Load a URL and print its content or an evaluated expression.
     --assets-max-bytes <N>   Maximum captured response bytes (default 536870912)
     --assets-max-resources <N>
                              Maximum captured responses (default 4096)
+    --captcha-adapter <ADAPTER>
+                             auto | tianai | go-captcha | aj-captcha | slider-captcha-js
+    --captcha-images-dir <DIR>
+                             Write background/puzzle images and a sanitized manifest
+    --captcha-urls-output <FILE>
+                             Write the sensitive source/provenance JSON report; use - for stdout
+    --captcha-max-bytes <N>  Maximum CAPTCHA capture bytes (default 67108864)
+    --captcha-max-resources <N>
+                             Maximum CAPTCHA capture responses (default 512)
     --proxy <URL>            HTTP or SOCKS5 proxy
     --stealth                Consistent browser fingerprint + tracker blocking (global)
 -e, --eval <JS>              Evaluate JS, print the result as JSON
@@ -47,6 +56,14 @@ Load a URL and print its content or an evaluated expression.
 default and may be combined with `--eval`; the expression runs before capture,
 which is useful for scrolling or preparing page state. It is not available in
 `--file` batch mode.
+
+`--captcha-adapter` enables read-only slide-CAPTCHA extraction and requires
+`--captcha-images-dir` and/or `--captcha-urls-output`. It conflicts with
+`--file`, `--dump`, `--output`, `--assets-dir`, `--screenshot`, and `--eval`;
+the adapter never solves, clicks, drags, or submits a challenge. See
+[Slide CAPTCHA adapters](Slide-Captcha-Adapters.zh-CN.md) for the exact four
+supported provider families and slide modes, completeness rules, output
+schemas, and URL-data sensitivity guidance.
 
 `commit` returns after the document URL, live parser tree, V8 realm, and
 new-document preload scripts are installed. The CLI's ordinary post-navigation

@@ -773,6 +773,36 @@ impl ObscuraJsRuntime {
         deno_core::serde_v8::from_v8(scope, value).map_err(|error| error.to_string())
     }
 
+    /// Bounded form of [`Self::eval_json_in_realm`] for host probes in child
+    /// documents. Page code can replace DOM methods with synchronous loops, so
+    /// browser-owned inspection must have the same watchdog guarantee as a
+    /// top-level evaluation.
+    pub(crate) fn eval_json_in_realm_with_timeout(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+        source: &str,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value, String> {
+        if timeout.is_zero() {
+            return self.eval_json_in_realm(realm, source);
+        }
+        self.begin_javascript_task();
+        let token = self.arm_watchdog(timeout);
+        let result = self.eval_json_in_realm(realm, source);
+        let fired = self.disarm_watchdog(token);
+        if self.recover_heap_limit() {
+            return Err("JavaScript heap limit exceeded; execution terminated".to_string());
+        }
+        match result {
+            Ok(value) if !fired => Ok(value),
+            Ok(_) => Err("frame evaluation timed out".to_string()),
+            Err(error) if fired || error.contains("execution terminated") => {
+                Err("frame evaluation timed out".to_string())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Installs one CDP `Runtime.addBinding` function in `context` without
     /// making deno_core's op table page-visible again.
     ///

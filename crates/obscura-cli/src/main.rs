@@ -10,6 +10,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 use tokio::time::{timeout, Duration};
 
+mod captcha_output;
+
 #[derive(Parser)]
 #[command(
     name = "obscura",
@@ -171,6 +173,49 @@ enum Command {
         #[arg(long, default_value_t = 4_096)]
         assets_max_resources: usize,
 
+        /// Extract only slider/puzzle challenge images for the selected view
+        /// library. This is a read-only capture adapter: it never solves,
+        /// drags, clicks, or submits a CAPTCHA.
+        #[arg(
+            long,
+            value_enum,
+            conflicts_with_all = ["file", "dump", "output", "assets_dir", "screenshot", "eval"]
+        )]
+        captcha_adapter: Option<CaptchaAdapterArg>,
+
+        /// Write decoded slider background/puzzle image files plus a sanitized
+        /// manifest to a new or empty directory.
+        #[arg(
+            long,
+            value_name = "DIR",
+            requires = "captcha_adapter",
+            conflicts_with_all = ["file", "output", "assets_dir", "screenshot"]
+        )]
+        captcha_images_dir: Option<std::path::PathBuf>,
+
+        /// Write the active slider image sources and provenance as JSON. Use -
+        /// for stdout. Data/inline sources remain data URIs; API endpoints are
+        /// reported separately and never presented as image URLs.
+        #[arg(
+            long,
+            value_name = "FILE",
+            requires = "captcha_adapter",
+            conflicts_with_all = ["file", "output", "assets_dir", "screenshot"]
+        )]
+        captcha_urls_output: Option<std::path::PathBuf>,
+
+        /// Maximum total response bytes retained while extracting a CAPTCHA.
+        #[arg(
+            long,
+            default_value_t = 64 * 1024 * 1024,
+            requires = "captcha_adapter"
+        )]
+        captcha_max_bytes: usize,
+
+        /// Maximum response count retained while extracting a CAPTCHA.
+        #[arg(long, default_value_t = 512, requires = "captcha_adapter")]
+        captcha_max_resources: usize,
+
         #[arg(long, short)]
         quiet: bool,
 
@@ -241,6 +286,30 @@ enum DumpFormat {
     Cookies,
 }
 
+#[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
+enum CaptchaAdapterArg {
+    Auto,
+    Tianai,
+    #[value(name = "go-captcha", alias = "gocaptcha")]
+    GoCaptcha,
+    #[value(name = "aj-captcha", alias = "ajcaptcha")]
+    AjCaptcha,
+    #[value(name = "slider-captcha-js", alias = "slider-captcha")]
+    SliderCaptchaJs,
+}
+
+impl From<CaptchaAdapterArg> for obscura_browser::CaptchaAdapter {
+    fn from(value: CaptchaAdapterArg) -> Self {
+        match value {
+            CaptchaAdapterArg::Auto => Self::Auto,
+            CaptchaAdapterArg::Tianai => Self::Tianai,
+            CaptchaAdapterArg::GoCaptcha => Self::GoCaptcha,
+            CaptchaAdapterArg::AjCaptcha => Self::AjCaptcha,
+            CaptchaAdapterArg::SliderCaptchaJs => Self::SliderCaptchaJs,
+        }
+    }
+}
+
 fn print_banner(port: u16) {
     println!(
         r#"
@@ -273,8 +342,22 @@ fn is_quiet_command(cmd: &Option<Command>) -> bool {
     matches!(
         cmd,
         Some(Command::Fetch { quiet: true, .. })
+            | Some(Command::Fetch {
+                captcha_adapter: Some(_),
+                ..
+            })
             | Some(Command::Scrape { quiet: true, .. })
             | Some(Command::Serve { quiet: true, .. })
+    )
+}
+
+fn is_captcha_command(cmd: &Option<Command>) -> bool {
+    matches!(
+        cmd,
+        Some(Command::Fetch {
+            captcha_adapter: Some(_),
+            ..
+        })
     )
 }
 
@@ -347,11 +430,15 @@ async fn main() -> anyhow::Result<()> {
 
     let quiet = is_quiet_command(&args.command);
     let filter = select_log_filter(args.verbose, quiet);
+    let force_captcha_log_redaction = is_captcha_command(&args.command) && !args.verbose;
+    let env_filter = if force_captcha_log_redaction {
+        tracing_subscriber::EnvFilter::new(filter)
+    } else {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter))
+    };
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter)),
-        )
+        .with_env_filter(env_filter)
         .with_writer(std::io::stderr)
         .init();
 
@@ -446,6 +533,11 @@ async fn main() -> anyhow::Result<()> {
             assets_dir,
             assets_max_bytes,
             assets_max_resources,
+            captcha_adapter,
+            captcha_images_dir,
+            captcha_urls_output,
+            captcha_max_bytes,
+            captcha_max_resources,
             quiet,
             storage_dir,
             file,
@@ -503,6 +595,11 @@ async fn main() -> anyhow::Result<()> {
                     assets_dir,
                     assets_max_bytes,
                     assets_max_resources,
+                    captcha_adapter,
+                    captcha_images_dir,
+                    captcha_urls_output,
+                    captcha_max_bytes,
+                    captcha_max_resources,
                     quiet,
                     global_proxy,
                     storage_dir,
@@ -704,6 +801,38 @@ async fn settle_page(page: &mut Page, wait_secs: u64, fixed: bool) -> anyhow::Re
     Ok(())
 }
 
+async fn settle_fetch_page(
+    page: &mut Page,
+    wait_secs: u64,
+    fixed: bool,
+    redact_captcha_errors: bool,
+) -> anyhow::Result<()> {
+    let result = settle_page(page, wait_secs, fixed).await;
+    if redact_captcha_errors {
+        result.map_err(|_| anyhow::anyhow!("Page settling failed during slider CAPTCHA capture"))
+    } else {
+        result
+    }
+}
+
+#[cfg(feature = "render")]
+async fn settle_fetch_duration(
+    page: &mut Page,
+    wait_ms: u64,
+    redact_captcha_errors: bool,
+) -> anyhow::Result<()> {
+    let result = page
+        .settle_for_duration_following_navigations(wait_ms)
+        .await;
+    if redact_captcha_errors {
+        result.map_err(|_| {
+            anyhow::anyhow!("Page resource settling failed during slider CAPTCHA capture")
+        })
+    } else {
+        result.map_err(Into::into)
+    }
+}
+
 fn normalized_path_for_overlap(path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     use std::path::Component;
 
@@ -828,6 +957,11 @@ async fn run_fetch(
     assets_dir: Option<std::path::PathBuf>,
     assets_max_bytes: usize,
     assets_max_resources: usize,
+    captcha_adapter: Option<CaptchaAdapterArg>,
+    captcha_images_dir: Option<std::path::PathBuf>,
+    captcha_urls_output: Option<std::path::PathBuf>,
+    captcha_max_bytes: usize,
+    captcha_max_resources: usize,
     quiet: bool,
     proxy: Option<String>,
     storage_dir: Option<std::path::PathBuf>,
@@ -835,11 +969,37 @@ async fn run_fetch(
     obey_robots: bool,
     screenshot: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
+    if captcha_adapter.is_some() && captcha_images_dir.is_none() && captcha_urls_output.is_none() {
+        anyhow::bail!(
+            "--captcha-adapter requires --captcha-images-dir and/or --captcha-urls-output"
+        );
+    }
+    if captcha_adapter.is_none() && (captcha_images_dir.is_some() || captcha_urls_output.is_some())
+    {
+        anyhow::bail!("--captcha-images-dir/--captcha-urls-output require --captcha-adapter");
+    }
+    if captcha_adapter.is_some() && (captcha_max_bytes == 0 || captcha_max_resources == 0) {
+        anyhow::bail!("CAPTCHA capture resource limits must be greater than zero");
+    }
+    if let (Some(directory), Some(urls_path)) = (
+        captcha_images_dir.as_deref(),
+        captcha_urls_output.as_deref(),
+    ) {
+        if urls_path != std::path::Path::new("-") {
+            let directory = normalized_path_for_overlap(directory)?;
+            let urls_path = normalized_path_for_overlap(urls_path)?;
+            if asset_paths_overlap(&directory, &urls_path) {
+                anyhow::bail!("--captcha-urls-output must be outside --captcha-images-dir");
+            }
+        }
+    }
+
     // Whether the user explicitly passed --dump. With --eval also present this
     // decides whether we return the eval value or read the page after the
     // eval's async work settles (issue #248).
     let dump_specified = dump.is_some();
     let dump = dump.unwrap_or(DumpFormat::Html);
+    let captcha_capture_enabled = captcha_adapter.is_some();
 
     if assets_dir.is_some() && dump != DumpFormat::Assets {
         anyhow::bail!("--assets-dir requires --dump assets");
@@ -880,10 +1040,18 @@ async fn run_fetch(
     context.obey_robots = obey_robots;
     let context = Arc::new(context);
     let mut page = Page::new("fetch-page".to_string(), context.clone());
-    if assets_dir.is_some() {
+    if captcha_capture_enabled {
+        obscura_browser::install_captcha_capture_preload(&mut page);
+    }
+    if assets_dir.is_some() || captcha_capture_enabled {
+        let (max_resources, max_total_bytes) = if captcha_capture_enabled {
+            (captcha_max_resources, captcha_max_bytes)
+        } else {
+            (assets_max_resources, assets_max_bytes)
+        };
         page.enable_resource_capture(ResourceCaptureLimits {
-            max_resources: assets_max_resources,
-            max_total_bytes: assets_max_bytes,
+            max_resources,
+            max_total_bytes,
         });
     }
     // Keep the browser's end-to-end navigation ceiling aligned with the CLI
@@ -916,7 +1084,11 @@ async fn run_fetch(
     let wait_condition = obscura_browser::lifecycle::WaitUntil::from_str(wait_until);
 
     if !quiet {
-        eprintln!("Fetching {}...", url_str);
+        if captcha_capture_enabled {
+            eprintln!("Fetching page for slider CAPTCHA capture...");
+        } else {
+            eprintln!("Fetching {}...", url_str);
+        }
     }
 
     // The paired corpus opts into a truthful capture boundary: its read-only
@@ -963,8 +1135,12 @@ async fn run_fetch(
         // Resource preparation can make an image/font onload handler request
         // another document. Each of the bounded archive warm-up rounds gets a
         // complete settle window, so the hard watchdog must budget those too.
-        .saturating_add(if assets_dir.is_some() { 4 } else { 0 });
-        let archive_warmup_secs = if assets_dir.is_some() {
+        .saturating_add(if assets_dir.is_some() || captcha_capture_enabled {
+            4
+        } else {
+            0
+        });
+        let archive_warmup_secs = if assets_dir.is_some() || captcha_capture_enabled {
             std::env::var("OBSCURA_RENDER_RESOURCE_DEADLINE_MS")
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
@@ -998,25 +1174,47 @@ async fn run_fetch(
     .await
     {
         Ok(result) => {
-            result.map_err(|e| anyhow::anyhow!("Failed to navigate to {}: {}", url_str, e))?
+            if captcha_capture_enabled {
+                result.map_err(|_| {
+                    anyhow::anyhow!("Failed to navigate while capturing a slider CAPTCHA")
+                })?
+            } else {
+                result.map_err(|e| anyhow::anyhow!("Failed to navigate to {}: {}", url_str, e))?
+            }
         }
-        Err(_) => anyhow::bail!(
-            "Timed out navigating to {} after {}s",
-            url_str,
+        Err(_) if captcha_capture_enabled => anyhow::bail!(
+            "Timed out navigating while capturing a slider CAPTCHA after {}s",
             timeout_secs
         ),
+        Err(_) => {
+            anyhow::bail!(
+                "Timed out navigating to {} after {}s",
+                url_str,
+                timeout_secs
+            )
+        }
     }
 
     if !quiet {
-        eprintln!("Page loaded: {} - \"{}\"", page.url_string(), page.title);
+        if captcha_capture_enabled {
+            eprintln!("Page loaded for slider CAPTCHA capture");
+        } else {
+            eprintln!("Page loaded: {} - \"{}\"", page.url_string(), page.title);
+        }
     }
 
     // --wait is a post-load settle: drive the event loop so timers, async work,
     // and completion callbacks (e.g. testharness's add_completion_callback) run
     // before we read the page. Returns early once the loop is idle, so static
     // pages stay fast.
-    let settle_is_fixed = wait_is_fixed || assets_dir.is_some();
-    settle_page(&mut page, wait_secs, settle_is_fixed).await?;
+    let settle_is_fixed = wait_is_fixed || assets_dir.is_some() || captcha_capture_enabled;
+    settle_fetch_page(
+        &mut page,
+        wait_secs,
+        settle_is_fixed,
+        captcha_capture_enabled,
+    )
+    .await?;
 
     let mut deferred_eval_output = None;
     let initial_controlled_scroll = if eval_at_capture_boundary {
@@ -1038,7 +1236,13 @@ async fn run_fetch(
         None
     };
     if initial_controlled_scroll.is_some() {
-        settle_page(&mut page, wait_secs, settle_is_fixed).await?;
+        settle_fetch_page(
+            &mut page,
+            wait_secs,
+            settle_is_fixed,
+            captcha_capture_enabled,
+        )
+        .await?;
     }
 
     if !eval_at_capture_boundary {
@@ -1052,7 +1256,11 @@ async fn run_fetch(
             // (JSON.stringify, ...) are unchanged. Screenshot captures continue
             // below so an evaluation such as scrollTo() affects the painted
             // viewport instead of being silently ignored.
-            if !dump_specified && selector.is_none() && screenshot.is_none() {
+            if !dump_specified
+                && selector.is_none()
+                && screenshot.is_none()
+                && !captcha_capture_enabled
+            {
                 let rendered = match result {
                     serde_json::Value::String(s) => s,
                     serde_json::Value::Null => "null".to_string(),
@@ -1071,7 +1279,13 @@ async fn run_fetch(
             // listener) that writes the DOM. Drive the event loop again so that
             // work completes, then fall through to selector/capture/dump instead
             // of returning the still-pending eval value (issue #248).
-            settle_page(&mut page, wait_secs, settle_is_fixed).await?;
+            settle_fetch_page(
+                &mut page,
+                wait_secs,
+                settle_is_fixed,
+                captcha_capture_enabled,
+            )
+            .await?;
         }
     }
 
@@ -1080,10 +1294,16 @@ async fn run_fetch(
         if !found {
             eprintln!("Warning: selector '{}' not found after {}s", sel, wait_secs);
         }
-        settle_page(&mut page, wait_secs, settle_is_fixed).await?;
+        settle_fetch_page(
+            &mut page,
+            wait_secs,
+            settle_is_fixed,
+            captcha_capture_enabled,
+        )
+        .await?;
     }
 
-    if let Some(ref directory) = assets_dir {
+    if assets_dir.is_some() || captcha_capture_enabled {
         let mut warmup_failed = 0usize;
         let mut warmup_timed_out = 0usize;
         let mut warmup_remaining = 0usize;
@@ -1116,10 +1336,10 @@ async fn run_fetch(
                     || pending_before
                     || page.has_pending_resource_work()
                 {
-                    page.settle_for_duration_following_navigations(resource_deadline_ms)
+                    settle_fetch_duration(&mut page, resource_deadline_ms, captcha_capture_enabled)
                         .await?;
                 } else {
-                    page.settle_for_duration_following_navigations(100).await?;
+                    settle_fetch_duration(&mut page, 100, captcha_capture_enabled).await?;
                 }
                 let after = page.url_string();
                 if after != before {
@@ -1151,6 +1371,57 @@ async fn run_fetch(
             }
         }
 
+        if let Some(adapter) = captcha_adapter {
+            let extraction = obscura_browser::extract_captcha(
+                &mut page,
+                adapter.into(),
+                Duration::from_secs(timeout_secs.min(10)),
+            )
+            .map_err(anyhow::Error::msg)?;
+            let summary = captcha_output::write_captcha_outputs(
+                &extraction,
+                captcha_images_dir.as_deref(),
+                captcha_urls_output.as_deref(),
+            )?;
+            if !quiet {
+                eprintln!(
+                    "Slider CAPTCHA capture: {} sources in {} groups, {} complete source pairs, {} image files, {} complete image pairs, {} URL-only/partial sources",
+                    summary.discovered,
+                    summary.groups,
+                    summary.source_pairs,
+                    summary.image_files,
+                    summary.image_pairs,
+                    summary.unresolved_images,
+                );
+                if !extraction.diagnostics.is_empty() {
+                    eprintln!(
+                        "Slider CAPTCHA capture recorded {} diagnostics; detailed values are written only to the explicit URL report",
+                        extraction.diagnostics.len()
+                    );
+                }
+            }
+            context.save_cookies();
+            if !summary.evidence_complete {
+                anyhow::bail!(
+                    "slider CAPTCHA evidence is incomplete because the final scan/capture was bounded, unsettled, ambiguous, or API-only without a live DOM identity; requested outputs contain partial diagnostics"
+                );
+            }
+            if summary.groups == 0 || summary.source_pairs != summary.groups {
+                anyhow::bail!(
+                    "not every active slider CAPTCHA group has a complete background+puzzle source pair; requested outputs contain partial diagnostics"
+                );
+            }
+            if captcha_images_dir.is_some() && summary.image_pairs != summary.groups {
+                anyhow::bail!(
+                    "not every active slider CAPTCHA group has an exportable background+puzzle graphic pair; see the output manifest/URL report"
+                );
+            }
+            return Ok(());
+        }
+
+        let directory = assets_dir
+            .as_ref()
+            .expect("resource capture output must be CAPTCHA or asset archive");
         let final_url = page.url_string();
         let page_html = dump_html(&page);
         let (frames, frame_capture_reasons) = capture_frame_documents(&mut page);
@@ -2646,10 +2917,11 @@ mod tests {
     use super::{
         asset_paths_overlap, classic_script_urls, configure_fetch_navigation_timeout,
         effective_v8_flags, extract_assets, extract_readable_text, fetch_original_bytes,
-        is_quiet_command, link_kind_from_rel, merge_proxy, missing_classic_script_reasons,
-        normalize_v8_flags, path_starts_with_components, read_urls_from_file, resolve_asset_url,
-        select_log_filter, write_or_print, write_or_print_bytes, Args, CapturedResource, Command,
-        DumpFormat, ResourceCapture, DEFAULT_V8_FLAGS,
+        is_captcha_command, is_quiet_command, link_kind_from_rel, merge_proxy,
+        missing_classic_script_reasons, normalize_v8_flags, path_starts_with_components,
+        read_urls_from_file, resolve_asset_url, select_log_filter, write_or_print,
+        write_or_print_bytes, Args, CaptchaAdapterArg, CapturedResource, Command, DumpFormat,
+        ResourceCapture, DEFAULT_V8_FLAGS,
     };
     use clap::Parser;
     use obscura_dom::parse_html;
@@ -2681,6 +2953,79 @@ mod tests {
             }
             _ => panic!("expected Fetch command"),
         }
+    }
+
+    #[test]
+    fn parsed_fetch_accepts_slide_captcha_adapter_outputs() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "fetch",
+            "https://example.com/login",
+            "--captcha-adapter",
+            "aj-captcha",
+            "--captcha-images-dir",
+            "captcha-images",
+            "--captcha-urls-output",
+            "-",
+        ])
+        .expect("slide CAPTCHA capture flags should parse");
+        assert!(
+            is_quiet_command(&args.command),
+            "CAPTCHA mode should suppress URL-bearing tracing by default"
+        );
+        assert!(is_captcha_command(&args.command));
+        match args.command {
+            Some(Command::Fetch {
+                captcha_adapter,
+                captcha_images_dir,
+                captcha_urls_output,
+                ..
+            }) => {
+                assert_eq!(captcha_adapter, Some(CaptchaAdapterArg::AjCaptcha));
+                assert_eq!(
+                    captcha_images_dir,
+                    Some(std::path::PathBuf::from("captcha-images"))
+                );
+                assert_eq!(captcha_urls_output, Some(std::path::PathBuf::from("-")));
+            }
+            _ => panic!("expected Fetch command"),
+        }
+    }
+
+    #[test]
+    fn captcha_output_requires_an_explicit_adapter_and_rejects_dump_mode() {
+        assert!(Args::try_parse_from([
+            "obscura",
+            "fetch",
+            "https://example.com/login",
+            "--captcha-urls-output",
+            "-",
+        ])
+        .is_err());
+        assert!(Args::try_parse_from([
+            "obscura",
+            "fetch",
+            "https://example.com/login",
+            "--captcha-adapter",
+            "tianai",
+            "--captcha-urls-output",
+            "-",
+            "--dump",
+            "html",
+        ])
+        .is_err());
+        assert!(Args::try_parse_from([
+            "obscura",
+            "fetch",
+            "https://example.com/login",
+            "--captcha-adapter",
+            "tianai",
+            "--captcha-urls-output",
+            "-",
+            "--eval",
+            "document.body.click()",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -3142,6 +3487,11 @@ mod tests {
             assets_dir: None,
             assets_max_bytes: 512 * 1024 * 1024,
             assets_max_resources: 4_096,
+            captcha_adapter: None,
+            captcha_images_dir: None,
+            captcha_urls_output: None,
+            captcha_max_bytes: 64 * 1024 * 1024,
+            captcha_max_resources: 512,
             storage_dir: None,
             screenshot: None,
         });

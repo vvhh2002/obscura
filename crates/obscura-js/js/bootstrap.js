@@ -6,6 +6,42 @@
 // removes globalThis.Deno; page scripts can use the web shims below, but can
 // never name the native op table or forge archive attribution arguments.
 const _core = Deno.core;
+// Keep bootstrap's native bridges independent from page rewrites of common
+// globals. DOM traversal, computed visibility, and image lifecycle state are
+// security boundaries for read-only capture features, so their native-op
+// payloads must not be parsed or coerced through page-owned replacements.
+const _intrinsicJSONParse = JSON.parse;
+const _intrinsicString = String;
+const _intrinsicNumber = Number;
+const _intrinsicNumberIsFinite = Number.isFinite;
+const _intrinsicMathRound = Math.round;
+const _intrinsicMathMin = Math.min;
+const _intrinsicMathMax = Math.max;
+const _intrinsicReflectApply = Reflect.apply;
+const _intrinsicObjectKeys = Object.keys;
+const _intrinsicObjectHasOwnProperty = Object.prototype.hasOwnProperty;
+const _intrinsicStringReplace = String.prototype.replace;
+const _intrinsicStringToLowerCase = String.prototype.toLowerCase;
+const _intrinsicStringStartsWith = String.prototype.startsWith;
+const _intrinsicStringIncludes = String.prototype.includes;
+const _intrinsicStringTrim = String.prototype.trim;
+const _intrinsicStringSplit = String.prototype.split;
+const _intrinsicStringIndexOf = String.prototype.indexOf;
+const _intrinsicStringSlice = String.prototype.slice;
+const _intrinsicSetHas = Set.prototype.has;
+const _intrinsicWeakMapGet = WeakMap.prototype.get;
+const _intrinsicWeakMapSet = WeakMap.prototype.set;
+const _intrinsicMapGet = Map.prototype.get;
+const _intrinsicMapSet = Map.prototype.set;
+const _intrinsicMapHas = Map.prototype.has;
+const _intrinsicProxy = Proxy;
+const _trustedNodeIds = new WeakMap();
+const _trustedShadowHosts = new WeakMap();
+const _trustedNodeId = (node) => {
+  if (!node || (typeof node !== 'object' && typeof node !== 'function')) return null;
+  const value = _intrinsicReflectApply(_intrinsicWeakMapGet, _trustedNodeIds, [node]);
+  return typeof value === 'number' ? value : null;
+};
 
 // Pre-declare all internal globals as non-enumerable so they are invisible
 // to Object.keys(window) / for-in enumeration. Must run before any var
@@ -930,7 +966,7 @@ globalThis._formChecked = globalThis._formChecked || {};
 const _eventRegistry = globalThis._eventRegistry;
 const _formValues = globalThis._formValues;
 const _formChecked = globalThis._formChecked;
-const _domParse = (cmd, a1, a2) => { try { return JSON.parse(_dom(cmd, a1, a2)); } catch { return null; } };
+const _domParse = (cmd, a1, a2) => { try { return _intrinsicJSONParse(_dom(cmd, a1, a2)); } catch { return null; } };
 
 // HTML "ASCII whitespace": U+0009 TAB, U+000A LF, U+000C FF, U+000D CR, U+0020 SPACE.
 // Class token splitting (classList, getElementsByClassName) uses exactly this set.
@@ -2440,7 +2476,10 @@ class Node {
   static DOCUMENT_POSITION_CONTAINED_BY = 16;
   static DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC = 32;
 
-  constructor(nid) { this._nid = nid; }
+  constructor(nid) {
+    this._nid = nid;
+    _intrinsicReflectApply(_intrinsicWeakMapSet, _trustedNodeIds, [this, nid]);
+  }
   get nodeType() { return +_dom("node_type", this._nid); }
   get nodeName() { return _domParse("node_name", this._nid) || ""; }
   get ownerDocument() { return globalThis.document; }
@@ -6844,7 +6883,7 @@ class HTMLImageElement extends Element {
     this._imageNaturalWidth = 0;
     this._imageNaturalHeight = 0;
     this._imageDecoded = false;
-    this._imageCurrentSrc = currentSrc ? String(currentSrc) : "";
+    this._imageCurrentSrc = currentSrc ? _intrinsicString(currentSrc) : "";
     this._imageComplete = !this._imageCurrentSrc;
   }
 
@@ -6884,7 +6923,7 @@ class HTMLImageElement extends Element {
         Promise.resolve(op(_realmFrameId, this._nid >>> 0)).then(
           raw => {
             let metadata = null;
-            try { metadata = JSON.parse(raw); }
+            try { metadata = _intrinsicJSONParse(raw); }
             catch (_error) { metadata = { ok: false, currentSrc: this.src }; }
             finish(metadata);
           },
@@ -6905,9 +6944,9 @@ class HTMLImageElement extends Element {
     try {
       const op = _core.ops.op_image_metadata;
       if (typeof op !== "function") return;
-      const metadata = JSON.parse(op(_realmFrameId, this._nid >>> 0, true));
+      const metadata = _intrinsicJSONParse(op(_realmFrameId, this._nid >>> 0, true));
       if (!metadata) return;
-      const selected = metadata.currentSrc ? String(metadata.currentSrc) : "";
+      const selected = metadata.currentSrc ? _intrinsicString(metadata.currentSrc) : "";
       if (selected !== this._imageCurrentSrc) {
         this._adoptImageCandidate(selected);
         // A live candidate switch is a new request even when paint retained
@@ -6944,7 +6983,7 @@ class HTMLImageElement extends Element {
       this._imageNaturalHeight,
     ];
     const selected = metadata && metadata.currentSrc
-      ? String(metadata.currentSrc)
+      ? _intrinsicString(metadata.currentSrc)
       : "";
     if (selected !== this._imageCurrentSrc) {
       this._adoptImageCandidate(selected);
@@ -6954,15 +6993,15 @@ class HTMLImageElement extends Element {
     this._imageComplete = true;
     this._finishImageLoadDelay();
     this._imageCurrentSrc = selected || this.src;
-    const width = Number(metadata && metadata.width);
-    const height = Number(metadata && metadata.height);
+    const width = _intrinsicNumber(metadata && metadata.width);
+    const height = _intrinsicNumber(metadata && metadata.height);
     const loaded = !!(metadata && metadata.ok)
       && (typeof _core.ops.op_image_metadata !== "function"
-        || (Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0));
+        || (_intrinsicNumberIsFinite(width) && width > 0 && _intrinsicNumberIsFinite(height) && height > 0));
     if (loaded) {
       this._imageDecoded = true;
-      this._imageNaturalWidth = Number.isFinite(width) && width > 0 ? Math.round(width) : 0;
-      this._imageNaturalHeight = Number.isFinite(height) && height > 0 ? Math.round(height) : 0;
+      this._imageNaturalWidth = _intrinsicNumberIsFinite(width) && width > 0 ? _intrinsicMathRound(width) : 0;
+      this._imageNaturalHeight = _intrinsicNumberIsFinite(height) && height > 0 ? _intrinsicMathRound(height) : 0;
       this._resolveImageDecodes(request);
       if (dispatchEvent) {
         try { _dispatchTrustedElementEvent(this, "load"); } catch (_error) {}
@@ -7537,7 +7576,9 @@ function _elementClassForKnownName(namespace, qualifiedName) {
 }
 function _wrap(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
-  if (_cache.has(nid)) return _cache.get(nid);
+  if (_intrinsicReflectApply(_intrinsicMapHas, _cache, [nid])) {
+    return _intrinsicReflectApply(_intrinsicMapGet, _cache, [nid]);
+  }
   const t = +_dom("node_type", nid);
   let n;
   if (t === 1) { const C = _elementClassFor(nid); n = new C(nid); }
@@ -7545,15 +7586,17 @@ function _wrap(nid) {
   else if (t === 8) n = new Comment(nid);
   else if (t === 9) n = new Document(nid);
   else n = new Node(nid);
-  _cache.set(nid, n);
+  _intrinsicReflectApply(_intrinsicMapSet, _cache, [nid, n]);
   return n;
 }
 function _wrapEl(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
-  if (_cache.has(nid)) return _cache.get(nid);
+  if (_intrinsicReflectApply(_intrinsicMapHas, _cache, [nid])) {
+    return _intrinsicReflectApply(_intrinsicMapGet, _cache, [nid]);
+  }
   const C = _elementClassFor(nid);
   const n = new C(nid);
-  _cache.set(nid, n);
+  _intrinsicReflectApply(_intrinsicMapSet, _cache, [nid, n]);
   return n;
 }
 
@@ -8549,6 +8592,53 @@ function _urlResolveOp(href, base) {
     return r ? r : null;
   } catch (e) { return null; }
 }
+const _captchaResolveDocumentUrl = (href) => {
+  try {
+    href = _intrinsicString(href == null ? '' : href);
+    if (!href) return '';
+    const base = _domParse('document_base_url') || _domParse('document_url') || 'about:blank';
+    return _core.ops.op_url_resolve(href, _intrinsicString(base)) || '';
+  } catch (_error) {
+    return '';
+  }
+};
+Object.defineProperty(globalThis, '__obscuraCaptchaResolveDocumentUrl', {
+  value: _captchaResolveDocumentUrl,
+  configurable: false,
+  enumerable: false,
+  writable: false,
+});
+const _captchaImageState = (image) => {
+  const nid = _trustedNodeId(image);
+  if (nid == null) return null;
+  const raw = _domParse('get_attribute', nid, 'src') || '';
+  const srcset = _domParse('get_attribute', nid, 'srcset') || '';
+  let resolved = _captchaResolveDocumentUrl(raw) || raw;
+  let capturedBytesSafe = false;
+  if (typeof _core.ops.op_image_metadata === 'function') {
+    try {
+      const encoded = _core.ops.op_image_metadata(_realmFrameId, nid >>> 0, true);
+      const metadata = encoded ? _intrinsicJSONParse(encoded) : null;
+      if (srcset && metadata && typeof metadata.currentSrc === 'string'
+          && metadata.currentSrc) {
+        resolved = metadata.currentSrc;
+      }
+      const width = _intrinsicNumber(metadata && metadata.width);
+      const height = _intrinsicNumber(metadata && metadata.height);
+      capturedBytesSafe = !!(metadata && metadata.ok)
+        && metadata.state !== 'pending'
+        && _intrinsicNumberIsFinite(width) && width > 0
+        && _intrinsicNumberIsFinite(height) && height > 0;
+    } catch (_error) {}
+  }
+  return { raw, resolved, capturedBytesSafe };
+};
+Object.defineProperty(globalThis, '__obscuraCaptchaImageState', {
+  value: _captchaImageState,
+  configurable: false,
+  enumerable: false,
+  writable: false,
+});
 if (typeof URL === 'undefined' || !URL.prototype || !URL.__obscura) {
   const _URL = class URL {
     constructor(url, base) {
@@ -9338,17 +9428,26 @@ globalThis.matchMedia = _markNative(function matchMedia(q) {
 // getComputedStyle() repeatedly on the same few roots; rebuilding and parsing
 // several hundred properties for every wrapper dominated real-page startup.
 const _computedStyleSnapshotCache = new WeakMap();
+const _intrinsicCssGetPropertyValue = CSSStyleDeclaration.prototype.getPropertyValue;
+const _intrinsicElementStyleGetter = Object.getOwnPropertyDescriptor(Element.prototype, 'style').get;
 globalThis.getComputedStyle = (el) => {
   if (!el) el = document.body || {};
-  const style = el?.style || el?._style || new CSSStyleDeclaration();
+  let style = null;
+  try { style = _intrinsicReflectApply(_intrinsicElementStyleGetter, el, []); }
+  catch (_error) {}
+  style = style || el?._style || new CSSStyleDeclaration();
   // Render builds expose one immutable snapshot from the retained final
   // cascade/layout. The native snapshot is shared per element and epoch while
   // each call still returns a distinct, live CSSStyleDeclaration proxy.
   const cacheable = (typeof el === 'object' && el !== null) || typeof el === 'function';
-  let snapshot = cacheable ? _computedStyleSnapshotCache.get(el) : null;
+  let snapshot = cacheable
+    ? _intrinsicReflectApply(_intrinsicWeakMapGet, _computedStyleSnapshotCache, [el])
+    : null;
   if (!snapshot) {
     snapshot = { rendered: null, epoch: -1, names: [] };
-    if (cacheable) _computedStyleSnapshotCache.set(el, snapshot);
+    if (cacheable) {
+      _intrinsicReflectApply(_intrinsicWeakMapSet, _computedStyleSnapshotCache, [el, snapshot]);
+    }
   }
   const refreshRendered = () => {
     const hasRunningAnimation = typeof _animationsForTarget === 'function'
@@ -9358,11 +9457,11 @@ globalThis.getComputedStyle = (el) => {
     snapshot.rendered = null;
     if (typeof _core.ops.op_computed_style === 'function' && el?._nid != null) {
       try {
-        const raw = _core.ops.op_computed_style(String(el._nid | 0));
-        snapshot.rendered = raw ? JSON.parse(raw) : null;
+        const raw = _core.ops.op_computed_style(_intrinsicString(el._nid | 0));
+        snapshot.rendered = raw ? _intrinsicJSONParse(raw) : null;
       } catch (e) {}
     }
-    snapshot.names = snapshot.rendered ? Object.keys(snapshot.rendered) : [];
+    snapshot.names = snapshot.rendered ? _intrinsicObjectKeys(snapshot.rendered) : [];
   };
   // React virtualization libraries (react-window, tanstack-virtual,
   // react-virtuoso) all compute container dimensions via getComputedStyle.
@@ -9421,21 +9520,28 @@ globalThis.getComputedStyle = (el) => {
   const lookup = (rawProp) => {
     if (typeof rawProp !== 'string') return '';
     refreshRendered();
-    let kebab = rawProp.replace(/([A-Z])/g, '-$1').toLowerCase();
+    let kebab = _intrinsicReflectApply(_intrinsicStringReplace, rawProp, [/([A-Z])/g, '-$1']);
+    kebab = _intrinsicReflectApply(_intrinsicStringToLowerCase, kebab, []);
     // CSSOM camelCase vendor properties omit the punctuation from their JS
     // spelling (`webkitLineClamp`) but computed-property names retain it
     // (`-webkit-line-clamp`). Normalize the prefix once for every WebKit
     // property instead of adding per-property aliases to the native snapshot.
-    if (kebab.startsWith('webkit-')) kebab = '-' + kebab;
-    if (snapshot.rendered && Object.prototype.hasOwnProperty.call(snapshot.rendered, kebab))
+    if (_intrinsicReflectApply(_intrinsicStringStartsWith, kebab, ['webkit-'])) kebab = '-' + kebab;
+    if (snapshot.rendered
+        && _intrinsicReflectApply(_intrinsicObjectHasOwnProperty, snapshot.rendered, [kebab]))
       return snapshot.rendered[kebab];
     // Non-render builds and properties outside the renderer snapshot retain
     // the lightweight inline CSSOM behavior.
-    const inlineVal = target.getPropertyValue ? target.getPropertyValue(rawProp) : '';
+    let inlineVal = '';
+    try {
+      inlineVal = _intrinsicReflectApply(_intrinsicCssGetPropertyValue, target, [rawProp]);
+    } catch (_error) {}
     if (inlineVal) {
       if (kebab === 'opacity') {
-        const value = Number(inlineVal);
-        if (Number.isFinite(value)) return String(Math.min(1, Math.max(0, value)));
+        const value = _intrinsicNumber(inlineVal);
+        if (_intrinsicNumberIsFinite(value)) {
+          return _intrinsicString(_intrinsicMathMin(1, _intrinsicMathMax(0, value)));
+        }
       }
       return inlineVal;
     }
@@ -9447,7 +9553,7 @@ globalThis.getComputedStyle = (el) => {
   };
 
   const target = style;
-  return new Proxy(style, {
+  return new _intrinsicProxy(style, {
     get(_, prop) {
       if (prop === Symbol.toPrimitive || prop === Symbol.toStringTag) return undefined;
       if (prop === 'getPropertyValue') return (name) => lookup(name);
@@ -9467,9 +9573,9 @@ globalThis.getComputedStyle = (el) => {
       // returned the empty inline declaration for e.g. computed.display and
       // prevented every computed/default fallback below from running.
       if (typeof prop === 'string'
-          && (_CSS_PROP_SET.has(prop)
-              || _CSS_PROP_SET.has(_cssKebabToCamel(prop))
-              || prop.includes('-'))) {
+          && (_intrinsicReflectApply(_intrinsicSetHas, _CSS_PROP_SET, [prop])
+              || _intrinsicReflectApply(_intrinsicSetHas, _CSS_PROP_SET, [_cssKebabToCamel(prop)])
+              || _intrinsicReflectApply(_intrinsicStringIncludes, prop, ['-']))) {
         return lookup(prop);
       }
       if (prop in target) return target[prop];
@@ -9478,6 +9584,68 @@ globalThis.getComputedStyle = (el) => {
     },
   });
 };
+
+// CAPTCHA extraction needs only the visibility properties, but it needs them
+// without consulting page-replaceable CSSOM/JSON prototypes. Render builds use
+// the retained cascade snapshot directly; lightweight builds conservatively
+// apply the element's inline declarations over visible defaults.
+const _captchaComputedVisibility = (el) => {
+  const nid = _trustedNodeId(el);
+  if (nid == null) return null;
+  let rendered = null;
+  if (typeof _core.ops.op_computed_style === 'function') {
+    try {
+      const raw = _core.ops.op_computed_style(_intrinsicString(nid | 0));
+      rendered = raw ? _intrinsicJSONParse(raw) : null;
+    } catch (_error) {}
+  }
+  const result = {
+    display: 'block',
+    visibility: 'visible',
+    contentVisibility: 'visible',
+    opacity: '1',
+  };
+  if (rendered) {
+    if (typeof rendered.display === 'string') result.display = rendered.display;
+    if (typeof rendered.visibility === 'string') result.visibility = rendered.visibility;
+    if (typeof rendered['content-visibility'] === 'string') {
+      result.contentVisibility = rendered['content-visibility'];
+    }
+    if (typeof rendered.opacity === 'string') result.opacity = rendered.opacity;
+    return result;
+  }
+  let inline = '';
+  try { inline = _domParse('get_attribute', nid, 'style') || ''; }
+  catch (_error) {}
+  if (typeof inline !== 'string' || inline === '') return result;
+  const declarations = _intrinsicReflectApply(_intrinsicStringSplit, inline, [';']);
+  for (let index = 0; index < declarations.length; index++) {
+    const declaration = declarations[index];
+    const colon = _intrinsicReflectApply(_intrinsicStringIndexOf, declaration, [':']);
+    if (colon <= 0) continue;
+    let name = _intrinsicReflectApply(_intrinsicStringSlice, declaration, [0, colon]);
+    name = _intrinsicReflectApply(_intrinsicStringTrim, name, []);
+    name = _intrinsicReflectApply(_intrinsicStringToLowerCase, name, []);
+    let value = _intrinsicReflectApply(_intrinsicStringSlice, declaration, [colon + 1]);
+    const important = _intrinsicReflectApply(_intrinsicStringIndexOf, value, ['!']);
+    if (important >= 0) {
+      value = _intrinsicReflectApply(_intrinsicStringSlice, value, [0, important]);
+    }
+    value = _intrinsicReflectApply(_intrinsicStringTrim, value, []);
+    value = _intrinsicReflectApply(_intrinsicStringToLowerCase, value, []);
+    if (name === 'display') result.display = value;
+    else if (name === 'visibility') result.visibility = value;
+    else if (name === 'content-visibility') result.contentVisibility = value;
+    else if (name === 'opacity') result.opacity = value;
+  }
+  return result;
+};
+Object.defineProperty(globalThis, '__obscuraCaptchaComputedVisibility', {
+  value: _captchaComputedVisibility,
+  configurable: false,
+  enumerable: false,
+  writable: false,
+});
 // Returns the one Selection instance for a document (cached on the document),
 // so window.getSelection() === document.getSelection(). The real Selection
 // class is defined below, after Range. _selectionFor is hoisted.
@@ -14373,6 +14541,83 @@ Object.defineProperty(Element.prototype, 'shadowRoot', {
   get: function () {
     return _shadowRootForHost(this, false);
   },
+});
+
+const _intrinsicShadowRootCtor = globalThis.ShadowRoot;
+const _captchaNativeDom = Object.freeze({
+  nodeType(node) {
+    const nid = _trustedNodeId(node);
+    return nid == null ? 0 : (+_dom('node_type', nid) || 0);
+  },
+  parentNode(node) {
+    const nid = _trustedNodeId(node);
+    if (nid == null) return null;
+    return _wrap(+_dom('parent_node', nid));
+  },
+  rootNode(node) {
+    const nid = _trustedNodeId(node);
+    if (nid == null) return null;
+    return _wrap(+_dom('node_root', nid));
+  },
+  nextNode(root, current) {
+    const rootNid = _trustedNodeId(root);
+    const currentNid = _trustedNodeId(current);
+    if (rootNid == null || currentNid == null) return null;
+    return _wrap(+_dom('next_in_subtree', rootNid, currentNid));
+  },
+  children(node) {
+    const nid = _trustedNodeId(node);
+    if (nid == null) return [];
+    const ids = _domParse('element_children', nid) || [];
+    const children = [];
+    for (let index = 0; index < ids.length; index++) {
+      const child = _wrapEl(ids[index]);
+      if (child) children[children.length] = child;
+    }
+    return children;
+  },
+  shadowRoot(host) {
+    const nid = _trustedNodeId(host);
+    if (nid == null) return null;
+    let info = null;
+    try { info = _core.ops.op_shadow_root_info(nid, _realmFrameId); }
+    catch (_error) {}
+    if (!info) return null;
+    const parts = _intrinsicReflectApply(_intrinsicStringSplit, info, ['\0']);
+    if (parts[1] !== 'open') return null;
+    const rootNid = _intrinsicNumber(parts[0]);
+    let root = _intrinsicReflectApply(_intrinsicMapGet, _cache, [rootNid]);
+    if (!root) {
+      root = new _intrinsicShadowRootCtor(rootNid, host, { mode: parts[1] });
+      _intrinsicReflectApply(_intrinsicMapSet, _cache, [rootNid, root]);
+    }
+    _intrinsicReflectApply(_intrinsicWeakMapSet, _trustedShadowHosts, [root, host]);
+    return root;
+  },
+  shadowHost(root) {
+    return _intrinsicReflectApply(_intrinsicWeakMapGet, _trustedShadowHosts, [root]) || null;
+  },
+  queryOne(root, selector) {
+    const nid = _trustedNodeId(root);
+    if (nid == null || typeof selector !== 'string') return null;
+    return _wrapEl(+_dom('query_selector_scoped', nid, selector));
+  },
+  getAttribute(element, name) {
+    const nid = _trustedNodeId(element);
+    if (nid == null || typeof name !== 'string') return null;
+    return _domParse('get_attribute', nid, name);
+  },
+  hasAttribute(element, name) {
+    const nid = _trustedNodeId(element);
+    if (nid == null || typeof name !== 'string') return false;
+    return _domParse('get_attribute', nid, name) !== null;
+  },
+});
+Object.defineProperty(globalThis, '__obscuraCaptchaNativeDom', {
+  value: _captchaNativeDom,
+  configurable: false,
+  enumerable: false,
+  writable: false,
 });
 
 // setHTMLUnsafe / getHTML: shims over innerHTML. setHTMLUnsafe parses markup
