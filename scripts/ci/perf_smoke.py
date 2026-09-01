@@ -131,6 +131,25 @@ def add_summary(markdown: str) -> None:
         print(markdown)
 
 
+def performance_regression_failures(
+    scenario: str,
+    latency_ratio: float,
+    latency_delta_ms: float,
+    rss_ratio: float,
+    rss_delta_kib: float,
+) -> list[str]:
+    """Return failures using main's ratio and absolute-delta noise guards."""
+    failures = []
+    if (
+        latency_ratio > LATENCY_FAILURE_RATIO
+        and latency_delta_ms > LATENCY_FAILURE_DELTA_MS
+    ):
+        failures.append(f"{scenario} latency is {latency_ratio:.2f}x the base")
+    if rss_ratio > RSS_FAILURE_RATIO and rss_delta_kib > RSS_FAILURE_DELTA_KIB:
+        failures.append(f"{scenario} RSS is {rss_ratio:.2f}x the base")
+    return failures
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", type=Path, required=True)
@@ -197,13 +216,15 @@ def main() -> None:
         )
         latency_delta = pr_latency - base_latency
         rss_delta = pr_rss - base_rss
-        if (
-            latency_ratio > LATENCY_FAILURE_RATIO
-            and latency_delta > LATENCY_FAILURE_DELTA_MS
-        ):
-            failures.append(f"{scenario} latency is {latency_ratio:.2f}x the base")
-        if rss_ratio > RSS_FAILURE_RATIO and rss_delta > RSS_FAILURE_DELTA_KIB:
-            failures.append(f"{scenario} RSS is {rss_ratio:.2f}x the base")
+        failures.extend(
+            performance_regression_failures(
+                scenario,
+                latency_ratio,
+                latency_delta,
+                rss_ratio,
+                rss_delta,
+            )
+        )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

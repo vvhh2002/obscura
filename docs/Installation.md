@@ -62,6 +62,15 @@ See [Build from source](Build-from-source.md).
 - `obscura`: CLI and CDP server.
 - `obscura-worker`: helper for the parallel `scrape` command. Keep both in the same directory.
 
+The Release page also carries separate `ai_slide_matcher-v*` platform archives.
+They are not embedded in the four Obscura variants. Select the archive matching
+your operating system and CPU when an offline slider-image matcher is needed.
+Matcher archives contain a native executable, runtime instructions, sample
+inputs, and the applicable legal notices; they contain no source code or
+implementation-documentation bundle. `ai_slide_matcher-TEST-REPORT.json` and
+`ai_slide_matcher-PROVENANCE.txt` publish the source revision and passed release
+gates without exposing the private checkout.
+
 Archive suffixes identify the feature set: no suffix includes rendering,
 `-stealth` includes rendering and stealth, `-no-render` includes neither, and
 `-no-render-stealth` includes stealth without rendering.

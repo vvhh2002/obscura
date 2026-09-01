@@ -149,6 +149,9 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
 
 ## Install
 
+中文用户可先阅读 [Release 中文使用手册](docs/User-Guide.zh-CN.md)。每个
+Release 压缩包中也包含同一份 `obscura-user-guide-zh-CN.md`。
+
 ### Download
 
 Grab the latest binary from [Releases](https://github.com/h4ckf0r0day/obscura/releases):
@@ -185,6 +188,15 @@ No Chrome or Node.js is required. Release archives include both `obscura` and
 `obscura-worker`; keep them in the same directory for the parallel `scrape`
 command. The binaries still depend on the target operating-system ABI/runtime;
 Linux downloads require glibc 2.35 or newer.
+
+The same Release also publishes `ai_slide_matcher-v*` archives for Linux
+x86_64/ARM64, macOS Apple Silicon/Intel, and Windows x86_64. These are separate
+downloads rather than files embedded in every Obscura variant. Each matcher
+archive contains only the native executable, its end-user instructions, sample
+image inputs, `LICENSE`, and `THIRD_PARTY_NOTICES`; matcher source and
+implementation documentation are never uploaded by the Obscura workflow. The
+Release also includes a sanitized matcher test report and build provenance so
+the public build remains auditable without disclosing private source.
 
 | Archive suffix | Rendering | Stealth transport |
 |----------------|-----------|-------------------|
