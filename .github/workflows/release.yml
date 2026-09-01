@@ -326,6 +326,10 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ needs.prepare.outputs.sha }}
+          # Keep the public policy checkout and private Cargo package as
+          # siblings. A private checkout nested below the Obscura Cargo
+          # workspace is rejected as an undeclared workspace member.
+          path: obscura-policy
 
       - name: Preserve LF files in the private Windows checkout
         if: runner.os == 'Windows'
@@ -509,7 +513,7 @@ jobs:
           set -euo pipefail
           python_cmd=python3
           command -v "$python_cmd" >/dev/null || python_cmd=python
-          "$python_cmd" scripts/ci/sanitize_matcher_smoke.py \
+          "$python_cmd" obscura-policy/scripts/ci/sanitize_matcher_smoke.py \
             --input matcher-source/target/private-smoke-results/${{ matrix.id }}.json \
             --output matcher-smoke-results/${{ matrix.id }}.json \
             --target ${{ matrix.id }} \
@@ -522,7 +526,7 @@ jobs:
           root="matcher-source/target/release-output/${{ matrix.id }}"
           python_cmd=python3
           command -v "$python_cmd" >/dev/null || python_cmd=python
-          "$python_cmd" scripts/ci/verify_matcher_binary_release.py \
+          "$python_cmd" obscura-policy/scripts/ci/verify_matcher_binary_release.py \
             --staging "$root" \
             --executable ${{ matrix.executable }}
 
