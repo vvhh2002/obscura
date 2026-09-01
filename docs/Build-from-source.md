@@ -143,6 +143,32 @@ the default, then select the desired source branch in the workflow picker.
 `.github/workflows/release.yml` still runs automatically for a pushed `v*`
 tag. It also supports `workflow_dispatch` for a guarded manual build:
 
+Before running it, create the protected GitHub Actions environment
+`ai-slide-matcher-release` and add its environment secret
+`AI_SLIDE_MATCHER_READ_TOKEN`. Restrict deployment branches/tags to the trusted
+release refs and require reviewer approval. The secret must be a fine-grained
+token (or equivalent short-lived GitHub App installation token exposed under
+that secret name) with only **Contents: Read** access to
+`vvhh2002/ai_slide_matcher`. Do not make it a repository-wide secret: manual
+workflows can select a branch, so an environment boundary is required to stop
+an unreviewed workflow revision from reading private matcher source. The
+ordinary Obscura `GITHUB_TOKEN` is intentionally scoped to Obscura and cannot
+read the private matcher repository. The checkout action receives this
+credential with `persist-credentials: false`; build, test, packaging, and
+publish commands do not receive it.
+
+The workflow pins matcher source with the full `AI_SLIDE_MATCHER_REF` commit,
+pairs it with a stable positive `AI_SLIDE_MATCHER_BUILD_NUMBER`, and fixes the
+result in `AI_SLIDE_MATCHER_VERSION`. Review and update all three values plus
+the reviewed public-file digests together when adopting a new matcher revision.
+Public distribution must remain authorized by the matcher copyright owner. The
+packages retain the matcher `LICENSE` and `THIRD_PARTY_NOTICES`.
+
+All matcher gates run directly inside this public Obscura workflow. It does not
+call a reusable matcher workflow, dispatch the private repository, wait for its
+CI, or download artifacts from a private matcher run. The private repository is
+used only as an immutable, read-only source checkout at the pinned commit.
+
 1. Open **Actions → Release → Run workflow** and select the exact branch whose
    current commit should be released.
 2. Enter a SemVer version such as `0.2.0` or `v0.2.0`. The workflow adds the
@@ -170,6 +196,24 @@ The matrix builds Linux x86_64/ARM64, macOS Apple Silicon/Intel, and Windows
 x86_64. Each platform produces default, stealth, no-render, and
 no-render-stealth archives, runs an offline V8 startup smoke test, and uploads
 the packages for seven days. Published releases also contain `SHA256SUMS`.
+
+A separate matcher gate runs locked source and packaging tests, then native
+release tests on five platform runners. Every native binary must pass the
+match/compare and Tianai, GoCaptcha, AJ-Captcha, and slider-captcha-js adapter
+smoke cases plus platform ABI checks. Obscura-owned policy validates each raw
+smoke manifest against eleven exact cases and rebuilds a canonical public copy;
+the raw private manifest remains runner-local. A read-only aggregation job
+compares the five sanitized manifests, verifies deterministic archives
+byte-for-byte against the tested binaries, removes the
+implementation-documentation ZIP, and uploads
+only platform binary archives, legal/runtime material, sample inputs, and a
+small provenance record. The private checkout, source tree, tests, and
+implementation documents are never release artifacts. Compiler, test, and
+packaging output from private source commands is retained only in runner-local
+temporary logs and is not printed or uploaded, preventing failure diagnostics
+from exposing source excerpts. The final write-enabled job still only collects
+the verified public artifacts, regenerates the combined `SHA256SUMS`, and
+publishes them.
 
 Only the final publish job receives `contents: write`; it does not check out or
 execute repository code. The build jobs remain read-only. A tag created by the

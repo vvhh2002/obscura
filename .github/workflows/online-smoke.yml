@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       matcher_ref:
-        description: Optional matcher SemVer tag or full commit; blank checks capture only
+        description: Optional full matcher commit SHA; blank checks capture only
         required: false
         default: ""
         type: string
@@ -15,7 +15,8 @@ on:
         type: string
 
 # This smoke reaches a mutable third-party endpoint, so it is manual-only and
-# is not a release or branch protection gate. It receives no repository secrets.
+# is not a release or branch protection gate. The optional matcher checkout
+# receives only its repository-scoped read token.
 permissions:
   contents: read
 
@@ -32,6 +33,7 @@ env:
 jobs:
   smoke:
     name: Authorized SMZDM / Tencent capture
+    environment: ai-slide-matcher-release
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     steps:
@@ -62,10 +64,21 @@ jobs:
           MATCHER_REF: ${{ inputs.matcher_ref }}
         run: |
           set -euo pipefail
-          commit='^[0-9a-fA-F]{40}$'
-          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
-          if [[ ! "$MATCHER_REF" =~ $commit && ! "$MATCHER_REF" =~ $semver ]]; then
-            echo "matcher_ref must be a full commit SHA or a v-prefixed SemVer tag" >&2
+          commit='^[0-9a-f]{40}$'
+          if [[ ! "$MATCHER_REF" =~ $commit ]]; then
+            echo "matcher_ref must be a lowercase full commit SHA" >&2
+            exit 1
+          fi
+
+      - name: Require optional matcher read credential
+        if: inputs.matcher_ref != ''
+        shell: bash
+        env:
+          MATCHER_TOKEN: ${{ secrets.AI_SLIDE_MATCHER_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$MATCHER_TOKEN" ]]; then
+            echo "AI_SLIDE_MATCHER_READ_TOKEN must grant Contents: Read on vvhh2002/ai_slide_matcher" >&2
             exit 1
           fi
 
@@ -76,13 +89,41 @@ jobs:
           repository: vvhh2002/ai_slide_matcher
           ref: ${{ inputs.matcher_ref }}
           path: matcher-source
+          token: ${{ secrets.AI_SLIDE_MATCHER_READ_TOKEN }}
           persist-credentials: false
+
+      - name: Verify optional matcher revision
+        if: inputs.matcher_ref != ''
+        shell: bash
+        env:
+          MATCHER_REF: ${{ inputs.matcher_ref }}
+        run: |
+          set -euo pipefail
+          actual_sha="$(git -C matcher-source rev-parse 'HEAD^{commit}')"
+          if [[ "$actual_sha" != "$MATCHER_REF" ]]; then
+            echo "Checked out matcher $actual_sha, expected $MATCHER_REF" >&2
+            exit 1
+          fi
+
+      - name: Install optional matcher toolchain
+        if: inputs.matcher_ref != ''
+        run: rustup toolchain install 1.98.0 --profile minimal
 
       - name: Build optional ai_slide_matcher
         if: inputs.matcher_ref != ''
+        working-directory: matcher-source
+        env:
+          AI_SLIDE_MATCHER_BUILD_NUMBER: ${{ github.run_id }}
+          CARGO_TARGET_DIR: ../matcher-target
         run: |
-          CARGO_TARGET_DIR="$RUNNER_TEMP/ai-slide-matcher-target" \
-            cargo build --locked --release --manifest-path matcher-source/Cargo.toml
+          set -euo pipefail
+          private_log="$RUNNER_TEMP/ai-slide-matcher-online-build.log"
+          if ! cargo +1.98.0 build --locked --release --bin ai_slide_matcher \
+            >"$private_log" 2>&1; then
+            echo "Private matcher build failed; source diagnostics are withheld from this public log" >&2
+            exit 1
+          fi
+          echo "Private matcher build passed"
 
       - name: Capture and inspect the authorized target
         shell: bash
@@ -93,7 +134,7 @@ jobs:
           set -euo pipefail
           matcher_args=()
           if [[ -n "$MATCHER_REF" ]]; then
-            matcher_args=(--matcher "$RUNNER_TEMP/ai-slide-matcher-target/release/ai_slide_matcher")
+            matcher_args=(--matcher "$GITHUB_WORKSPACE/matcher-target/release/ai_slide_matcher")
           fi
           python3 scripts/ci/tencent_captcha_online_smoke.py \
             --obscura target/release/obscura \

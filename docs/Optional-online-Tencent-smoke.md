@@ -18,12 +18,20 @@ workflow must first exist on the repository's default branch before GitHub
 shows its manual-run button. Select the Obscura revision to test.
 
 `matcher_ref` is optional. Leave it blank to validate only the browser capture.
-Set it to a `v`-prefixed SemVer tag or full 40-character commit from
+Set it to a lowercase full 40-character commit from
 `vvhh2002/ai_slide_matcher` to build that revision, run its `gray` matcher, and
 require the returned `[x,y]` center to lie inside the archived background
-image. Moving branch names are rejected. `wait_seconds` controls the fixed
+image. Tags and moving branch names are rejected. `wait_seconds` controls the fixed
 observation window after the `capture-ready` boundary and defaults to eight
 seconds.
+
+Because the matcher repository is private, matcher-enabled runs require the
+same protected `ai-slide-matcher-release` environment and its
+`AI_SLIDE_MATCHER_READ_TOKEN`, scoped to **Contents: Read** on that repository.
+The environment should allow only reviewed release refs. Capture-only runs do
+not read the secret, although the job still passes the environment protection
+gate. The source checkout remains on the ephemeral runner; only the existing
+sanitized smoke report is uploaded.
 
 The action has three outcomes:
 

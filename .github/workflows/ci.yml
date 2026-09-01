@@ -106,6 +106,12 @@ jobs:
       - name: Test performance threshold policy
         run: python3 -m unittest discover -s scripts/ci -p 'test_perf_smoke.py'
 
+      - name: Test binary-only matcher release policy
+        run: python3 -m unittest discover -s scripts/ci -p 'test_verify_matcher_binary_release.py'
+
+      - name: Test public matcher smoke sanitizer
+        run: python3 -m unittest discover -s scripts/ci -p 'test_sanitize_matcher_smoke.py'
+
       - name: Check dependency advisories, licenses, bans, and sources
         if: steps.changes.outputs.audit == 'true'
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2

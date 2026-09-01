@@ -41,6 +41,15 @@
 运行 `scrape` 时不要把两个可执行文件分开。Linux 官方包要求 glibc 2.35 或
 更新版本；它不是 musl 全静态包。
 
+同一 Release 页面还会提供单独的 `ai_slide_matcher-v*` 五平台附件，用于离线
+计算滑块图片的目标坐标。matcher 不会重复放进四种 Obscura 变体压缩包；请按
+操作系统和 CPU 另行下载。matcher 平台包只包含原生可执行文件、运行说明、示例
+图片、`LICENSE` 和 `THIRD_PARTY_NOTICES`，不包含源代码或实现文档压缩包。
+它也不会自动拖动或提交验证码；调用方仍需在获得授权的系统中处理交互。
+Release 根目录中的 `ai_slide_matcher-TEST-REPORT.json` 与
+`ai_slide_matcher-PROVENANCE.txt` 提供公开测试门禁结论和固定源码 revision，
+但不包含私有源码内容。
+
 ## 2. 校验、解压与首次运行
 
 Release 同时提供 `SHA256SUMS`。建议先下载它，再校验所选压缩包。

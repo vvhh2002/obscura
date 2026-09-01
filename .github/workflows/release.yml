@@ -27,6 +27,12 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # Keep the matcher source and product build number immutable together. The
+  # build number is the pinned commit timestamp so rebuilding an Obscura tag
+  # does not create differently named matcher assets.
+  AI_SLIDE_MATCHER_BUILD_NUMBER: "1788194189"
+  AI_SLIDE_MATCHER_REF: 132a833b72a6593d04f7400315ec82100d261d8c
+  AI_SLIDE_MATCHER_VERSION: 0.1.0+build.1788194189
   CARGO_BUILD_JOBS: "2"
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
@@ -190,6 +196,12 @@ jobs:
       - name: Test performance threshold policy
         run: python3 -m unittest discover -s scripts/ci -p 'test_perf_smoke.py'
 
+      - name: Test binary-only matcher release policy
+        run: python3 -m unittest discover -s scripts/ci -p 'test_verify_matcher_binary_release.py'
+
+      - name: Test public matcher smoke sanitizer
+        run: python3 -m unittest discover -s scripts/ci -p 'test_sanitize_matcher_smoke.py'
+
       - name: Run focused document-loading regressions
         run: |
           cargo nextest run --locked --release --features render \
@@ -201,6 +213,551 @@ jobs:
         # This intentionally follows the small focused gate. Cargo reuses the
         # release-mode compilation, so only the focused test processes repeat.
         run: cargo nextest run --locked --release --features render --no-fail-fast
+
+  matcher_test:
+    name: Release / ai_slide_matcher source tests
+    needs: prepare
+    environment: ai-slide-matcher-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Require private matcher read credential
+        shell: bash
+        env:
+          MATCHER_TOKEN: ${{ secrets.AI_SLIDE_MATCHER_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$MATCHER_TOKEN" ]]; then
+            echo "AI_SLIDE_MATCHER_READ_TOKEN must grant Contents: Read on vvhh2002/ai_slide_matcher" >&2
+            exit 1
+          fi
+
+      - name: Checkout pinned ai_slide_matcher source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: vvhh2002/ai_slide_matcher
+          ref: ${{ env.AI_SLIDE_MATCHER_REF }}
+          path: matcher-source
+          token: ${{ secrets.AI_SLIDE_MATCHER_READ_TOKEN }}
+          persist-credentials: false
+
+      - name: Verify pinned matcher revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_sha="$(git -C matcher-source rev-parse 'HEAD^{commit}')"
+          if [[ "$actual_sha" != "$AI_SLIDE_MATCHER_REF" ]]; then
+            echo "Checked out matcher $actual_sha, expected $AI_SLIDE_MATCHER_REF" >&2
+            exit 1
+          fi
+
+      - name: Install pinned matcher Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal
+
+      - name: Run locked matcher and packaging tests
+        working-directory: matcher-source
+        env:
+          CARGO_TARGET_DIR: ../matcher-test-target
+        run: |
+          set -euo pipefail
+          private_log="$RUNNER_TEMP/ai-slide-matcher-source-tests.log"
+          if ! cargo +1.98.0 test --locked --all-targets --all-features \
+            >"$private_log" 2>&1; then
+            echo "Private matcher Rust tests failed; source diagnostics are withheld from this public log" >&2
+            exit 1
+          fi
+          if ! python3 -m unittest tests/test_release_packaging.py \
+            >>"$private_log" 2>&1; then
+            echo "Private matcher packaging tests failed; source diagnostics are withheld from this public log" >&2
+            exit 1
+          fi
+          echo "Private matcher source and packaging tests passed"
+
+  matcher_build:
+    name: Release / ai_slide_matcher / ${{ matrix.id }}
+    needs: [prepare, matcher_test]
+    environment: ai-slide-matcher-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: linux-x64-musl
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            executable: ai_slide_matcher
+            architecture: x86_64
+          - id: linux-arm64-musl
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            executable: ai_slide_matcher
+            architecture: aarch64
+          - id: macos-x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            executable: ai_slide_matcher
+            architecture: x86_64
+          - id: macos-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            executable: ai_slide_matcher
+            architecture: arm64
+          - id: windows-x64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            executable: ai_slide_matcher.exe
+            architecture: x86_64
+
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Require private matcher read credential
+        shell: bash
+        env:
+          MATCHER_TOKEN: ${{ secrets.AI_SLIDE_MATCHER_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$MATCHER_TOKEN" ]]; then
+            echo "AI_SLIDE_MATCHER_READ_TOKEN must grant Contents: Read on vvhh2002/ai_slide_matcher" >&2
+            exit 1
+          fi
+
+      - name: Checkout resolved Obscura sanitizer revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - name: Preserve LF files in the private Windows checkout
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - name: Checkout pinned ai_slide_matcher source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: vvhh2002/ai_slide_matcher
+          ref: ${{ env.AI_SLIDE_MATCHER_REF }}
+          path: matcher-source
+          token: ${{ secrets.AI_SLIDE_MATCHER_READ_TOKEN }}
+          persist-credentials: false
+
+      - name: Verify pinned matcher revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_sha="$(git -C matcher-source rev-parse 'HEAD^{commit}')"
+          if [[ "$actual_sha" != "$AI_SLIDE_MATCHER_REF" ]]; then
+            echo "Checked out matcher $actual_sha, expected $AI_SLIDE_MATCHER_REF" >&2
+            exit 1
+          fi
+
+      - name: Install pinned matcher Rust toolchain and target
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup target add --toolchain 1.98.0 ${{ matrix.target }}
+
+      - name: Install native musl linker
+        if: startsWith(matrix.id, 'linux-')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binutils musl-tools
+
+      - name: Run native matcher release tests (Unix)
+        if: runner.os != 'Windows'
+        working-directory: matcher-source
+        env:
+          CARGO_TARGET_DIR: ../matcher-target
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+        run: |
+          set -euo pipefail
+          private_log="$RUNNER_TEMP/ai-slide-matcher-native-tests.log"
+          if ! cargo +1.98.0 test --release --locked --target ${{ matrix.target }} \
+            >"$private_log" 2>&1; then
+            echo "Private matcher native tests failed; source diagnostics are withheld from this public log" >&2
+            exit 1
+          fi
+          echo "Private matcher native tests passed"
+
+      - name: Run native matcher release tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: matcher-source
+        env:
+          CARGO_TARGET_DIR: ../matcher-target
+        run: |
+          $privateLog = Join-Path $env:RUNNER_TEMP "ai-slide-matcher-native-tests.log"
+          cargo +1.98.0 test --release --locked --target ${{ matrix.target }} *> $privateLog
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Private matcher native tests failed; source diagnostics are withheld from this public log"
+            exit 1
+          }
+          Write-Host "Private matcher native tests passed"
+
+      - name: Build and smoke matcher release binary (Unix)
+        if: runner.os != 'Windows'
+        working-directory: matcher-source
+        env:
+          CARGO_TARGET_DIR: ../matcher-target
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+        run: |
+          set -euo pipefail
+          private_log="$RUNNER_TEMP/ai-slide-matcher-native-build.log"
+          if ! cargo +1.98.0 build --release --locked --bin ai_slide_matcher \
+            --target ${{ matrix.target }} >"$private_log" 2>&1; then
+            echo "Private matcher native build failed; source diagnostics are withheld from this public log" >&2
+            exit 1
+          fi
+          mkdir -p target/release-output/${{ matrix.id }} target/private-smoke-results
+          cp ../matcher-target/${{ matrix.target }}/release/${{ matrix.executable }} \
+            target/release-output/${{ matrix.id }}/
+          cp LICENSE THIRD_PARTY_NOTICES target/release-output/${{ matrix.id }}/
+          if ! rustc +1.98.0 scripts/native_smoke.rs -O -o target/native-smoke \
+            >>"$private_log" 2>&1; then
+            echo "Private matcher smoke harness build failed; source diagnostics are withheld from this public log" >&2
+            exit 1
+          fi
+          if ! target/native-smoke \
+            target/release-output/${{ matrix.id }}/${{ matrix.executable }} \
+            target/private-smoke-results/${{ matrix.id }}.json \
+            ${{ matrix.id }} >>"$private_log" 2>&1; then
+            echo "Private matcher native smoke failed; source diagnostics are withheld from this public log" >&2
+            exit 1
+          fi
+          echo "Private matcher native build and smoke passed"
+
+      - name: Build and smoke matcher release binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: matcher-source
+        env:
+          CARGO_TARGET_DIR: ../matcher-target
+        run: |
+          $privateLog = Join-Path $env:RUNNER_TEMP "ai-slide-matcher-native-build.log"
+          cargo +1.98.0 build --release --locked --bin ai_slide_matcher --target ${{ matrix.target }} *> $privateLog
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Private matcher native build failed; source diagnostics are withheld from this public log"
+            exit 1
+          }
+          New-Item -ItemType Directory -Force target/release-output/${{ matrix.id }}, target/private-smoke-results | Out-Null
+          Copy-Item ../matcher-target/${{ matrix.target }}/release/${{ matrix.executable }} target/release-output/${{ matrix.id }}/
+          Copy-Item -Path LICENSE, THIRD_PARTY_NOTICES -Destination target/release-output/${{ matrix.id }}/
+          rustc +1.98.0 scripts/native_smoke.rs -O -o target/native-smoke.exe *>> $privateLog
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Private matcher smoke harness build failed; source diagnostics are withheld from this public log"
+            exit 1
+          }
+          target/native-smoke.exe `
+            target/release-output/${{ matrix.id }}/${{ matrix.executable }} `
+            target/private-smoke-results/${{ matrix.id }}.json `
+            ${{ matrix.id }} *>> $privateLog
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Private matcher native smoke failed; source diagnostics are withheld from this public log"
+            exit 1
+          }
+          Write-Host "Private matcher native build and smoke passed"
+
+      - name: Verify static Linux matcher artifact
+        if: startsWith(matrix.id, 'linux-')
+        working-directory: matcher-source
+        run: |
+          set -euo pipefail
+          private_log="$RUNNER_TEMP/ai-slide-matcher-linux-abi.log"
+          if ! bash scripts/check_static_linux.sh \
+            target/release-output/${{ matrix.id }}/${{ matrix.executable }} \
+            ${{ matrix.architecture }} >"$private_log" 2>&1; then
+            echo "Private matcher Linux ABI check failed; diagnostics are withheld from this public log" >&2
+            exit 1
+          fi
+          echo "Private matcher Linux ABI check passed"
+
+      - name: Verify macOS matcher artifact
+        if: startsWith(matrix.id, 'macos-')
+        working-directory: matcher-source
+        run: |
+          set -euo pipefail
+          private_log="$RUNNER_TEMP/ai-slide-matcher-macos-abi.log"
+          if ! bash scripts/check_macos_binary.sh \
+            target/release-output/${{ matrix.id }}/${{ matrix.executable }} \
+            ${{ matrix.architecture }} >"$private_log" 2>&1; then
+            echo "Private matcher macOS ABI check failed; diagnostics are withheld from this public log" >&2
+            exit 1
+          fi
+          echo "Private matcher macOS ABI check passed"
+
+      - name: Verify Windows matcher artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: matcher-source
+        run: |
+          $privateLog = Join-Path $env:RUNNER_TEMP "ai-slide-matcher-windows-abi.log"
+          ./scripts/check_windows_binary.ps1 `
+            -Binary target/release-output/${{ matrix.id }}/${{ matrix.executable }} *> $privateLog
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Private matcher Windows ABI check failed; diagnostics are withheld from this public log"
+            exit 1
+          }
+          Write-Host "Private matcher Windows ABI check passed"
+
+      - name: Sanitize native matcher smoke result with public policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          python_cmd=python3
+          command -v "$python_cmd" >/dev/null || python_cmd=python
+          "$python_cmd" scripts/ci/sanitize_matcher_smoke.py \
+            --input matcher-source/target/private-smoke-results/${{ matrix.id }}.json \
+            --output matcher-smoke-results/${{ matrix.id }}.json \
+            --target ${{ matrix.id }} \
+            --version "$AI_SLIDE_MATCHER_VERSION"
+
+      - name: Verify native matcher upload file set
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="matcher-source/target/release-output/${{ matrix.id }}"
+          python_cmd=python3
+          command -v "$python_cmd" >/dev/null || python_cmd=python
+          "$python_cmd" scripts/ci/verify_matcher_binary_release.py \
+            --staging "$root" \
+            --executable ${{ matrix.executable }}
+
+      - name: Upload native matcher binary and legal notices
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: binary-${{ matrix.id }}
+          path: |
+            matcher-source/target/release-output/${{ matrix.id }}/${{ matrix.executable }}
+            matcher-source/target/release-output/${{ matrix.id }}/LICENSE
+            matcher-source/target/release-output/${{ matrix.id }}/THIRD_PARTY_NOTICES
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload native matcher smoke result
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: matcher-smoke-${{ matrix.id }}
+          path: matcher-smoke-results/${{ matrix.id }}.json
+          if-no-files-found: error
+          retention-days: 7
+
+  matcher_package:
+    name: Release / Package ai_slide_matcher
+    needs: [prepare, test, matcher_test, matcher_build]
+    environment: ai-slide-matcher-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Require private matcher read credential
+        shell: bash
+        env:
+          MATCHER_TOKEN: ${{ secrets.AI_SLIDE_MATCHER_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$MATCHER_TOKEN" ]]; then
+            echo "AI_SLIDE_MATCHER_READ_TOKEN must grant Contents: Read on vvhh2002/ai_slide_matcher" >&2
+            exit 1
+          fi
+
+      - name: Checkout resolved Obscura verifier revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - name: Checkout pinned ai_slide_matcher source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: vvhh2002/ai_slide_matcher
+          ref: ${{ env.AI_SLIDE_MATCHER_REF }}
+          path: matcher-source
+          token: ${{ secrets.AI_SLIDE_MATCHER_READ_TOKEN }}
+          persist-credentials: false
+
+      - name: Verify pinned matcher revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_sha="$(git -C matcher-source rev-parse 'HEAD^{commit}')"
+          if [[ "$actual_sha" != "$AI_SLIDE_MATCHER_REF" ]]; then
+            echo "Checked out matcher $actual_sha, expected $AI_SLIDE_MATCHER_REF" >&2
+            exit 1
+          fi
+
+      - name: Download native matcher binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: binary-*
+          path: matcher-source/target/release-input
+
+      - name: Download native matcher smoke results
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: matcher-smoke-*
+          path: matcher-source/target/all-smoke-results
+          merge-multiple: true
+
+      - name: Compare matcher results across platforms
+        working-directory: matcher-source
+        run: |
+          set -euo pipefail
+          private_log="$RUNNER_TEMP/ai-slide-matcher-compare.log"
+          if ! python3 scripts/compare_smoke_manifests.py target/all-smoke-results \
+            >"$private_log" 2>&1; then
+            echo "Private matcher cross-platform comparison failed; source diagnostics are withheld from this public log" >&2
+            exit 1
+          fi
+          echo "Private matcher cross-platform outputs agree"
+
+      - name: Resolve matcher release version
+        id: matcher_version
+        shell: bash
+        working-directory: matcher-source
+        run: |
+          set -euo pipefail
+          private_log="$RUNNER_TEMP/ai-slide-matcher-version.log"
+          if ! version="$(python3 scripts/resolve_release_version.py \
+            --requested '' \
+            --build-number "$AI_SLIDE_MATCHER_BUILD_NUMBER" 2>"$private_log")"; then
+            echo "Private matcher version resolution failed; source diagnostics are withheld from this public log" >&2
+            exit 1
+          fi
+          if [[ "$version" != "$AI_SLIDE_MATCHER_VERSION" ]]; then
+            echo "Private matcher version differs from the pinned public release version" >&2
+            exit 1
+          fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          echo "Packaging ai_slide_matcher $version from $AI_SLIDE_MATCHER_REF"
+
+      - name: Package and verify binary matcher archives
+        working-directory: matcher-source
+        env:
+          MATCHER_VERSION: ${{ steps.matcher_version.outputs.version }}
+        run: |
+          set -euo pipefail
+          private_log="$RUNNER_TEMP/ai-slide-matcher-package.log"
+          if ! python3 scripts/package_release.py \
+            --input target/release-input \
+            --output ../matcher-release \
+            --version "$MATCHER_VERSION" \
+            --source-date-epoch 0 >"$private_log" 2>&1; then
+            echo "Private matcher packaging failed; source diagnostics are withheld from this public log" >&2
+            exit 1
+          fi
+          if ! python3 scripts/verify_release_archives.py \
+            --input target/release-input \
+            --archives ../matcher-release \
+            --version "$MATCHER_VERSION" \
+            --extract-linux-x64 ../matcher-release-verify \
+            >>"$private_log" 2>&1; then
+            echo "Private matcher archive verification failed; source diagnostics are withheld from this public log" >&2
+            exit 1
+          fi
+          if ! ../matcher-release-verify/ai_slide_matcher --version \
+            >>"$private_log" 2>&1; then
+            echo "Packaged matcher execution failed" >&2
+            exit 1
+          fi
+          # The private repository's implementation-documentation bundle is
+          # verified locally but is not an authorized public artifact.
+          rm "../matcher-release/ai_slide_matcher-v${MATCHER_VERSION}-documentation.zip"
+
+      - name: Record pinned matcher build provenance
+        shell: bash
+        env:
+          MATCHER_VERSION: ${{ steps.matcher_version.outputs.version }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            "repository=https://github.com/vvhh2002/ai_slide_matcher" \
+            "commit=$AI_SLIDE_MATCHER_REF" \
+            "rust_toolchain=1.98.0" \
+            "version=$MATCHER_VERSION" \
+            > matcher-release/ai_slide_matcher-PROVENANCE.txt
+
+      - name: Publish sanitized matcher test report
+        shell: bash
+        env:
+          MATCHER_VERSION: ${{ steps.matcher_version.outputs.version }}
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg repository "vvhh2002/ai_slide_matcher" \
+            --arg commit "$AI_SLIDE_MATCHER_REF" \
+            --arg version "$MATCHER_VERSION" \
+            '{
+              schema_version: 1,
+              repository: $repository,
+              commit: $commit,
+              version: $version,
+              source_code_included: false,
+              gates: {
+                locked_source_tests: "passed",
+                packaging_tests: "passed",
+                native_release_tests: "passed",
+                native_functional_smoke: "passed",
+                cross_platform_determinism: "passed",
+                platform_abi_checks: "passed",
+                binary_archive_verification: "passed"
+              },
+              native_targets: [
+                "x86_64-unknown-linux-musl",
+                "aarch64-unknown-linux-musl",
+                "x86_64-apple-darwin",
+                "aarch64-apple-darwin",
+                "x86_64-pc-windows-msvc"
+              ]
+            }' > matcher-release/ai_slide_matcher-TEST-REPORT.json
+          {
+            echo "### ai_slide_matcher public release gate"
+            echo
+            echo "- Revision: \`$AI_SLIDE_MATCHER_REF\`"
+            echo "- Version: \`$MATCHER_VERSION\`"
+            echo "- Source/packaging tests: passed"
+            echo "- Five-platform native tests, adapter smoke, determinism, and ABI checks: passed"
+            echo "- Public source files: none"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Generate matcher release checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd matcher-release
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > SHA256SUMS
+          test -s SHA256SUMS
+
+      - name: Independently verify binary-only matcher release
+        shell: bash
+        env:
+          MATCHER_VERSION: ${{ steps.matcher_version.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/verify_matcher_binary_release.py \
+            --archives matcher-release \
+            --version "$MATCHER_VERSION" \
+            --commit "$AI_SLIDE_MATCHER_REF"
+
+      - name: Upload packaged matcher releases
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-ai-slide-matcher
+          path: |
+            matcher-release/SHA256SUMS
+            matcher-release/ai_slide_matcher-PROVENANCE.txt
+            matcher-release/ai_slide_matcher-TEST-REPORT.json
+            matcher-release/ai_slide_matcher-v${{ steps.matcher_version.outputs.version }}-aarch64-apple-darwin.tar.gz
+            matcher-release/ai_slide_matcher-v${{ steps.matcher_version.outputs.version }}-aarch64-unknown-linux-musl.tar.gz
+            matcher-release/ai_slide_matcher-v${{ steps.matcher_version.outputs.version }}-x86_64-apple-darwin.tar.gz
+            matcher-release/ai_slide_matcher-v${{ steps.matcher_version.outputs.version }}-x86_64-pc-windows-msvc.zip
+            matcher-release/ai_slide_matcher-v${{ steps.matcher_version.outputs.version }}-x86_64-unknown-linux-musl.tar.gz
+          if-no-files-found: error
+          retention-days: 7
 
   build:
     needs: [prepare, test]
@@ -445,7 +1002,7 @@ jobs:
           retention-days: 7
 
   publish:
-    needs: [prepare, test, build, documentation]
+    needs: [prepare, test, matcher_package, build, documentation]
     if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 15
@@ -460,6 +1017,56 @@ jobs:
           pattern: release-*
           path: dist
           merge-multiple: true
+
+      - name: Verify collected public release file set
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          expected="$RUNNER_TEMP/obscura-release-files.expected"
+          actual="$RUNNER_TEMP/obscura-release-files.actual"
+          printf '%s\n' \
+            "SHA256SUMS" \
+            "ai_slide_matcher-PROVENANCE.txt" \
+            "ai_slide_matcher-TEST-REPORT.json" \
+            "ai_slide_matcher-v${AI_SLIDE_MATCHER_VERSION}-aarch64-apple-darwin.tar.gz" \
+            "ai_slide_matcher-v${AI_SLIDE_MATCHER_VERSION}-aarch64-unknown-linux-musl.tar.gz" \
+            "ai_slide_matcher-v${AI_SLIDE_MATCHER_VERSION}-x86_64-apple-darwin.tar.gz" \
+            "ai_slide_matcher-v${AI_SLIDE_MATCHER_VERSION}-x86_64-pc-windows-msvc.zip" \
+            "ai_slide_matcher-v${AI_SLIDE_MATCHER_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            "obscura-aarch64-linux-no-render-stealth.tar.gz" \
+            "obscura-aarch64-linux-no-render.tar.gz" \
+            "obscura-aarch64-linux-stealth.tar.gz" \
+            "obscura-aarch64-linux.tar.gz" \
+            "obscura-aarch64-macos-no-render-stealth.tar.gz" \
+            "obscura-aarch64-macos-no-render.tar.gz" \
+            "obscura-aarch64-macos-stealth.tar.gz" \
+            "obscura-aarch64-macos.tar.gz" \
+            "obscura-user-guide-zh-CN.md" \
+            "obscura-x86_64-linux-no-render-stealth.tar.gz" \
+            "obscura-x86_64-linux-no-render.tar.gz" \
+            "obscura-x86_64-linux-stealth.tar.gz" \
+            "obscura-x86_64-linux.tar.gz" \
+            "obscura-x86_64-macos-no-render-stealth.tar.gz" \
+            "obscura-x86_64-macos-no-render.tar.gz" \
+            "obscura-x86_64-macos-stealth.tar.gz" \
+            "obscura-x86_64-macos.tar.gz" \
+            "obscura-x86_64-windows-no-render-stealth.zip" \
+            "obscura-x86_64-windows-no-render.zip" \
+            "obscura-x86_64-windows-stealth.zip" \
+            "obscura-x86_64-windows.zip" \
+            | sort > "$expected"
+          if [[ -n "$(find . -mindepth 1 -maxdepth 1 ! -type f -print -quit)" ]]; then
+            echo "Collected release contains a non-file entry" >&2
+            exit 1
+          fi
+          find . -mindepth 1 -maxdepth 1 -type f -print \
+            | sed 's#^./##' \
+            | sort > "$actual"
+          if ! cmp -s "$expected" "$actual"; then
+            echo "Collected release file set differs from the public allowlist" >&2
+            exit 1
+          fi
 
       - name: Revalidate or create release tag
         shell: bash
