@@ -63,6 +63,9 @@ jobs:
       - name: Test public matcher smoke sanitizer
         run: python3 -m unittest discover -s scripts/ci -p 'test_sanitize_matcher_smoke.py'
 
+      - name: Test automatic release version policy
+        run: python3 -m unittest discover -s scripts/ci -p 'test_next_release_tag.py'
+
       - name: Build render release
         run: cargo build --locked --release -p obscura-cli --bins --features render
 

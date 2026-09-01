@@ -171,18 +171,26 @@ used only as an immutable, read-only source checkout at the pinned commit.
 
 1. Open **Actions → Release → Run workflow** and select the exact branch whose
    current commit should be released.
-2. Enter a SemVer version such as `0.2.0` or `v0.2.0`. The workflow adds the
-   leading `v` when it is omitted.
+2. The workflow selects the version automatically. It reuses the highest
+   stable `vMAJOR.MINOR.PATCH` tag already attached to the selected commit;
+   otherwise it increments the patch component of the highest stable version
+   found in repository tags or existing GitHub Releases. This prevents a
+   deleted release tag from making an old version available again. A repository
+   without a stable version starts at `v0.1.0`.
 3. Select **build** to create downloadable workflow artifacts only, or
    **publish** to create or update a public GitHub Release after every build
    succeeds.
 
-Manual publication creates a missing tag at the selected commit, generates
-release notes for a new Release, and publishes a non-draft release. Updating an
-existing Release preserves its notes; publishing an existing draft makes it
-public. A pre-existing tag must already resolve to the selected commit. Tags
-with a prerelease suffix, such as `v0.2.0-rc.1`, are marked as prereleases
-automatically.
+A repository-wide concurrency guard prevents two release requests from
+selecting a version simultaneously. GitHub Actions retains only one pending
+request in that concurrency group, so do not queue several manual releases at
+once. Manual publication creates the selected missing stable tag at the chosen
+commit, generates release notes for a new Release, and publishes a non-draft
+release. Rebuilding a commit that already has a stable tag reuses that tag;
+updating an existing Release preserves its notes, and publishing an existing
+draft makes it public. To publish a major, minor, or prerelease version, push an
+explicit SemVer tag such as `v1.0.0`, `v0.2.0`, or `v0.2.0-rc.1`; tag-triggered
+runs preserve that version and mark prerelease versions automatically.
 
 The prepare job resolves one immutable commit SHA. A release test gate checks
 out and verifies that exact SHA, runs the focused document-loading regressions,

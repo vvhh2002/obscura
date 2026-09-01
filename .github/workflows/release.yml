@@ -6,10 +6,6 @@ on:
       - 'v*'
   workflow_dispatch:
     inputs:
-      tag:
-        description: Version (for example 0.2.0 or v0.2.0)
-        required: true
-        type: string
       mode:
         description: Build artifacts only, or publish a release after the builds pass
         required: true
@@ -23,7 +19,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ inputs.tag || github.ref_name }}
+  # Manual runs calculate the next stable tag from repository tags and
+  # Releases. Never let two requests select a version simultaneously.
+  group: release-${{ github.repository }}
   cancel-in-progress: false
 
 env:
@@ -39,7 +37,7 @@ env:
 
 jobs:
   prepare:
-    name: Resolve release revision
+    name: Resolve release revision and version
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     outputs:
@@ -58,20 +56,24 @@ jobs:
           persist-credentials: false
           ref: ${{ github.sha }}
 
-      - name: Validate release request
+      - name: Resolve and validate release request
         id: release
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           INPUT_MODE: ${{ inputs.mode }}
-          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
 
           if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            tag="$INPUT_TAG"
-            if [[ "$tag" != v* ]]; then
-              tag="v$tag"
-            fi
+            occupied_tags="$RUNNER_TEMP/obscura-release-tags"
+            gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              --jq '.[].tag_name' > "$occupied_tags"
+            tag="$(python3 scripts/ci/next_release_tag.py \
+              --repository . \
+              --initial-version 0.1.0 \
+              --occupied-tags-file "$occupied_tags")"
             case "$INPUT_MODE" in
               build)
                 publish=false
@@ -99,7 +101,7 @@ jobs:
           semver_pre='(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
           semver="^v${semver_core}\.${semver_core}\.${semver_core}(-${semver_pre}(\.${semver_pre})*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$"
           if [[ ! "$tag" =~ $semver ]]; then
-            echo "Release version must be SemVer, for example 0.2.0 or v0.2.0: $tag" >&2
+            echo "Resolved release tag is not canonical SemVer: $tag" >&2
             exit 1
           fi
 
@@ -112,7 +114,7 @@ jobs:
           existing_sha="$(git rev-parse -q --verify "refs/tags/${tag}^{commit}" || true)"
           if [[ -n "$existing_sha" && "$existing_sha" != "$sha" ]]; then
             echo "Tag $tag already exists at $existing_sha, but the selected revision is $sha." >&2
-            echo "Choose a new version or select the commit already tagged as $tag." >&2
+            echo "Select the commit already tagged as $tag, or rerun after repository tags are refreshed." >&2
             exit 1
           fi
           if [[ "$publish" == "true" && -z "$existing_sha" && "$create_tag" != "true" ]]; then
@@ -201,6 +203,9 @@ jobs:
 
       - name: Test public matcher smoke sanitizer
         run: python3 -m unittest discover -s scripts/ci -p 'test_sanitize_matcher_smoke.py'
+
+      - name: Test automatic release version policy
+        run: python3 -m unittest discover -s scripts/ci -p 'test_next_release_tag.py'
 
       - name: Run focused document-loading regressions
         run: |

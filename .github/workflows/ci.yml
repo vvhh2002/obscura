@@ -112,6 +112,9 @@ jobs:
       - name: Test public matcher smoke sanitizer
         run: python3 -m unittest discover -s scripts/ci -p 'test_sanitize_matcher_smoke.py'
 
+      - name: Test automatic release version policy
+        run: python3 -m unittest discover -s scripts/ci -p 'test_next_release_tag.py'
+
       - name: Check dependency advisories, licenses, bans, and sources
         if: steps.changes.outputs.audit == 'true'
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
